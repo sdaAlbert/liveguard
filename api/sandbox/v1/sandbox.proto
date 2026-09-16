@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package liveguard.sandbox.v1;
+
+option go_package = "liveguard/internal/gen/sandboxv1;sandboxv1";
+
+// SandboxExecutor is the process boundary around Docker execution. The caller
+// owns persistence and queue acknowledgement; the server only runs one
+// whitelisted scenario and returns its execution evidence.
+service SandboxExecutor {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
+
+message ToolInput {
+  string title = 1;
+  string text_snippet = 2;
+  string objective = 3;
+}
+
+message ExecuteRequest {
+  string run_id = 1;
+  string scenario = 2;
+  int32 attempt = 3;
+  ToolInput input = 4;
+}
+
+message SandboxPolicy {
+  string image = 1;
+  string memory = 2;
+  string cpus = 3;
+  int32 pids = 4;
+  string network = 5;
+  bool read_only = 6;
+  bool non_root = 7;
+  bool cap_drop_all = 8;
+  int64 timeout_ms = 9;
+}
+
+message ExecuteResponse {
+  string run_id = 1;
+  int32 attempt = 2;
+  string scenario = 3;
+  string scenario_label = 4;
+  string status = 5;
+  bool policy_verified = 6;
+  SandboxPolicy policy = 7;
+  string container_name = 8;
+  optional int32 exit_code = 9;
+  bool oom_killed = 10;
+  bool timed_out = 11;
+  bool cleaned = 12;
+  string output = 13;
+  bool output_truncated = 14;
+  string error = 15;
+  int64 started_at_unix_ms = 16;
+  int64 finished_at_unix_ms = 17;
+  int64 duration_ms = 18;
+  string trace_id = 19;
+}

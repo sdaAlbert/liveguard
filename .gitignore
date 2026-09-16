@@ -1,0 +1,13 @@
+.env
+.env.local
+artifacts/
+runtime/
+state/
+liveguard.exe
+.cache/
+*.exe
+*.test
+coverage.out
+.idea/
+.vscode/
+.learnings/

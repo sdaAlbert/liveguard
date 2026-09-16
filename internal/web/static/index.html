@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiveGuard · 直播巡检指挥台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="grid-noise"></div>
+  <header class="masthead">
+    <div class="brand"><span class="brand-mark">LG</span><div><strong>LIVEGUARD</strong><small>直播巡检指挥台</small></div></div>
+    <div class="system-state"><span class="pulse"></span> LOCAL CONTROL PLANE <b id="clock">--:--:--</b></div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <p class="eyebrow">BROWSER AGENT / EVIDENCE FIRST</p>
+        <h1>让每一次页面判断<br><em>都有证据。</em></h1>
+        <p class="lede">输入直播页面和验收目标。Agent 会在独立 Chrome 会话中规划、执行并记录；遇到登录或验证时停下来交给人。</p>
+      </div>
+      <div class="metric-cluster">
+        <article><span id="totalCount">0</span><small>全部任务</small></article>
+        <article><span id="runningCount">0</span><small>正在执行</small></article>
+        <article><span id="attentionCount">0</span><small>需要介入</small></article>
+      </div>
+    </section>
+
+    <section class="console-grid">
+      <form id="taskForm" class="panel composer">
+        <div class="panel-label"><span>01</span> 创建巡检</div>
+        <label>目标页面
+          <input id="url" name="url" type="url" value="https://www.douyin.com/" required autocomplete="off">
+        </label>
+        <label>验收目标
+          <textarea id="objective" name="objective" required>检查页面是否可以正常打开，识别页面标题、直播状态，并判断是否被登录或安全验证阻塞。</textarea>
+        </label>
+        <div class="boundary"><b>只读边界</b><span>不关注 · 不评论 · 不点赞 · 不送礼 · 不绕过验证</span></div>
+        <div class="demo-preset"><span>闭环演示</span><button id="loadAgentDemo" type="button">载入“活动入口缺失”场景</button></div>
+        <button type="submit"><span>启动巡检</span><i>↗</i></button>
+        <p id="formError" class="error" role="alert"></p>
+      </form>
+
+      <section class="panel task-list-panel">
+        <div class="panel-label"><span>02</span> 任务队列 <button id="refresh" type="button">刷新</button></div>
+        <div id="taskList" class="task-list"><div class="empty">尚无巡检任务</div></div>
+      </section>
+    </section>
+
+    <section class="panel sandbox-lab">
+      <div class="panel-label"><span>03</span> SANDBOX LAB <b id="infraMode">正在读取基础设施状态…</b></div>
+      <div class="infra-flow" aria-label="异步执行链路">
+        <span>HTTP / AGENT</span><i>→</i><span>POSTGRES OUTBOX</span><i>→</i><span>REDIS STREAM</span><i>→</i><span>gRPC WORKER</span><i>→</i><span>DOCKER SANDBOX</span>
+      </div>
+      <div class="sandbox-intro">
+        <div>
+          <p class="eyebrow">AGENT TOOL EXECUTION / ZERO TRUST</p>
+          <h2>让 Agent 的代码<br>关在笼子里运行。</h2>
+          <p>点击一次，真实启动四个临时容器，验证正常执行、超时强杀、只读拦截和网络隔离。每个容器结束后必须被清理。</p>
+        </div>
+        <button id="runSandboxSuite" class="suite-button" type="button"><span>运行全部验收</span><i>04 TESTS ↗</i></button>
+      </div>
+      <div class="policy-strip" aria-label="Sandbox 强制策略">
+        <span><b>128</b> MiB MEMORY</span>
+        <span><b>0.5</b> CPU</span>
+        <span><b>32</b> PIDs</span>
+        <span><b>OFF</b> NETWORK</span>
+        <span><b>RO</b> ROOT FS</span>
+        <span><b>65534</b> USER</span>
+      </div>
+      <div class="sandbox-controls">
+        <button type="button" data-sandbox="normal"><i>01</i><b>正常执行</b><small>命令完成并返回证据</small></button>
+        <button type="button" data-sandbox="timeout"><i>02</i><b>超时终止</b><small>3 秒 deadline 后强制回收</small></button>
+        <button type="button" data-sandbox="write_denied"><i>03</i><b>只读拦截</b><small>禁止修改容器根文件系统</small></button>
+        <button type="button" data-sandbox="network_denied"><i>04</i><b>断网拦截</b><small>容器没有外部网络能力</small></button>
+      </div>
+      <div class="sandbox-result-head"><b>最近运行</b><span id="sandboxSummary">等待第一次验收</span></div>
+      <div id="sandboxRuns" class="sandbox-runs"><div class="sandbox-empty">DOCKER READY? 点击「运行全部验收」给出证据。</div></div>
+      <p id="sandboxError" class="error" role="alert"></p>
+    </section>
+
+    <section class="panel agent-eval">
+      <div class="panel-label"><span>04</span> AGENT EVAL <b id="evalMode">尚未运行评测</b></div>
+      <div class="eval-intro">
+        <div>
+          <p class="eyebrow">MODEL ROUTING / POLICY GATEWAY</p>
+          <h2>模型负责提议，<br>策略负责放行。</h2>
+          <p>六个固定案例检查该调用、该停止和该拒绝。在线模型不可用时会明确标记 deterministic_fallback，不把降级结果冒充模型能力。</p>
+        </div>
+        <button id="runAgentEval" class="suite-button" type="button"><span>运行 Agent Eval</span><i>06 CASES ↗</i></button>
+      </div>
+      <div id="evalMetrics" class="eval-metrics">
+        <span><small>PASS RATE</small><b>—</b></span><span><small>LATENCY</small><b>—</b></span><span><small>TOKENS</small><b>—</b></span>
+      </div>
+      <div id="evalCases" class="eval-cases"><div class="sandbox-empty">点击运行，验证 Tool Calling 与 Policy Gateway。</div></div>
+      <p id="evalError" class="error" role="alert"></p>
+    </section>
+
+    <section id="detail" class="panel detail hidden">
+      <div class="panel-label"><span>05</span> 执行证据 <button id="closeDetail" type="button">收起</button></div>
+      <div class="detail-head"><div><p id="detailId" class="mono"></p><h2 id="detailObjective"></h2><a id="detailURL" target="_blank" rel="noreferrer"></a><a id="detailTrace" class="trace-link hidden" target="_blank" rel="noreferrer"></a></div><span id="detailStatus" class="status"></span></div>
+      <div class="evidence-grid">
+        <div><h3>执行时间线</h3><ol id="timeline" class="timeline"></ol></div>
+        <div><h3>浏览器证据</h3><div id="screenshot" class="screenshot"><span>任务完成后显示截图</span></div></div>
+      </div>
+      <div id="report" class="report"></div>
+    </section>
+  </main>
+
+  <footer><span>LIVEGUARD / AGENT EXECUTION PLATFORM</span><span>Go · PostgreSQL · Redis Streams · gRPC · Docker · OpenTelemetry</span></footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

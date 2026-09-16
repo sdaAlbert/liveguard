@@ -1,0 +1,7 @@
+body { margin: 0; background: #111; color: #f5f0e5; font-family: Georgia, "Microsoft YaHei UI", sans-serif; }
+main { min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 30% 20%, #305f56, transparent 34%), radial-gradient(circle at 80% 70%, #913e2f, transparent 38%); }
+article { width: min(720px, 86vw); border: 1px solid #aaa; padding: 48px; background: rgba(0,0,0,.55); box-shadow: 18px 18px 0 #d7ef69; }
+.live { display: inline-block; background: #e84c32; padding: 6px 10px; font: 12px Consolas, monospace; }
+.host { font-size: 56px; margin: 24px 0 10px; }
+.meta { color: #c8c3b8; }
+.notice { margin-top: 36px; padding-top: 20px; border-top: 1px solid #777; }
