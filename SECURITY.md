@@ -4,7 +4,7 @@ LiveGuard is a local reference implementation for studying policy-gated Agent ex
 
 ## Reporting a vulnerability
 
-Use GitHub private vulnerability reporting when it is enabled for the repository. If it is unavailable, open a public issue titled `Security contact request` without technical details; the maintainer should provide a private channel before reproduction information is shared. Do not publish credentials, working exploits, private URLs, browser profiles, or user data in a public issue.
+Use the repository's GitHub private vulnerability reporting form. Do not publish credentials, working exploits, private URLs, browser profiles, or user data in a public issue.
 
 Include the affected revision, reproduction steps, expected impact, and any suggested mitigation. Reports about container escape, command injection, SSRF, credential exposure, authorization bypass, or cross-run data access are especially useful.
 

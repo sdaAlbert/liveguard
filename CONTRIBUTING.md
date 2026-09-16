@@ -79,7 +79,7 @@ For changes to Sandbox behavior, also run the four-case Sandbox Lab from the UI 
 - `internal/sandboxrpc`: gRPC client and server adapters
 - `internal/web`: HTTP API and embedded dashboard
 - `api/sandbox/v1`: protobuf contract
-- `docs`: phase reports and design notes
+- `docs`: architecture notes and public verification images
 
 Generated protobuf stubs are checked in. They currently record `protoc` 5.27.3, `protoc-gen-go` 1.36.11, and `protoc-gen-go-grpc` 1.6.2. After installing those tools, regenerate both outputs from the repository root:
 
