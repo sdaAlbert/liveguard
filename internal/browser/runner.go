@@ -23,6 +23,8 @@ var (
 	scriptPattern = regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</(script|style)>`)
 	tagPattern    = regexp.MustCompile(`(?s)<[^>]+>`)
 	spacePattern  = regexp.MustCompile(`\s+`)
+	liveTerms     = []string{"直播中", "正在直播", "live now", "在线观众", "当前在线"}
+	offlineTerms  = []string{"未开播", "直播已结束", "已下播", "offline"}
 )
 
 type Result struct {
@@ -66,7 +68,7 @@ func (r *Runner) OpenSession(targetURL string) error {
 		return err
 	}
 	r.sessionMu.Lock()
-	if r.sessionOpen {
+	if r.sessionOpen || r.profileLocked() {
 		r.sessionMu.Unlock()
 		return errors.New("专用登录窗口已打开；请在该窗口完成登录")
 	}
@@ -99,7 +101,7 @@ func (r *Runner) OpenSession(targetURL string) error {
 func (r *Runner) SessionState() SessionState {
 	r.sessionMu.Lock()
 	defer r.sessionMu.Unlock()
-	return SessionState{Configured: strings.TrimSpace(r.SessionProfileDir) != "", Open: r.sessionOpen, Inspecting: r.sessionInspecting}
+	return SessionState{Configured: strings.TrimSpace(r.SessionProfileDir) != "", Open: r.sessionOpen || r.profileLocked(), Inspecting: r.sessionInspecting}
 }
 
 func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string, useAuthenticatedSession bool) (Result, error) {
@@ -140,7 +142,7 @@ func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string, useAuthe
 			r.sessionMu.Unlock()
 			return Result{}, errors.New("专用登录会话未配置")
 		}
-		if r.sessionOpen {
+		if r.sessionOpen || r.profileLocked() {
 			r.sessionMu.Unlock()
 			return Result{}, errors.New("请先在专用窗口完成登录并关闭窗口，再启动巡检")
 		}
@@ -190,6 +192,19 @@ func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string, useAuthe
 		return Result{Title: title, FinalURL: targetURL, BodyText: bodyText}, fmt.Errorf("chrome did not create screenshot: %w", err)
 	}
 	return Result{Title: title, FinalURL: targetURL, BodyText: bodyText, Screenshot: "/artifacts/" + taskID + "/overview.png"}, nil
+}
+
+func (r *Runner) profileLocked() bool {
+	if strings.TrimSpace(r.SessionProfileDir) == "" {
+		return false
+	}
+	lockPath := filepath.Join(r.SessionProfileDir, "lockfile")
+	file, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	_ = file.Close()
+	return false
 }
 
 func (r *Runner) Evaluate(plan []domain.CheckSpec, result Result) ([]domain.CheckResult, bool) {
@@ -249,8 +264,8 @@ func (r *Runner) Evaluate(plan []domain.CheckSpec, result Result) ([]domain.Chec
 			if len(spec.Terms) > 0 {
 				expected = strings.ToLower(strings.TrimSpace(spec.Terms[0]))
 			}
-			live := containsAny(bodyLower, []string{"直播中", "正在直播", "live now"})
-			offline := containsAny(bodyLower, []string{"未开播", "直播已结束", "已下播", "offline"})
+			live := containsAny(bodyLower, liveTerms)
+			offline := containsAny(bodyLower, offlineTerms)
 			switch {
 			case expected == "live" && live:
 				check.Status, check.Observed = domain.CheckPassed, "页面显示正在直播"
@@ -264,7 +279,7 @@ func (r *Runner) Evaluate(plan []domain.CheckSpec, result Result) ([]domain.Chec
 				check.Status, check.Observed = domain.CheckUnverified, "页面中没有可确认直播状态的文本"
 			}
 		case "live_status":
-			matched := matchingTerms(bodyLower, []string{"直播中", "正在直播", "未开播", "直播已结束", "live"})
+			matched := matchingTerms(bodyLower, append(append([]string{}, liveTerms...), offlineTerms...))
 			if len(matched) > 0 {
 				check.Status = domain.CheckPassed
 				check.Observed = "识别到状态文本：" + strings.Join(matched, "、")

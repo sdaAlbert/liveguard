@@ -42,6 +42,18 @@ func TestEvaluateOperationalExpectations(t *testing.T) {
 	}
 }
 
+func TestEvaluateRecognizesDouyinOnlineAudienceAsLive(t *testing.T) {
+	runner := &Runner{}
+	plan := []domain.CheckSpec{
+		{Key: "status", Label: "直播状态", Kind: "live_status"},
+		{Key: "expected", Label: "预期正在直播", Kind: "expected_live_status", Terms: []string{"live"}},
+	}
+	checks, _ := runner.Evaluate(plan, Result{BodyText: "在线观众 · 151"})
+	if checks[0].Status != domain.CheckPassed || checks[1].Status != domain.CheckPassed {
+		t.Fatalf("expected Douyin audience marker to prove live status: %#v", checks)
+	}
+}
+
 func TestAuthenticatedInspectionRequiresClosedLoginWindow(t *testing.T) {
 	runner := &Runner{ProfileDir: t.TempDir(), SessionProfileDir: t.TempDir(), ArtifactDir: t.TempDir(), AllowedHosts: map[string]bool{"localhost": true}, sessionOpen: true}
 	_, err := runner.Inspect(context.Background(), "task-one", "http://localhost/demo", true)

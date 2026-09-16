@@ -227,6 +227,17 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request) {
 		if input.ExpectedLiveStatus == "any" {
 			input.ExpectedLiveStatus = ""
 		}
+		if input.UseAuthenticatedSession && s.browserSessionState != nil {
+			state := s.browserSessionState()
+			if state.Open {
+				writeError(w, http.StatusConflict, "请先关闭抖音登录窗口，再开始巡检")
+				return
+			}
+			if state.Inspecting {
+				writeError(w, http.StatusConflict, "另一个登录态巡检正在执行，请稍候")
+				return
+			}
+		}
 		task, err := s.createTask(r.Context(), &domain.Task{URL: input.URL, Objective: input.Objective, ExpectedTexts: expectedTexts, ExpectedLiveStatus: input.ExpectedLiveStatus, UseAuthenticatedSession: input.UseAuthenticatedSession}, "任务已创建并进入执行队列")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())

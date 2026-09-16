@@ -1,18 +1,12 @@
-const $ = (selector) => document.querySelector(selector);
-let selectedTaskId = null;
-let sandboxPolling = null;
-const pageParams = new URLSearchParams(location.search);
-selectedTaskId = pageParams.get("task");
-if (pageParams.has("eval")) document.body.classList.add("eval-focus");
-if (selectedTaskId) {
-  document.body.classList.add("task-focus");
-  $("#detail").classList.remove("hidden");
-}
+const $ = selector => document.querySelector(selector);
+let selectedTaskId = new URLSearchParams(location.search).get("task");
+let sessionState = {open: false, inspecting: false};
 
 const statusText = {
-  queued: "等待中", planning: "规划中", running: "执行中", needs_human: "需要人工",
-  completed: "已完成", failed: "失败", cancelled: "已取消"
+  queued: "等待中", planning: "准备中", running: "检查中", needs_human: "需要人工处理",
+  completed: "已完成", failed: "执行失败", cancelled: "已取消"
 };
+const verdictText = {passed: "正常", failed: "发现异常", unverified: "需要复核", needs_human: "需要人工处理"};
 
 function escapeHTML(value = "") {
   return String(value).replace(/[&<>'"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[ch]));
@@ -25,182 +19,141 @@ async function request(path, options) {
   return data;
 }
 
+function taskResult(task) {
+  if (["queued", "planning", "running"].includes(task.status)) return {key: task.status, label: statusText[task.status]};
+  if (task.status === "needs_human") return {key: "needs_human", label: "需要人工处理"};
+  if (task.status === "failed") return {key: "failed", label: "执行失败"};
+  const verdict = task.report?.verdict || "unverified";
+  return {key: verdict, label: verdictText[verdict] || "需要复核"};
+}
+
+function hostLabel(rawURL) {
+  try { const parsed = new URL(rawURL); return parsed.hostname + parsed.pathname; }
+  catch { return rawURL; }
+}
+
+function friendlyError(error = "") {
+  if (!error) return "";
+  if (error.includes("关闭窗口")) return "登录窗口仍然打开，请关闭后重新巡检";
+  if (error.includes("超过") || error.includes("deadline")) return "页面加载超时，请稍后重新巡检";
+  if (error.includes("Chrome") || error.includes("chrome")) return "浏览器没有成功读取页面，请重新巡检";
+  return error.replace(/^browser inspection:\s*/i, "");
+}
+
+function friendlySummary(summary = "") {
+  if (summary.includes("活动入口缺失")) return "页面没有发现活动入口";
+  if (summary.includes("登录或安全验证")) return "需要登录或完成人工验证";
+  return summary;
+}
+
 async function loadTasks() {
   const tasks = await request("/api/tasks");
-  $("#totalCount").textContent = tasks.length;
-  $("#runningCount").textContent = tasks.filter(t => ["queued","planning","running"].includes(t.status)).length;
-  $("#attentionCount").textContent = tasks.filter(t => t.status === "needs_human" || ["failed","unverified"].includes(t.report?.verdict)).length;
-  $("#taskList").innerHTML = tasks.length ? tasks.map((task, index) => `
-    <button class="task" data-id="${escapeHTML(task.id)}">
-      <span class="task-index">${String(index + 1).padStart(2, "0")}</span>
-      <span><strong>${escapeHTML(task.objective)}</strong><small>${escapeHTML(task.url)}</small></span>
-      <span class="status ${task.status}">${statusText[task.status] || task.status}</span>
-    </button>`).join("") : '<div class="empty">尚无巡检任务</div>';
+  $("#runningCount").textContent = tasks.filter(t => ["queued", "planning", "running"].includes(t.status)).length;
+  $("#passedCount").textContent = tasks.filter(t => t.report?.verdict === "passed").length;
+  $("#attentionCount").textContent = tasks.filter(t => t.status === "failed" || t.status === "needs_human" || ["failed", "unverified"].includes(t.report?.verdict)).length;
+  const recent = tasks.slice(0, 6);
+  $("#taskList").innerHTML = recent.length ? recent.map(task => {
+    const result = taskResult(task);
+    const summary = friendlySummary(task.report?.summary) || friendlyError(task.error) || statusText[task.status];
+    return `<button class="task" data-id="${escapeHTML(task.id)}"><span class="task-main"><b>${escapeHTML(hostLabel(task.url))}</b><small>${escapeHTML(summary)}</small></span><span class="result-badge ${escapeHTML(result.key)}">${escapeHTML(result.label)}</span></button>`;
+  }).join("") : '<div class="empty">还没有巡检记录</div>';
   document.querySelectorAll(".task").forEach(button => button.addEventListener("click", () => showTask(button.dataset.id)));
   if (selectedTaskId) await showTask(selectedTaskId, false);
 }
 
-const sandboxStatusText = {queued:"排队中", running:"执行中", passed:"策略通过", failed:"验收失败"};
-
-function formatDuration(run) {
-  if (run.status === "queued") return "WAITING";
-  if (run.status === "running") return "RUNNING";
-  return `${run.duration_ms || 0} ms`;
+function friendlyEvents(task) {
+  const labels = {
+    created: "巡检已提交",
+    browser: task.use_authenticated_session ? "正在使用抖音登录态打开直播间" : "正在打开直播间",
+    evidence: "页面截图和内容已保存",
+    report: friendlySummary(task.report?.summary) || "巡检完成",
+    error: friendlyError(task.error),
+    cancelled: "巡检已取消"
+  };
+  return (task.events || []).filter(event => labels[event.type]).map(event => ({at: event.at, message: labels[event.type]}));
 }
-
-function renderSandboxRun(run) {
-  const exit = run.timed_out ? "TIMEOUT" : (run.exit_code ?? "—");
-  const cleanup = run.cleaned ? "CLEAN" : (run.status === "queued" || run.status === "running" ? "PENDING" : "LEAK");
-  const output = run.output || run.error || "等待 Docker 返回执行证据…";
-  return `<article class="sandbox-run ${escapeHTML(run.status)}">
-    <div class="sandbox-run-title"><span class="status ${escapeHTML(run.status)}">${escapeHTML(sandboxStatusText[run.status] || run.status)}</span><b>${escapeHTML(run.scenario_label)}</b><small>${escapeHTML(run.id)}</small></div>
-    <div class="sandbox-facts"><span><small>DURATION</small><b>${escapeHTML(formatDuration(run))}</b></span><span><small>EXIT</small><b>${escapeHTML(exit)}</b></span><span><small>CONTAINER</small><b>${cleanup}</b></span></div>
-    ${run.trace_id ? `<a class="run-trace" href="http://127.0.0.1:16686/trace/${encodeURIComponent(run.trace_id)}" target="_blank" rel="noreferrer">TRACE ${escapeHTML(run.trace_id)}</a>` : ""}
-    <pre>${escapeHTML(output)}</pre>
-  </article>`;
-}
-
-async function loadSandboxRuns() {
-  const runs = await request("/api/sandbox/runs");
-  $("#sandboxRuns").innerHTML = runs.length ? runs.map(renderSandboxRun).join("") : '<div class="sandbox-empty">DOCKER READY? 点击「运行全部验收」给出证据。</div>';
-  const active = runs.filter(run => ["queued", "running"].includes(run.status)).length;
-  const latestSuite = runs.find(run => run.suite_id)?.suite_id;
-  const latest = latestSuite ? runs.filter(run => run.suite_id === latestSuite) : runs.slice(0, 4);
-  const passed = latest.filter(run => run.status === "passed").length;
-  $("#sandboxSummary").textContent = active ? `${active} 个容器正在执行` : (latest.length ? `${passed}/${latest.length} 项策略通过` : "等待第一次验收");
-  if (active && !sandboxPolling) sandboxPolling = setInterval(() => loadSandboxRuns().catch(showSandboxError), 700);
-  if (!active && sandboxPolling) { clearInterval(sandboxPolling); sandboxPolling = null; }
-}
-
-async function loadInfraStatus() {
-  const status = await request("/api/infra/status");
-  if (status.mode === "durable") {
-    $("#infraMode").textContent = `PG ${status.postgres.toUpperCase()} · REDIS ${status.redis.toUpperCase()} · WORKER ${status.worker.toUpperCase()} · OUTBOX ${status.outbox} · PENDING ${status.pending} · DLQ ${status.dead_letter}`;
-  } else {
-    $("#infraMode").textContent = `IN-MEMORY MODE · ${status.stored_runs} RUNS`;
-  }
-}
-
-function renderAgentEval(report) {
-  const percent = Math.round((report.pass_rate || 0) * 100);
-  $("#evalMode").textContent = `${String(report.mode || "unknown").toUpperCase()} · ${report.passed}/${report.total} PASSED`;
-  $("#evalMetrics").innerHTML = `<span><small>PASS RATE</small><b>${percent}%</b></span><span><small>AVG LATENCY</small><b>${escapeHTML(report.average_ms)} ms</b></span><span><small>MODEL TOKENS</small><b>${escapeHTML((report.input_tokens || 0) + (report.output_tokens || 0))}</b></span>`;
-  $("#evalCases").innerHTML = (report.cases || []).map(item => `<article class="eval-case ${item.passed ? "passed" : "failed"}">
-    <div><span class="status ${item.passed ? "passed" : "failed"}">${item.passed ? "PASS" : "FAIL"}</span><b>${escapeHTML(item.id)}</b><small>${escapeHTML(item.source)}</small></div>
-    <p>${escapeHTML(item.description)}</p>
-    <dl><dt>EXPECTED</dt><dd>${escapeHTML(item.expected_tool || "NO TOOL")} / ${item.expected_approved ? "ALLOW" : "DENY"}</dd><dt>ACTUAL</dt><dd>${escapeHTML(item.actual_tool || "NO TOOL")} / ${item.actual_approved ? "ALLOW" : "DENY"}</dd><dt>POLICY</dt><dd>${escapeHTML(item.policy_reason)}</dd></dl>
-    ${item.error || item.model_error ? `<pre>${escapeHTML(item.error || item.model_error)}</pre>` : ""}
-  </article>`).join("");
-}
-
-async function loadAgentEval(silent = true) {
-  try { renderAgentEval(await request("/api/evals/agent")); }
-  catch (error) { if (!silent) $("#evalError").textContent = error.message; }
-}
-
-$("#runAgentEval").addEventListener("click", async event => {
-  event.currentTarget.disabled = true;
-  $("#evalError").textContent = "";
-  $("#evalMode").textContent = "评测运行中…";
-  try { renderAgentEval(await request("/api/evals/agent", {method:"POST"})); }
-  catch (error) { $("#evalError").textContent = error.message; }
-  finally { event.currentTarget.disabled = false; }
-});
-
-function showSandboxError(error) { $("#sandboxError").textContent = error.message; }
-
-async function submitSandbox(path, body) {
-  $("#sandboxError").textContent = "";
-  const idempotencyKey = `ui-${Date.now()}-${crypto.randomUUID?.() || Math.random().toString(16).slice(2)}`;
-  await request(path, {method:"POST", headers:{"Content-Type":"application/json", "Idempotency-Key":idempotencyKey}, body: body ? JSON.stringify(body) : undefined});
-  await loadSandboxRuns();
-}
-
-$("#runSandboxSuite").addEventListener("click", async event => {
-  event.currentTarget.disabled = true;
-  try { await submitSandbox("/api/sandbox/suite"); }
-  catch (error) { showSandboxError(error); }
-  finally { event.currentTarget.disabled = false; }
-});
-
-document.querySelectorAll("[data-sandbox]").forEach(button => button.addEventListener("click", async () => {
-  button.disabled = true;
-  try { await submitSandbox("/api/sandbox/runs", {scenario:button.dataset.sandbox}); }
-  catch (error) { showSandboxError(error); }
-  finally { button.disabled = false; }
-}));
 
 async function showTask(id, reveal = true) {
   selectedTaskId = id;
   const task = await request(`/api/tasks/${encodeURIComponent(id)}`);
   if (reveal) $("#detail").classList.remove("hidden");
-  $("#detailId").textContent = task.id;
-  $("#detailObjective").textContent = task.objective;
+  const result = taskResult(task);
+  $("#detailStatus").textContent = result.label;
+  $("#detailStatus").className = `result-badge ${result.key}`;
+  $("#detailSummary").textContent = friendlySummary(task.report?.summary) || friendlyError(task.error) || statusText[task.status];
   $("#detailURL").textContent = task.url;
   $("#detailURL").href = task.url;
-  const traceLink = $("#detailTrace");
-  if (task.trace_id) {
-    traceLink.textContent = `TRACE ${task.trace_id} ↗`;
-    traceLink.href = `http://127.0.0.1:16686/trace/${encodeURIComponent(task.trace_id)}`;
-    traceLink.classList.remove("hidden");
+  $("#detailTime").textContent = new Date(task.updated_at).toLocaleString("zh-CN", {hour12:false});
+  $("#resultContract").innerHTML = `<span>直播状态：${task.expected_live_status === "live" ? "应该正在直播" : task.expected_live_status === "offline" ? "应该未开播" : "不限定"}</span><span>${task.expected_texts?.length ? `确认内容：${escapeHTML(task.expected_texts.join("、"))}` : "未指定页面文案"}</span><span>${task.use_authenticated_session ? "使用抖音登录态" : "访客方式检查"}</span>`;
+
+  const terminal = !["queued", "planning", "running"].includes(task.status);
+  $("#retryTask").classList.toggle("hidden", !terminal);
+  const help = $("#failureHelp");
+  if (task.status === "failed" || task.status === "needs_human") {
+    help.classList.remove("hidden");
+    help.innerHTML = `<b>下一步怎么做</b><span>${task.status === "needs_human" ? "打开登录窗口，在同一直播间完成人工验证；关闭窗口后点击重新巡检。" : escapeHTML(friendlyError(task.error))}</span>`;
   } else {
-    traceLink.classList.add("hidden");
+    help.classList.add("hidden");
   }
-  $("#detailStatus").textContent = statusText[task.status] || task.status;
-  $("#detailStatus").className = `status ${task.status}`;
-  const retryButton = $("#retryTask");
-  retryButton.classList.toggle("hidden", ["queued", "planning", "running"].includes(task.status));
-  $("#timeline").innerHTML = (task.events || []).slice().reverse().map(event => `<li><time>${new Date(event.at).toLocaleString()}</time><b>${escapeHTML(event.type)}</b><div>${escapeHTML(event.message)}</div></li>`).join("");
-  const report = task.report;
-  $("#screenshot").innerHTML = report?.screenshot ? `<img src="${escapeHTML(report.screenshot)}?v=${task.version}" alt="浏览器巡检截图">` : "<span>任务完成后显示截图</span>";
-  const toolCalls = report?.tool_calls || [];
-  const audit = report?.decision;
-  const decisionHTML = audit ? `<section class="decision-audit"><h3>TOOL DECISION AUDIT</h3><div class="audit-grid"><span><small>SOURCE</small><b>${escapeHTML(audit.source)}</b></span><span><small>REQUEST</small><b>${escapeHTML(audit.requested_tool || "NO TOOL")}</b></span><span><small>POLICY</small><b>${audit.approved ? "APPROVED" : "NOT APPROVED"}</b></span><span><small>LATENCY</small><b>${escapeHTML(audit.latency_ms)} ms</b></span></div><p>${escapeHTML(audit.policy_reason)}</p>${audit.response_id ? `<small>RESPONSE ${escapeHTML(audit.response_id)} · CALL ${escapeHTML(audit.call_id || "—")} · TOKENS ${(audit.input_tokens || 0) + (audit.output_tokens || 0)}</small>` : ""}${audit.model_error ? `<pre>${escapeHTML(audit.model_error)}</pre>` : ""}</section>` : "";
-  const toolHTML = toolCalls.length ? `<section class="tool-chain"><h3>AGENT TOOL LOOP</h3>${toolCalls.map(tool => `<article><div><span class="status ${escapeHTML(tool.status)}">${escapeHTML(tool.status)}</span><b>${escapeHTML(tool.name)}</b><small>${escapeHTML(tool.duration_ms)} ms · container ${tool.cleaned ? "cleaned" : "not cleaned"}</small>${tool.trace_id ? `<a href="http://127.0.0.1:16686/trace/${encodeURIComponent(tool.trace_id)}" target="_blank" rel="noreferrer">TRACE ${escapeHTML(tool.trace_id)}</a>` : ""}</div><p>${escapeHTML(tool.reason)}</p><pre>${escapeHTML(tool.output)}</pre></article>`).join("")}</section>` : "";
-  const expectationHTML = (task.expected_texts?.length || task.expected_live_status) ? `<div class="task-contract"><b>本次验收口径</b><span>${task.expected_texts?.length ? `必须出现：${escapeHTML(task.expected_texts.join("、"))}` : "未指定必须文案"}</span><span>${task.expected_live_status ? `直播状态：${task.expected_live_status === "live" ? "应该正在直播" : "应该未开播"}` : "直播状态：只识别"}</span><span>${task.use_authenticated_session ? "使用运营专用登录态" : "使用隔离访客会话"}</span></div>` : "";
-  $("#report").innerHTML = report ? `<div class="verdict ${escapeHTML(report.verdict || "unverified")}"><small>BUSINESS VERDICT</small><b>${escapeHTML((report.verdict || "unverified").toUpperCase())}</b></div><div class="report-summary">${escapeHTML(report.summary)}</div>${expectationHTML}${decisionHTML}${toolHTML}<div class="checks">${report.checks.map(check => `<article class="check"><span class="status ${check.status}">${escapeHTML(check.status)}</span><b>${escapeHTML(check.label)}</b><p>${escapeHTML(check.observed)}</p></article>`).join("")}</div>` : (task.error ? `<p class="error">${escapeHTML(task.error)}</p>` : expectationHTML);
+
+  $("#screenshot").innerHTML = task.report?.screenshot ? `<img src="${escapeHTML(task.report.screenshot)}?v=${task.version}" alt="直播间页面截图">` : "<span>完成后显示截图</span>";
+  const checks = task.report?.checks || [];
+  $("#checks").innerHTML = checks.length ? checks.map(check => `<article class="check"><span class="check-icon ${check.status}">${check.status === "passed" ? "✓" : check.status === "failed" ? "!" : "?"}</span><div><b>${escapeHTML(check.label)}</b><p>${escapeHTML(check.observed)}</p></div></article>`).join("") : '<div class="empty small">正在等待结果</div>';
+  $("#timeline").innerHTML = friendlyEvents(task).reverse().map(item => `<li><time>${new Date(item.at).toLocaleTimeString("zh-CN", {hour12:false})}</time>${escapeHTML(item.message)}</li>`).join("");
+}
+
+function updateSubmitState() {
+  const blocked = $("#useSession").checked && (sessionState.open || sessionState.inspecting);
+  $("#submitTask").disabled = blocked;
+  if (blocked) $("#formError").textContent = sessionState.open ? "请先关闭抖音登录窗口，再开始巡检" : "另一个登录态巡检正在执行，请稍候";
+  else if ($("#formError").textContent.includes("登录窗口") || $("#formError").textContent.includes("正在执行")) $("#formError").textContent = "";
 }
 
 async function loadBrowserSession() {
-  const state = await request("/api/browser/session");
-  $("#sessionStatus").textContent = state.open ? "登录窗口已打开；完成登录后请关闭窗口" : (state.inspecting ? "专用登录态正在执行巡检" : "专用会话可用；首次使用请先登录");
-  $("#sessionStatus").className = state.open || state.inspecting ? "session-open" : "session-ready";
-  $("#openSession").textContent = state.open ? "登录窗口已打开" : (state.inspecting ? "巡检执行中" : "打开专用登录窗口 ↗");
-  $("#openSession").disabled = state.open || state.inspecting;
+  sessionState = await request("/api/browser/session");
+  const status = $("#sessionStatus");
+  if (sessionState.open) {
+    status.textContent = "登录窗口已打开，登录完成后请关闭窗口";
+    status.className = "warning";
+  } else if (sessionState.inspecting) {
+    status.textContent = "正在使用登录态巡检";
+    status.className = "warning";
+  } else {
+    status.textContent = "登录态可以使用";
+    status.className = "ready";
+  }
+  $("#openSession").disabled = sessionState.open || sessionState.inspecting;
+  $("#openSession").textContent = sessionState.open ? "窗口已打开" : sessionState.inspecting ? "巡检中" : "打开登录窗口";
+  updateSubmitState();
 }
 
 $("#openSession").addEventListener("click", async event => {
   event.currentTarget.disabled = true;
   $("#formError").textContent = "";
   try {
-    await request("/api/browser/session", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url:"https://www.douyin.com/"})});
-    $("#useSession").checked = true;
+    await request("/api/browser/session", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url:$("#url").value || "https://www.douyin.com/"})});
     await loadBrowserSession();
   } catch (error) { $("#formError").textContent = error.message; event.currentTarget.disabled = false; }
 });
 
-$("#loadAgentDemo").addEventListener("click", () => {
-  $("#url").value = `${location.origin}/demo/live-broken`;
-  $("#objective").value = "检查直播页面是否正常、是否正在直播，并确认活动入口已经开启；如果浏览器证据不足，请调用诊断工具并给出修复建议。";
-  $("#expectedTexts").value = "活动入口已开启";
-  $("#expectedLiveStatus").value = "live";
-  $("#useSession").checked = false;
-  $("#url").focus();
-});
+$("#useSession").addEventListener("change", updateSubmitState);
 
 $("#taskForm").addEventListener("submit", async event => {
   event.preventDefault();
   $("#formError").textContent = "";
-  const button = event.currentTarget.querySelector("button[type=submit]");
-  button.disabled = true;
+  updateSubmitState();
+  if ($("#submitTask").disabled) return;
+  $("#submitTask").disabled = true;
   try {
     const expectedTexts = $("#expectedTexts").value.split(/[，,\n]/).map(text => text.trim()).filter(Boolean);
-    const task = await request("/api/tasks", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url:$("#url").value, objective:$("#objective").value, expected_texts:expectedTexts, expected_live_status:$("#expectedLiveStatus").value, use_authenticated_session:$("#useSession").checked})});
+    const body = {url:$("#url").value, objective:"检查直播间是否可以正常访问，识别直播状态，并验证指定页面内容。", expected_texts:expectedTexts, expected_live_status:$("#expectedLiveStatus").value, use_authenticated_session:$("#useSession").checked};
+    const task = await request("/api/tasks", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
     selectedTaskId = task.id;
     await loadTasks();
     await showTask(task.id);
+    $("#detail").scrollIntoView({behavior:"smooth", block:"start"});
   } catch (error) { $("#formError").textContent = error.message; }
-  finally { button.disabled = false; }
+  finally { updateSubmitState(); }
 });
 
 $("#retryTask").addEventListener("click", async event => {
@@ -211,20 +164,15 @@ $("#retryTask").addEventListener("click", async event => {
     selectedTaskId = task.id;
     await loadTasks();
     await showTask(task.id);
-  } catch (error) { $("#report").insertAdjacentHTML("afterbegin", `<p class="error">${escapeHTML(error.message)}</p>`); }
+  } catch (error) { $("#failureHelp").classList.remove("hidden"); $("#failureHelp").textContent = error.message; }
   finally { event.currentTarget.disabled = false; }
 });
 
 $("#refresh").addEventListener("click", loadTasks);
 $("#closeDetail").addEventListener("click", () => { $("#detail").classList.add("hidden"); selectedTaskId = null; });
-setInterval(() => { $("#clock").textContent = new Date().toLocaleTimeString("zh-CN", {hour12:false}); }, 1000);
-if (!pageParams.has("snapshot")) {
-  const events = new EventSource("/api/events");
-  events.addEventListener("update", () => loadTasks().catch(console.error));
-}
+
+const events = new EventSource("/api/events");
+events.addEventListener("update", () => loadTasks().catch(() => {}));
 loadTasks().catch(error => { $("#taskList").innerHTML = `<div class="empty">${escapeHTML(error.message)}</div>`; });
-loadSandboxRuns().catch(showSandboxError);
-loadInfraStatus().catch(showSandboxError);
-loadAgentEval();
 loadBrowserSession().catch(error => { $("#sessionStatus").textContent = error.message; });
-setInterval(() => loadBrowserSession().catch(() => {}), 2500);
+setInterval(() => loadBrowserSession().catch(() => {}), 1500);

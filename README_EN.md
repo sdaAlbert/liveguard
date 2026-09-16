@@ -34,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1
 - Dashboard: <http://127.0.0.1:8080>
 - Jaeger: <http://127.0.0.1:16686>
 
-Load the missing-activity-entry scenario and start a task. The report should show `FAILED` with the missing copy, and the task can be retried after a fix. For authenticated Douyin pages, open the dedicated login window, sign in manually, close that window, and enable the saved session for the inspection. Agent Eval should pass 6/6 and Sandbox Lab 4/4.
+Paste a livestream URL, select the expected live status, and optionally enter a host name or campaign copy. The operator UI shows only the business verdict, screenshot, and check results. For authenticated Douyin pages, open the dedicated login window, sign in manually, close that window, and then start the inspection.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1 status

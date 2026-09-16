@@ -34,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1
 - 控制台：<http://127.0.0.1:8080>
 - Jaeger：<http://127.0.0.1:16686>
 
-在控制台载入“活动入口缺失”场景并启动任务。预期结果是报告明确显示 `FAILED` 和缺失文案；修复后可一键复测。需要检查真实抖音登录页时，先打开专用登录窗口、手动登录并关闭窗口，再勾选使用该登录态。Agent Eval 应为 6/6，Sandbox Lab 应为 4/4。
+在控制台粘贴直播间地址，选择预期直播状态，并按需填写主播昵称或活动文案。报告只向运营展示业务结论、页面截图和检查结果。需要检查真实抖音登录页时，先打开专用登录窗口、手动登录并关闭窗口，再开始巡检。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1 status
