@@ -57,10 +57,11 @@ func main() {
 	}
 	chromePath := envOr("LIVEGUARD_CHROME_PATH", defaultChromePath())
 	browserRunner := &browser.Runner{
-		ChromePath: chromePath, ProfileDir: filepath.Join("runtime", "chrome-profile"), ArtifactDir: "artifacts",
+		ChromePath: chromePath, ProfileDir: filepath.Join("runtime", "chrome-profile"), SessionProfileDir: filepath.Join("runtime", "operator-profile"), ArtifactDir: "artifacts",
 		Headless: strings.EqualFold(os.Getenv("LIVEGUARD_HEADLESS"), "true"), AllowedHosts: allowedHosts(),
 	}
 	webServer := webapp.New(stateStore, "artifacts")
+	webServer.SetBrowserSession(browserRunner.OpenSession, browserRunner.SessionState)
 	var toolRunner worker.ToolRunner
 	if strings.EqualFold(os.Getenv("LIVEGUARD_INFRA_MODE"), "durable") {
 		infraCtx, cancelInfra := context.WithTimeout(ctx, 10*time.Second)

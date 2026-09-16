@@ -29,7 +29,7 @@ async function loadTasks() {
   const tasks = await request("/api/tasks");
   $("#totalCount").textContent = tasks.length;
   $("#runningCount").textContent = tasks.filter(t => ["queued","planning","running"].includes(t.status)).length;
-  $("#attentionCount").textContent = tasks.filter(t => t.status === "needs_human").length;
+  $("#attentionCount").textContent = tasks.filter(t => t.status === "needs_human" || ["failed","unverified"].includes(t.report?.verdict)).length;
   $("#taskList").innerHTML = tasks.length ? tasks.map((task, index) => `
     <button class="task" data-id="${escapeHTML(task.id)}">
       <span class="task-index">${String(index + 1).padStart(2, "0")}</span>
@@ -148,6 +148,8 @@ async function showTask(id, reveal = true) {
   }
   $("#detailStatus").textContent = statusText[task.status] || task.status;
   $("#detailStatus").className = `status ${task.status}`;
+  const retryButton = $("#retryTask");
+  retryButton.classList.toggle("hidden", ["queued", "planning", "running"].includes(task.status));
   $("#timeline").innerHTML = (task.events || []).slice().reverse().map(event => `<li><time>${new Date(event.at).toLocaleString()}</time><b>${escapeHTML(event.type)}</b><div>${escapeHTML(event.message)}</div></li>`).join("");
   const report = task.report;
   $("#screenshot").innerHTML = report?.screenshot ? `<img src="${escapeHTML(report.screenshot)}?v=${task.version}" alt="浏览器巡检截图">` : "<span>任务完成后显示截图</span>";
@@ -155,12 +157,34 @@ async function showTask(id, reveal = true) {
   const audit = report?.decision;
   const decisionHTML = audit ? `<section class="decision-audit"><h3>TOOL DECISION AUDIT</h3><div class="audit-grid"><span><small>SOURCE</small><b>${escapeHTML(audit.source)}</b></span><span><small>REQUEST</small><b>${escapeHTML(audit.requested_tool || "NO TOOL")}</b></span><span><small>POLICY</small><b>${audit.approved ? "APPROVED" : "NOT APPROVED"}</b></span><span><small>LATENCY</small><b>${escapeHTML(audit.latency_ms)} ms</b></span></div><p>${escapeHTML(audit.policy_reason)}</p>${audit.response_id ? `<small>RESPONSE ${escapeHTML(audit.response_id)} · CALL ${escapeHTML(audit.call_id || "—")} · TOKENS ${(audit.input_tokens || 0) + (audit.output_tokens || 0)}</small>` : ""}${audit.model_error ? `<pre>${escapeHTML(audit.model_error)}</pre>` : ""}</section>` : "";
   const toolHTML = toolCalls.length ? `<section class="tool-chain"><h3>AGENT TOOL LOOP</h3>${toolCalls.map(tool => `<article><div><span class="status ${escapeHTML(tool.status)}">${escapeHTML(tool.status)}</span><b>${escapeHTML(tool.name)}</b><small>${escapeHTML(tool.duration_ms)} ms · container ${tool.cleaned ? "cleaned" : "not cleaned"}</small>${tool.trace_id ? `<a href="http://127.0.0.1:16686/trace/${encodeURIComponent(tool.trace_id)}" target="_blank" rel="noreferrer">TRACE ${escapeHTML(tool.trace_id)}</a>` : ""}</div><p>${escapeHTML(tool.reason)}</p><pre>${escapeHTML(tool.output)}</pre></article>`).join("")}</section>` : "";
-  $("#report").innerHTML = report ? `<div class="report-summary">${escapeHTML(report.summary)}</div>${decisionHTML}${toolHTML}<div class="checks">${report.checks.map(check => `<article class="check"><span class="status ${check.status}">${escapeHTML(check.status)}</span><b>${escapeHTML(check.label)}</b><p>${escapeHTML(check.observed)}</p></article>`).join("")}</div>` : (task.error ? `<p class="error">${escapeHTML(task.error)}</p>` : "");
+  const expectationHTML = (task.expected_texts?.length || task.expected_live_status) ? `<div class="task-contract"><b>本次验收口径</b><span>${task.expected_texts?.length ? `必须出现：${escapeHTML(task.expected_texts.join("、"))}` : "未指定必须文案"}</span><span>${task.expected_live_status ? `直播状态：${task.expected_live_status === "live" ? "应该正在直播" : "应该未开播"}` : "直播状态：只识别"}</span><span>${task.use_authenticated_session ? "使用运营专用登录态" : "使用隔离访客会话"}</span></div>` : "";
+  $("#report").innerHTML = report ? `<div class="verdict ${escapeHTML(report.verdict || "unverified")}"><small>BUSINESS VERDICT</small><b>${escapeHTML((report.verdict || "unverified").toUpperCase())}</b></div><div class="report-summary">${escapeHTML(report.summary)}</div>${expectationHTML}${decisionHTML}${toolHTML}<div class="checks">${report.checks.map(check => `<article class="check"><span class="status ${check.status}">${escapeHTML(check.status)}</span><b>${escapeHTML(check.label)}</b><p>${escapeHTML(check.observed)}</p></article>`).join("")}</div>` : (task.error ? `<p class="error">${escapeHTML(task.error)}</p>` : expectationHTML);
 }
+
+async function loadBrowserSession() {
+  const state = await request("/api/browser/session");
+  $("#sessionStatus").textContent = state.open ? "登录窗口已打开；完成登录后请关闭窗口" : (state.inspecting ? "专用登录态正在执行巡检" : "专用会话可用；首次使用请先登录");
+  $("#sessionStatus").className = state.open || state.inspecting ? "session-open" : "session-ready";
+  $("#openSession").textContent = state.open ? "登录窗口已打开" : (state.inspecting ? "巡检执行中" : "打开专用登录窗口 ↗");
+  $("#openSession").disabled = state.open || state.inspecting;
+}
+
+$("#openSession").addEventListener("click", async event => {
+  event.currentTarget.disabled = true;
+  $("#formError").textContent = "";
+  try {
+    await request("/api/browser/session", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url:"https://www.douyin.com/"})});
+    $("#useSession").checked = true;
+    await loadBrowserSession();
+  } catch (error) { $("#formError").textContent = error.message; event.currentTarget.disabled = false; }
+});
 
 $("#loadAgentDemo").addEventListener("click", () => {
   $("#url").value = `${location.origin}/demo/live-broken`;
   $("#objective").value = "检查直播页面是否正常、是否正在直播，并确认活动入口已经开启；如果浏览器证据不足，请调用诊断工具并给出修复建议。";
+  $("#expectedTexts").value = "活动入口已开启";
+  $("#expectedLiveStatus").value = "live";
+  $("#useSession").checked = false;
   $("#url").focus();
 });
 
@@ -170,12 +194,25 @@ $("#taskForm").addEventListener("submit", async event => {
   const button = event.currentTarget.querySelector("button[type=submit]");
   button.disabled = true;
   try {
-    const task = await request("/api/tasks", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url:$("#url").value, objective:$("#objective").value})});
+    const expectedTexts = $("#expectedTexts").value.split(/[，,\n]/).map(text => text.trim()).filter(Boolean);
+    const task = await request("/api/tasks", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url:$("#url").value, objective:$("#objective").value, expected_texts:expectedTexts, expected_live_status:$("#expectedLiveStatus").value, use_authenticated_session:$("#useSession").checked})});
     selectedTaskId = task.id;
     await loadTasks();
     await showTask(task.id);
   } catch (error) { $("#formError").textContent = error.message; }
   finally { button.disabled = false; }
+});
+
+$("#retryTask").addEventListener("click", async event => {
+  if (!selectedTaskId) return;
+  event.currentTarget.disabled = true;
+  try {
+    const task = await request(`/api/tasks/${encodeURIComponent(selectedTaskId)}/retry`, {method:"POST"});
+    selectedTaskId = task.id;
+    await loadTasks();
+    await showTask(task.id);
+  } catch (error) { $("#report").insertAdjacentHTML("afterbegin", `<p class="error">${escapeHTML(error.message)}</p>`); }
+  finally { event.currentTarget.disabled = false; }
 });
 
 $("#refresh").addEventListener("click", loadTasks);
@@ -189,3 +226,5 @@ loadTasks().catch(error => { $("#taskList").innerHTML = `<div class="empty">${es
 loadSandboxRuns().catch(showSandboxError);
 loadInfraStatus().catch(showSandboxError);
 loadAgentEval();
+loadBrowserSession().catch(error => { $("#sessionStatus").textContent = error.message; });
+setInterval(() => loadBrowserSession().catch(() => {}), 2500);

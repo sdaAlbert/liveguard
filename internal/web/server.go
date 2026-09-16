@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"liveguard/internal/agent"
+	"liveguard/internal/browser"
 	"liveguard/internal/domain"
 	"liveguard/internal/sandbox"
 	"liveguard/internal/store"
@@ -29,14 +30,16 @@ import (
 var assets embed.FS
 
 type Server struct {
-	store       *store.Store
-	worker      *worker.Worker
-	sandboxLab  SandboxService
-	artifactDir string
-	evalRunner  func(context.Context) agent.EvalReport
-	lastEval    *agent.EvalReport
-	mu          sync.Mutex
-	subscribers map[chan domain.Event]struct{}
+	store               *store.Store
+	worker              *worker.Worker
+	sandboxLab          SandboxService
+	artifactDir         string
+	evalRunner          func(context.Context) agent.EvalReport
+	openBrowserSession  func(string) error
+	browserSessionState func() browser.SessionState
+	lastEval            *agent.EvalReport
+	mu                  sync.Mutex
+	subscribers         map[chan domain.Event]struct{}
 }
 
 type SandboxService interface {
@@ -55,6 +58,11 @@ func (s *Server) SetWorker(w *worker.Worker) { s.worker = w }
 func (s *Server) SetSandboxLab(lab SandboxService) { s.sandboxLab = lab }
 
 func (s *Server) SetAgentEval(runner func(context.Context) agent.EvalReport) { s.evalRunner = runner }
+
+func (s *Server) SetBrowserSession(open func(string) error, state func() browser.SessionState) {
+	s.openBrowserSession = open
+	s.browserSessionState = state
+}
 
 func (s *Server) Publish(event domain.Event) {
 	s.mu.Lock()
@@ -79,6 +87,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/sandbox/suite", s.sandboxSuite)
 	mux.HandleFunc("/api/infra/status", s.infraStatus)
 	mux.HandleFunc("/api/evals/agent", s.agentEval)
+	mux.HandleFunc("/api/browser/session", s.browserSession)
 	mux.HandleFunc("/demo/live", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, assets, "static/demo-live.html")
 	})
@@ -185,8 +194,11 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.store.List())
 	case http.MethodPost:
 		var input struct {
-			URL       string `json:"url"`
-			Objective string `json:"objective"`
+			URL                     string   `json:"url"`
+			Objective               string   `json:"objective"`
+			ExpectedTexts           []string `json:"expected_texts"`
+			ExpectedLiveStatus      string   `json:"expected_live_status"`
+			UseAuthenticatedSession bool     `json:"use_authenticated_session"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&input); err != nil {
 			writeError(w, http.StatusBadRequest, "请求格式无效")
@@ -202,22 +214,23 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "巡检目标应为 4-500 个字符")
 			return
 		}
-		now := time.Now().UTC()
-		carrier := propagation.MapCarrier{}
-		otel.GetTextMapPropagator().Inject(r.Context(), carrier)
-		traceID := ""
-		if spanContext := trace.SpanContextFromContext(r.Context()); spanContext.IsValid() {
-			traceID = spanContext.TraceID().String()
-		}
-		task := &domain.Task{ID: domain.NewID("task"), URL: input.URL, Objective: input.Objective, Status: domain.StatusQueued, CreatedAt: now, UpdatedAt: now, Version: 1, TraceID: traceID, TraceParent: carrier.Get("traceparent"), TraceState: carrier.Get("tracestate")}
-		task.AddEvent("created", "任务已创建并进入执行队列")
-		if err := s.store.Create(task); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+		expectedTexts, err := validateExpectedTexts(input.ExpectedTexts)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		s.Publish(task.Events[len(task.Events)-1])
-		if s.worker != nil {
-			s.worker.Notify()
+		input.ExpectedLiveStatus = strings.ToLower(strings.TrimSpace(input.ExpectedLiveStatus))
+		if input.ExpectedLiveStatus != "" && input.ExpectedLiveStatus != "any" && input.ExpectedLiveStatus != "live" && input.ExpectedLiveStatus != "offline" {
+			writeError(w, http.StatusBadRequest, "直播状态预期仅支持 any、live 或 offline")
+			return
+		}
+		if input.ExpectedLiveStatus == "any" {
+			input.ExpectedLiveStatus = ""
+		}
+		task, err := s.createTask(r.Context(), &domain.Task{URL: input.URL, Objective: input.Objective, ExpectedTexts: expectedTexts, ExpectedLiveStatus: input.ExpectedLiveStatus, UseAuthenticatedSession: input.UseAuthenticatedSession}, "任务已创建并进入执行队列")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 		writeJSON(w, http.StatusCreated, task)
 	default:
@@ -233,6 +246,25 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parts[0]
+	if len(parts) == 2 && parts[1] == "retry" && r.Method == http.MethodPost {
+		original, err := s.store.Get(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if original.Status == domain.StatusQueued || original.Status == domain.StatusPlanning || original.Status == domain.StatusRunning {
+			writeError(w, http.StatusConflict, "任务仍在执行，结束后才能复测")
+			return
+		}
+		clone := &domain.Task{URL: original.URL, Objective: original.Objective, ExpectedTexts: append([]string(nil), original.ExpectedTexts...), ExpectedLiveStatus: original.ExpectedLiveStatus, UseAuthenticatedSession: original.UseAuthenticatedSession, ParentTaskID: original.ID}
+		retry, err := s.createTask(r.Context(), clone, "复测任务已创建，来源："+original.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, retry)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
 		task, err := s.store.Update(id, func(t *domain.Task) error {
 			if t.Status == domain.StatusCompleted || t.Status == domain.StatusFailed {
@@ -262,6 +294,78 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, task)
+}
+
+func (s *Server) browserSession(w http.ResponseWriter, r *http.Request) {
+	if s.browserSessionState == nil || s.openBrowserSession == nil {
+		writeError(w, http.StatusServiceUnavailable, "专用浏览器会话未启用")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.browserSessionState())
+	case http.MethodPost:
+		var input struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "请求格式无效")
+			return
+		}
+		if input.URL = strings.TrimSpace(input.URL); input.URL == "" {
+			input.URL = "https://www.douyin.com/"
+		}
+		if err := s.openBrowserSession(input.URL); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, s.browserSessionState())
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) createTask(ctx context.Context, task *domain.Task, eventMessage string) (*domain.Task, error) {
+	now := time.Now().UTC()
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	traceID := ""
+	if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
+		traceID = spanContext.TraceID().String()
+	}
+	task.ID = domain.NewID("task")
+	task.Status = domain.StatusQueued
+	task.CreatedAt, task.UpdatedAt, task.Version = now, now, 1
+	task.TraceID, task.TraceParent, task.TraceState = traceID, carrier.Get("traceparent"), carrier.Get("tracestate")
+	task.AddEvent("created", eventMessage)
+	if err := s.store.Create(task); err != nil {
+		return nil, err
+	}
+	s.Publish(task.Events[len(task.Events)-1])
+	if s.worker != nil {
+		s.worker.Notify()
+	}
+	return task, nil
+}
+
+func validateExpectedTexts(input []string) ([]string, error) {
+	if len(input) > 5 {
+		return nil, errors.New("最多设置 5 条预期文案")
+	}
+	seen := map[string]bool{}
+	result := make([]string, 0, len(input))
+	for _, text := range input {
+		text = strings.TrimSpace(text)
+		if text == "" || seen[text] {
+			continue
+		}
+		if len([]rune(text)) > 80 {
+			return nil, errors.New("每条预期文案不能超过 80 个字符")
+		}
+		seen[text] = true
+		result = append(result, text)
+	}
+	return result, nil
 }
 
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {

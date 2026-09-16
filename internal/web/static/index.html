@@ -36,6 +36,23 @@
         <label>验收目标
           <textarea id="objective" name="objective" required>检查页面是否可以正常打开，识别页面标题、直播状态，并判断是否被登录或安全验证阻塞。</textarea>
         </label>
+        <div class="expectation-grid">
+          <label>必须出现的文案 <small>逗号或换行分隔，最多 5 条</small>
+            <textarea id="expectedTexts" class="compact-textarea" placeholder="例如：海边电台，活动入口已开启"></textarea>
+          </label>
+          <label>预期直播状态
+            <select id="expectedLiveStatus">
+              <option value="any">只识别，不限定</option>
+              <option value="live">应该正在直播</option>
+              <option value="offline">应该未开播</option>
+            </select>
+          </label>
+        </div>
+        <div class="auth-session">
+          <div><b>抖音运营登录态</b><span id="sessionStatus">正在检查专用会话…</span></div>
+          <button id="openSession" type="button">打开专用登录窗口 ↗</button>
+          <label class="checkbox-row"><input id="useSession" type="checkbox"> 本次巡检使用该登录态</label>
+        </div>
         <div class="boundary"><b>只读边界</b><span>不关注 · 不评论 · 不点赞 · 不送礼 · 不绕过验证</span></div>
         <div class="demo-preset"><span>闭环演示</span><button id="loadAgentDemo" type="button">载入“活动入口缺失”场景</button></div>
         <button type="submit"><span>启动巡检</span><i>↗</i></button>
@@ -98,7 +115,7 @@
     </section>
 
     <section id="detail" class="panel detail hidden">
-      <div class="panel-label"><span>05</span> 执行证据 <button id="closeDetail" type="button">收起</button></div>
+      <div class="panel-label"><span>05</span> 执行证据 <div class="detail-actions"><button id="retryTask" class="hidden" type="button">一键复测</button><button id="closeDetail" type="button">收起</button></div></div>
       <div class="detail-head"><div><p id="detailId" class="mono"></p><h2 id="detailObjective"></h2><a id="detailURL" target="_blank" rel="noreferrer"></a><a id="detailTrace" class="trace-link hidden" target="_blank" rel="noreferrer"></a></div><span id="detailStatus" class="status"></span></div>
       <div class="evidence-grid">
         <div><h3>执行时间线</h3><ol id="timeline" class="timeline"></ol></div>

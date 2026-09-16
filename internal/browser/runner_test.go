@@ -1,6 +1,8 @@
 package browser
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"liveguard/internal/domain"
@@ -17,6 +19,34 @@ func TestValidateURLUsesHostBoundary(t *testing.T) {
 		if err := runner.validateURL(target); err == nil {
 			t.Fatalf("expected %s to be rejected", target)
 		}
+	}
+}
+
+func TestEvaluateOperationalExpectations(t *testing.T) {
+	runner := &Runner{}
+	plan := []domain.CheckSpec{
+		{Key: "copy", Label: "运营预期文案", Kind: "contains_all", Terms: []string{"海边电台", "活动入口已开启"}},
+		{Key: "status", Label: "预期正在直播", Kind: "expected_live_status", Terms: []string{"live"}},
+	}
+	checks, needsHuman := runner.Evaluate(plan, Result{Title: "直播间", BodyText: "海边电台 正在直播 活动入口已开启"})
+	if needsHuman || checks[0].Status != domain.CheckPassed || checks[1].Status != domain.CheckPassed {
+		t.Fatalf("expected both operational checks to pass: %#v", checks)
+	}
+
+	checks, _ = runner.Evaluate(plan, Result{Title: "直播间", BodyText: "海边电台 直播已结束"})
+	if checks[0].Status != domain.CheckFailed || !strings.Contains(checks[0].Observed, "活动入口已开启") {
+		t.Fatalf("expected missing copy to fail with evidence: %#v", checks[0])
+	}
+	if checks[1].Status != domain.CheckFailed {
+		t.Fatalf("expected live status mismatch to fail: %#v", checks[1])
+	}
+}
+
+func TestAuthenticatedInspectionRequiresClosedLoginWindow(t *testing.T) {
+	runner := &Runner{ProfileDir: t.TempDir(), SessionProfileDir: t.TempDir(), ArtifactDir: t.TempDir(), AllowedHosts: map[string]bool{"localhost": true}, sessionOpen: true}
+	_, err := runner.Inspect(context.Background(), "task-one", "http://localhost/demo", true)
+	if err == nil || !strings.Contains(err.Error(), "关闭窗口") {
+		t.Fatalf("expected actionable profile lock error, got %v", err)
 	}
 }
 

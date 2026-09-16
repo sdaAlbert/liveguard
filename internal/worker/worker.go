@@ -117,6 +117,7 @@ func (w *Worker) run(ctx context.Context, id string) {
 		w.fail(id, err)
 		return
 	}
+	plan = appendExpectations(plan, task)
 	_, err = w.store.Update(id, func(t *domain.Task) error {
 		if t.Status == domain.StatusCancelled {
 			return errors.New("task cancelled")
@@ -130,9 +131,13 @@ func (w *Worker) run(ctx context.Context, id string) {
 		return
 	}
 	w.publishLatest(id)
-	w.addEvent(id, "browser", "正在启动独立 Chrome 会话并访问目标页面")
+	browserMessage := "正在启动独立 Chrome 会话并访问目标页面"
+	if task.UseAuthenticatedSession {
+		browserMessage = "正在使用运营专用登录态访问目标页面"
+	}
+	w.addEvent(id, "browser", browserMessage)
 	browserCtx, browserSpan := otel.Tracer("liveguard/agent").Start(ctx, "browser.inspect")
-	page, err := w.browser.Inspect(browserCtx, id, task.URL)
+	page, err := w.browser.Inspect(browserCtx, id, task.URL, task.UseAuthenticatedSession)
 	browserSpan.End()
 	if err != nil {
 		w.fail(id, fmt.Errorf("browser inspection: %w", err))
@@ -141,7 +146,7 @@ func (w *Worker) run(ctx context.Context, id string) {
 	w.addEvent(id, "evidence", "页面读取完成，截图证据已保存")
 	checks, needsHuman := w.browser.Evaluate(plan, page)
 	status := domain.StatusCompleted
-	summary := "巡检完成；请结合每项证据判断是否可以继续上线流程"
+	summary := "巡检执行完成"
 	var toolCalls []domain.ToolCall
 	decisionInput := agent.DecisionInput{Objective: task.Objective, PageTitle: page.Title, PageText: page.BodyText, Checks: checks, NeedsHuman: needsHuman}
 	decisionCtx, decisionSpan := otel.Tracer("liveguard/agent").Start(ctx, "agent.decide_tool")
@@ -191,20 +196,66 @@ func (w *Worker) run(ctx context.Context, id string) {
 	}
 	if needsHuman {
 		status = domain.StatusNeedsHuman
-		summary = "检测到登录或安全验证，需要人工接管后继续"
+	}
+	verdict, verdictSummary := summarizeChecks(checks, needsHuman)
+	if len(toolCalls) == 0 || verdict == "needs_human" {
+		summary = verdictSummary
 	}
 	_, err = w.store.Update(id, func(t *domain.Task) error {
 		if t.Status == domain.StatusCancelled {
 			return errors.New("task cancelled")
 		}
 		t.Status = status
-		t.Report = &domain.Report{Title: page.Title, FinalURL: page.FinalURL, Screenshot: page.Screenshot, Planner: plannerSource, Summary: summary, Checks: checks, ToolCalls: toolCalls, Decision: &decisionResult.Audit, CompletedAt: time.Now().UTC()}
+		t.Report = &domain.Report{Title: page.Title, FinalURL: page.FinalURL, Screenshot: page.Screenshot, Planner: plannerSource, Verdict: verdict, Summary: summary, Checks: checks, ToolCalls: toolCalls, Decision: &decisionResult.Audit, CompletedAt: time.Now().UTC()}
 		t.AddEvent("report", summary)
 		return nil
 	})
 	if err == nil {
 		w.publishLatest(id)
 	}
+}
+
+func appendExpectations(plan []domain.CheckSpec, task *domain.Task) []domain.CheckSpec {
+	result := append([]domain.CheckSpec(nil), plan...)
+	if len(task.ExpectedTexts) > 0 {
+		result = append(result, domain.CheckSpec{
+			Key: "expected_texts", Label: "运营预期文案", Kind: "contains_all", Terms: append([]string(nil), task.ExpectedTexts...),
+			Description: "确认运营配置要求展示的文案都出现在页面中",
+		})
+	}
+	if task.ExpectedLiveStatus == "live" || task.ExpectedLiveStatus == "offline" {
+		label := "预期正在直播"
+		if task.ExpectedLiveStatus == "offline" {
+			label = "预期未开播"
+		}
+		result = append(result, domain.CheckSpec{
+			Key: "expected_live_status", Label: label, Kind: "expected_live_status", Terms: []string{task.ExpectedLiveStatus},
+			Description: "将页面可见直播状态与运营预期进行比对",
+		})
+	}
+	return result
+}
+
+func summarizeChecks(checks []domain.CheckResult, needsHuman bool) (string, string) {
+	if needsHuman {
+		return "needs_human", "检测到登录或安全验证；请人工处理后发起复测"
+	}
+	failed, unverified := 0, 0
+	for _, check := range checks {
+		switch check.Status {
+		case domain.CheckFailed:
+			failed++
+		case domain.CheckUnverified:
+			unverified++
+		}
+	}
+	if failed > 0 {
+		return "failed", fmt.Sprintf("发现 %d 项不符合运营预期", failed)
+	}
+	if unverified > 0 {
+		return "unverified", fmt.Sprintf("有 %d 项无法自动确认，需要人工复核", unverified)
+	}
+	return "passed", "全部检查符合运营预期"
 }
 
 func (w *Worker) transition(id string, status domain.Status, eventType, message string) {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"liveguard/internal/domain"
@@ -32,14 +33,76 @@ type Result struct {
 }
 
 type Runner struct {
-	ChromePath   string
-	ProfileDir   string
-	ArtifactDir  string
-	Headless     bool
-	AllowedHosts map[string]bool
+	ChromePath        string
+	ProfileDir        string
+	SessionProfileDir string
+	ArtifactDir       string
+	Headless          bool
+	AllowedHosts      map[string]bool
+	sessionMu         sync.Mutex
+	sessionUseMu      sync.Mutex
+	sessionOpen       bool
+	sessionInspecting bool
 }
 
-func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string) (Result, error) {
+type SessionState struct {
+	Configured bool `json:"configured"`
+	Open       bool `json:"open"`
+	Inspecting bool `json:"inspecting"`
+}
+
+func (r *Runner) OpenSession(targetURL string) error {
+	if err := r.validateURL(targetURL); err != nil {
+		return err
+	}
+	if strings.TrimSpace(r.SessionProfileDir) == "" {
+		return errors.New("专用登录会话未配置")
+	}
+	profile, err := filepath.Abs(r.SessionProfileDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		return err
+	}
+	r.sessionMu.Lock()
+	if r.sessionOpen {
+		r.sessionMu.Unlock()
+		return errors.New("专用登录窗口已打开；请在该窗口完成登录")
+	}
+	if r.sessionInspecting {
+		r.sessionMu.Unlock()
+		return errors.New("专用登录态正在执行巡检，请稍后再打开登录窗口")
+	}
+	command := exec.Command(r.ChromePath,
+		"--new-window",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--user-data-dir="+profile,
+		targetURL,
+	)
+	if err := command.Start(); err != nil {
+		r.sessionMu.Unlock()
+		return fmt.Errorf("启动 Chrome 登录窗口: %w", err)
+	}
+	r.sessionOpen = true
+	r.sessionMu.Unlock()
+	go func() {
+		_ = command.Wait()
+		r.sessionMu.Lock()
+		r.sessionOpen = false
+		r.sessionMu.Unlock()
+	}()
+	return nil
+}
+
+func (r *Runner) SessionState() SessionState {
+	r.sessionMu.Lock()
+	defer r.sessionMu.Unlock()
+	return SessionState{Configured: strings.TrimSpace(r.SessionProfileDir) != "", Open: r.sessionOpen, Inspecting: r.sessionInspecting}
+}
+
+func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string, useAuthenticatedSession bool) (Result, error) {
 	if err := r.validateURL(targetURL); err != nil {
 		return Result{}, err
 	}
@@ -52,7 +115,7 @@ func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string) (Result,
 		return Result{}, err
 	}
 	var visible *exec.Cmd
-	if !r.Headless {
+	if !r.Headless && !useAuthenticatedSession {
 		visible = exec.CommandContext(ctx, r.ChromePath,
 			"--new-window",
 			"--no-first-run",
@@ -68,7 +131,29 @@ func (r *Runner) Inspect(ctx context.Context, taskID, targetURL string) (Result,
 	if err != nil {
 		return Result{}, err
 	}
-	inspectionProfile, err := filepath.Abs(filepath.Join(taskProfile, "inspection"))
+	inspectionProfilePath := filepath.Join(taskProfile, "inspection")
+	if useAuthenticatedSession {
+		r.sessionUseMu.Lock()
+		defer r.sessionUseMu.Unlock()
+		r.sessionMu.Lock()
+		if strings.TrimSpace(r.SessionProfileDir) == "" {
+			r.sessionMu.Unlock()
+			return Result{}, errors.New("专用登录会话未配置")
+		}
+		if r.sessionOpen {
+			r.sessionMu.Unlock()
+			return Result{}, errors.New("请先在专用窗口完成登录并关闭窗口，再启动巡检")
+		}
+		r.sessionInspecting = true
+		r.sessionMu.Unlock()
+		defer func() {
+			r.sessionMu.Lock()
+			r.sessionInspecting = false
+			r.sessionMu.Unlock()
+		}()
+		inspectionProfilePath = r.SessionProfileDir
+	}
+	inspectionProfile, err := filepath.Abs(inspectionProfilePath)
 	if err != nil {
 		return Result{}, err
 	}
@@ -149,6 +234,35 @@ func (r *Runner) Evaluate(plan []domain.CheckSpec, result Result) ([]domain.Chec
 				check.Status = domain.CheckUnverified
 				check.Observed = "没有找到指定文本；页面结构、登录状态或目标描述可能影响结果"
 			}
+		case "contains_all":
+			matched := matchingTerms(bodyLower, spec.Terms)
+			if len(matched) == len(nonEmptyTerms(spec.Terms)) {
+				check.Status = domain.CheckPassed
+				check.Observed = "全部预期文案均可见：" + strings.Join(matched, "、")
+			} else {
+				missing := missingTerms(bodyLower, spec.Terms)
+				check.Status = domain.CheckFailed
+				check.Observed = "缺少预期文案：" + strings.Join(missing, "、")
+			}
+		case "expected_live_status":
+			expected := ""
+			if len(spec.Terms) > 0 {
+				expected = strings.ToLower(strings.TrimSpace(spec.Terms[0]))
+			}
+			live := containsAny(bodyLower, []string{"直播中", "正在直播", "live now"})
+			offline := containsAny(bodyLower, []string{"未开播", "直播已结束", "已下播", "offline"})
+			switch {
+			case expected == "live" && live:
+				check.Status, check.Observed = domain.CheckPassed, "页面显示正在直播"
+			case expected == "offline" && offline:
+				check.Status, check.Observed = domain.CheckPassed, "页面显示未开播或直播已结束"
+			case expected == "live" && offline:
+				check.Status, check.Observed = domain.CheckFailed, "预期正在直播，但页面显示未开播或已结束"
+			case expected == "offline" && live:
+				check.Status, check.Observed = domain.CheckFailed, "预期未开播，但页面显示正在直播"
+			default:
+				check.Status, check.Observed = domain.CheckUnverified, "页面中没有可确认直播状态的文本"
+			}
 		case "live_status":
 			matched := matchingTerms(bodyLower, []string{"直播中", "正在直播", "未开播", "直播已结束", "live"})
 			if len(matched) > 0 {
@@ -201,6 +315,26 @@ func matchingTerms(input string, terms []string) []string {
 		}
 	}
 	return matched
+}
+
+func nonEmptyTerms(terms []string) []string {
+	result := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if term = strings.TrimSpace(term); term != "" {
+			result = append(result, term)
+		}
+	}
+	return result
+}
+
+func missingTerms(input string, terms []string) []string {
+	var missing []string
+	for _, term := range nonEmptyTerms(terms) {
+		if !strings.Contains(input, strings.ToLower(term)) {
+			missing = append(missing, term)
+		}
+	}
+	return missing
 }
 
 func truncate(input string, max int) string {

@@ -8,6 +8,8 @@
 
 LiveGuard uses livestream page inspection to demonstrate the path from browser evidence to a durable sandbox job. The default demo uses deterministic decisions for offline reproducibility. Responses API tool calling is integrated, but online model behavior has not been evaluated. This is an architecture reference, not a production platform.
 
+Operators can define required visible copy and an expected live status as an acceptance contract. The report returns a `passed`, `failed`, `unverified`, or `needs_human` business verdict. Login or challenge pages are handled in a dedicated Chrome profile, after which the same task can be retried with one click.
+
 ![LiveGuard task report](docs/assets/liveguard-task-report.png)
 
 ## How a task runs
@@ -32,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1
 - Dashboard: <http://127.0.0.1:8080>
 - Jaeger: <http://127.0.0.1:16686>
 
-Load the missing-activity-entry scenario and start a task. The agent should request a diagnosis, the policy should approve it, the sandbox should report missing evidence, and the activity check should change from `unverified` to `failed`. Agent Eval should pass 6/6 and Sandbox Lab 4/4.
+Load the missing-activity-entry scenario and start a task. The report should show `FAILED` with the missing copy, and the task can be retried after a fix. For authenticated Douyin pages, open the dedicated login window, sign in manually, close that window, and enable the saved session for the inspection. Agent Eval should pass 6/6 and Sandbox Lab 4/4.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1 status

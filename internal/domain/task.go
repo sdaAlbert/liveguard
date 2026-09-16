@@ -51,6 +51,7 @@ type Report struct {
 	FinalURL    string         `json:"final_url"`
 	Screenshot  string         `json:"screenshot,omitempty"`
 	Planner     string         `json:"planner"`
+	Verdict     string         `json:"verdict"`
 	Summary     string         `json:"summary"`
 	Checks      []CheckResult  `json:"checks"`
 	ToolCalls   []ToolCall     `json:"tool_calls,omitempty"`
@@ -85,20 +86,24 @@ type ToolCall struct {
 }
 
 type Task struct {
-	ID          string      `json:"id"`
-	URL         string      `json:"url"`
-	Objective   string      `json:"objective"`
-	Status      Status      `json:"status"`
-	Error       string      `json:"error,omitempty"`
-	Plan        []CheckSpec `json:"plan,omitempty"`
-	Events      []Event     `json:"events,omitempty"`
-	Report      *Report     `json:"report,omitempty"`
-	CreatedAt   time.Time   `json:"created_at"`
-	UpdatedAt   time.Time   `json:"updated_at"`
-	Version     int64       `json:"version"`
-	TraceID     string      `json:"trace_id,omitempty"`
-	TraceParent string      `json:"trace_parent,omitempty"`
-	TraceState  string      `json:"trace_state,omitempty"`
+	ID                      string      `json:"id"`
+	URL                     string      `json:"url"`
+	Objective               string      `json:"objective"`
+	ExpectedTexts           []string    `json:"expected_texts,omitempty"`
+	ExpectedLiveStatus      string      `json:"expected_live_status,omitempty"`
+	UseAuthenticatedSession bool        `json:"use_authenticated_session,omitempty"`
+	ParentTaskID            string      `json:"parent_task_id,omitempty"`
+	Status                  Status      `json:"status"`
+	Error                   string      `json:"error,omitempty"`
+	Plan                    []CheckSpec `json:"plan,omitempty"`
+	Events                  []Event     `json:"events,omitempty"`
+	Report                  *Report     `json:"report,omitempty"`
+	CreatedAt               time.Time   `json:"created_at"`
+	UpdatedAt               time.Time   `json:"updated_at"`
+	Version                 int64       `json:"version"`
+	TraceID                 string      `json:"trace_id,omitempty"`
+	TraceParent             string      `json:"trace_parent,omitempty"`
+	TraceState              string      `json:"trace_state,omitempty"`
 }
 
 func (t *Task) AddEvent(kind, message string) {

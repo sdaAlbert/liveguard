@@ -8,6 +8,8 @@
 
 LiveGuard 用“直播页面巡检”展示从浏览器证据到持久化 Sandbox 任务的完整链路。默认演示使用确定性决策，便于离线复现；Responses API Tool Calling 已接入，但在线模型效果尚未评测。这是架构参考实现，不是生产平台。
 
+运营人员可以把必须出现的文案和预期直播状态作为验收口径。系统输出 `passed`、`failed`、`unverified` 或 `needs_human` 业务结论；遇到登录或验证码时，由运营人员在隔离的专用 Chrome 配置中处理，随后一键复测原任务。
+
 ![LiveGuard 任务报告](docs/assets/liveguard-task-report.png)
 
 ## 一次任务如何执行
@@ -32,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1
 - 控制台：<http://127.0.0.1:8080>
 - Jaeger：<http://127.0.0.1:16686>
 
-在控制台载入“活动入口缺失”场景并启动任务。预期结果是 Agent 请求诊断、Policy 批准、Sandbox 返回缺失证据，活动入口检查由 `unverified` 更新为 `failed`。Agent Eval 应为 6/6，Sandbox Lab 应为 4/4。
+在控制台载入“活动入口缺失”场景并启动任务。预期结果是报告明确显示 `FAILED` 和缺失文案；修复后可一键复测。需要检查真实抖音登录页时，先打开专用登录窗口、手动登录并关闭窗口，再勾选使用该登录态。Agent Eval 应为 6/6，Sandbox Lab 应为 4/4。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\demo.ps1 status
