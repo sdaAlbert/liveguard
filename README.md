@@ -2,6 +2,8 @@
 
 [中文](README.md) · [English](README_EN.md)
 
+[![CI](https://github.com/sdaAlbert/liveguard/actions/workflows/ci.yml/badge.svg)](https://github.com/sdaAlbert/liveguard/actions/workflows/ci.yml)
+
 > 一个用 Go 构建的直播页面巡检 Agent：浏览器负责取证，模型负责提出工具调用，策略层负责授权，Sandbox 负责隔离执行，执行链展示持久化投递、策略审计和分布式追踪。
 
 LiveGuard 不是聊天机器人，也不是通用网页自动化框架。它用一个具体业务场景回答一个工程问题：**怎样让不稳定的模型安全、可靠、可观测地调用真实工具？**

@@ -2,6 +2,8 @@
 
 [中文](README.md) · [English](README_EN.md)
 
+[![CI](https://github.com/sdaAlbert/liveguard/actions/workflows/ci.yml/badge.svg)](https://github.com/sdaAlbert/liveguard/actions/workflows/ci.yml)
+
 > A Go reference implementation for livestream page inspection: the browser collects evidence, the model proposes a tool, the policy layer authorizes it, and a sandbox executes it through a pipeline with durable delivery, policy audit, and distributed tracing.
 
 LiveGuard is not a chatbot or a general browser automation framework. It uses one concrete workflow to answer an engineering question: **how can an unreliable model call real tools safely, durably, and observably?**
