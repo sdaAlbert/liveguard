@@ -1,0 +1,11 @@
+{
+  "campaign_id": "campaign_1789611384916_03a16b1c",
+  "requested": 12,
+  "passed": 12,
+  "attention": 0,
+  "wall_time_ms": 7606,
+  "throughput_per_sec": 1.5776602675057083,
+  "latency_p50_ms": 4691,
+  "latency_p95_ms": 6992,
+  "measured_at": "2026-09-17T02:16:32Z"
+}

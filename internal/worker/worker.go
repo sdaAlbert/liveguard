@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,29 +19,36 @@ import (
 )
 
 type Worker struct {
-	store   *store.Store
-	planner agent.Planner
-	browser *browser.Runner
-	tools   ToolRunner
-	decider agent.ToolDecider
-	policy  agent.ToolPolicy
-	wake    chan struct{}
-	mu      sync.Mutex
-	running map[string]context.CancelFunc
-	onEvent func(domain.Event)
+	store         store.TaskRepository
+	planner       agent.Planner
+	browser       *browser.Runner
+	tools         ToolRunner
+	decider       agent.ToolDecider
+	policy        agent.ToolPolicy
+	wake          chan struct{}
+	mu            sync.Mutex
+	running       map[string]context.CancelFunc
+	maxConcurrent int
+	onEvent       func(domain.Event)
 }
 
 type ToolRunner interface {
 	RunTool(context.Context, sandbox.ToolInput, string) (*sandbox.Run, error)
 }
 
-func New(s *store.Store, planner agent.Planner, browserRunner *browser.Runner, tools ToolRunner, onEvent func(domain.Event)) *Worker {
-	return &Worker{store: s, planner: planner, browser: browserRunner, tools: tools, decider: agent.DeterministicToolDecider{}, policy: agent.ToolPolicy{}, wake: make(chan struct{}, 1), running: map[string]context.CancelFunc{}, onEvent: onEvent}
+func New(s store.TaskRepository, planner agent.Planner, browserRunner *browser.Runner, tools ToolRunner, onEvent func(domain.Event)) *Worker {
+	return &Worker{store: s, planner: planner, browser: browserRunner, tools: tools, decider: agent.DeterministicToolDecider{}, policy: agent.ToolPolicy{}, wake: make(chan struct{}, 1), running: map[string]context.CancelFunc{}, onEvent: onEvent, maxConcurrent: 4}
 }
 
 func (w *Worker) SetToolDecider(decider agent.ToolDecider) {
 	if decider != nil {
 		w.decider = decider
+	}
+}
+
+func (w *Worker) SetMaxConcurrent(limit int) {
+	if limit > 0 {
+		w.maxConcurrent = limit
 	}
 }
 
@@ -79,7 +87,14 @@ func (w *Worker) dispatch(parent context.Context) {
 		if task.Status != domain.StatusQueued {
 			continue
 		}
+		if task.NextAttemptAt != nil && task.NextAttemptAt.After(time.Now()) {
+			continue
+		}
 		w.mu.Lock()
+		if len(w.running) >= w.maxConcurrent {
+			w.mu.Unlock()
+			return
+		}
 		_, exists := w.running[task.ID]
 		if exists {
 			w.mu.Unlock()
@@ -100,16 +115,27 @@ func (w *Worker) run(ctx context.Context, id string) {
 		}
 		delete(w.running, id)
 		w.mu.Unlock()
+		w.Notify()
 	}()
-	task, err := w.store.Get(id)
+	task, err := w.store.Update(id, func(t *domain.Task) error {
+		if t.Status != domain.StatusQueued {
+			return errors.New("task is no longer queued")
+		}
+		t.Status = domain.StatusPlanning
+		t.Error = ""
+		t.Attempt++
+		t.NextAttemptAt = nil
+		t.AddEvent("planning", fmt.Sprintf("开始第 %d/%d 次执行", t.Attempt, t.MaxAttempts))
+		return nil
+	})
 	if err != nil {
 		return
 	}
+	w.publishLatest(id)
 	ctx = sandbox.ExtractTrace(ctx, task.TraceParent, task.TraceState)
 	ctx, runSpan := otel.Tracer("liveguard/agent").Start(ctx, "agent.run")
 	runSpan.SetAttributes(attribute.String("task.id", id), attribute.String("task.url", task.URL))
 	defer runSpan.End()
-	w.transition(id, domain.StatusPlanning, "planning", "正在把巡检目标转换为受约束的检查计划")
 	planCtx, planSpan := otel.Tracer("liveguard/agent").Start(ctx, "agent.plan")
 	plan, plannerSource, err := w.planner.Plan(planCtx, task.URL, task.Objective)
 	planSpan.End()
@@ -283,14 +309,29 @@ func (w *Worker) addEvent(id, eventType, message string) {
 func (w *Worker) fail(id string, cause error) {
 	status := domain.StatusFailed
 	message := cause.Error()
+	retryable := isRetryable(cause)
 	if errors.Is(cause, context.Canceled) {
 		status, message = domain.StatusCancelled, "任务已取消"
+		retryable = false
 	}
 	if errors.Is(cause, context.DeadlineExceeded) {
 		message = "任务超过 75 秒执行预算"
 	}
 	_, err := w.store.Update(id, func(t *domain.Task) error {
 		if t.Status == domain.StatusCancelled {
+			return nil
+		}
+		maxAttempts := t.MaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 1
+		}
+		if retryable && t.Attempt < maxAttempts {
+			delay := retryDelay(t.Attempt)
+			next := time.Now().UTC().Add(delay)
+			t.Status = domain.StatusQueued
+			t.Error = message
+			t.NextAttemptAt = &next
+			t.AddEvent("retry", fmt.Sprintf("执行失败，%s 后自动重试（%d/%d）", delay, t.Attempt+1, maxAttempts))
 			return nil
 		}
 		t.Status = status
@@ -301,6 +342,24 @@ func (w *Worker) fail(id string, cause error) {
 	if err == nil {
 		w.publishLatest(id)
 	}
+}
+
+func isRetryable(cause error) bool {
+	if cause == nil || errors.Is(cause, context.Canceled) {
+		return false
+	}
+	message := strings.ToLower(cause.Error())
+	return errors.Is(cause, context.DeadlineExceeded) || strings.Contains(message, "browser inspection") || strings.Contains(message, "sandbox tool") || strings.Contains(message, "rpc") || strings.Contains(message, "tempor")
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 4 {
+		attempt = 4
+	}
+	return time.Duration(1<<attempt) * time.Second
 }
 
 func (w *Worker) publishLatest(id string) {

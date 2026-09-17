@@ -55,3 +55,26 @@ func TestSnapshotsAreReturnedAsCopies(t *testing.T) {
 		t.Fatal("caller mutated repository state without Update")
 	}
 }
+
+func TestCreateManyPersistsBatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.jsonl")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tasks := []*domain.Task{
+		{ID: "task-batch-1", CampaignID: "campaign-1", Status: domain.StatusQueued, CreatedAt: now, UpdatedAt: now},
+		{ID: "task-batch-2", CampaignID: "campaign-1", Status: domain.StatusQueued, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := s.CreateMany(tasks); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened.List()) != 2 {
+		t.Fatalf("expected two persisted tasks, got %d", len(reopened.List()))
+	}
+}

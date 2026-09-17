@@ -1,6 +1,8 @@
 const $ = selector => document.querySelector(selector);
 let selectedTaskId = new URLSearchParams(location.search).get("task");
 let sessionState = {open: false, inspecting: false};
+let formMode = "single";
+let selectedCampaignId = null;
 
 const statusText = {
   queued: "等待中", planning: "准备中", running: "检查中", needs_human: "需要人工处理",
@@ -46,19 +48,65 @@ function friendlySummary(summary = "") {
   return summary;
 }
 
-async function loadTasks() {
-  const tasks = await request("/api/tasks");
-  $("#runningCount").textContent = tasks.filter(t => ["queued", "planning", "running"].includes(t.status)).length;
-  $("#passedCount").textContent = tasks.filter(t => t.report?.verdict === "passed").length;
-  $("#attentionCount").textContent = tasks.filter(t => t.status === "failed" || t.status === "needs_human" || ["failed", "unverified"].includes(t.report?.verdict)).length;
-  const recent = tasks.slice(0, 6);
+function renderTasks(tasks) {
+  const recent = tasks.slice(0, 8);
   $("#taskList").innerHTML = recent.length ? recent.map(task => {
     const result = taskResult(task);
     const summary = friendlySummary(task.report?.summary) || friendlyError(task.error) || statusText[task.status];
     return `<button class="task" data-id="${escapeHTML(task.id)}"><span class="task-main"><b>${escapeHTML(hostLabel(task.url))}</b><small>${escapeHTML(summary)}</small></span><span class="result-badge ${escapeHTML(result.key)}">${escapeHTML(result.label)}</span></button>`;
   }).join("") : '<div class="empty">还没有巡检记录</div>';
   document.querySelectorAll(".task").forEach(button => button.addEventListener("click", () => showTask(button.dataset.id)));
+}
+
+function updateMetrics(tasks) {
+  $("#runningCount").textContent = tasks.filter(t => ["queued", "planning", "running"].includes(t.status)).length;
+  $("#passedCount").textContent = tasks.filter(t => t.report?.verdict === "passed").length;
+  $("#attentionCount").textContent = tasks.filter(t => t.status === "failed" || t.status === "needs_human" || ["failed", "unverified"].includes(t.report?.verdict)).length;
+}
+
+function renderCampaigns(campaigns) {
+  const list = $("#campaignList");
+  list.classList.toggle("hidden", !campaigns.length);
+  list.innerHTML = campaigns.map(campaign => {
+    const finished = campaign.passed + campaign.attention;
+    const progress = campaign.total ? Math.round(finished * 100 / campaign.total) : 0;
+    const state = campaign.running || campaign.queued ? `${campaign.running} 个执行中 · ${campaign.queued} 个等待` : "已完成";
+    return `<article class="campaign"><div class="campaign-head"><button class="open-campaign" data-id="${escapeHTML(campaign.id)}">${escapeHTML(campaign.name)}</button><span>${finished}/${campaign.total}</span></div><div class="campaign-meta"><span>${escapeHTML(state)}</span><span class="${campaign.attention ? "campaign-attention" : ""}">${campaign.passed} 正常 · ${campaign.attention} 需处理${campaign.retrying ? ` · ${campaign.retrying} 重试中` : ""}</span></div><div class="campaign-progress"><i style="width:${progress}%"></i></div>${campaign.attention ? `<button class="retry-campaign" data-id="${escapeHTML(campaign.id)}">复测异常直播间</button>` : ""}</article>`;
+  }).join("");
+  document.querySelectorAll(".open-campaign").forEach(button => button.addEventListener("click", () => showCampaign(button.dataset.id)));
+  document.querySelectorAll(".retry-campaign").forEach(button => button.addEventListener("click", event => retryCampaign(event.currentTarget.dataset.id, event.currentTarget)));
+}
+
+async function loadTasks() {
+  const [tasks, campaigns] = await Promise.all([request("/api/tasks"), request("/api/campaigns")]);
+  updateMetrics(tasks);
+  if (selectedCampaignId) {
+    const campaign = await request(`/api/campaigns/${encodeURIComponent(selectedCampaignId)}`);
+    $("#resultsTitle").textContent = campaign.name;
+    renderCampaigns([]);
+    renderTasks(campaign.tasks || []);
+  } else {
+    $("#resultsTitle").textContent = campaigns.length ? "巡检批次" : "最近结果";
+    renderCampaigns(campaigns.slice(0, 4));
+    renderTasks(campaigns.length ? tasks.filter(task => !task.campaign_id).slice(0, 3) : tasks.slice(0, 6));
+  }
   if (selectedTaskId) await showTask(selectedTaskId, false);
+}
+
+async function showCampaign(id) {
+  selectedCampaignId = id;
+  selectedTaskId = null;
+  await loadTasks();
+}
+
+async function retryCampaign(id, button) {
+  button.disabled = true;
+  try {
+    await request(`/api/campaigns/${encodeURIComponent(id)}/retry-failed`, {method:"POST"});
+    selectedCampaignId = id;
+    await loadTasks();
+  } catch (error) { $("#formError").textContent = error.message; }
+  finally { button.disabled = false; }
 }
 
 function friendlyEvents(task) {
@@ -109,6 +157,18 @@ function updateSubmitState() {
   else if ($("#formError").textContent.includes("登录窗口") || $("#formError").textContent.includes("正在执行")) $("#formError").textContent = "";
 }
 
+function setFormMode(mode) {
+  formMode = mode;
+  document.querySelectorAll(".mode-tabs button").forEach(button => button.classList.toggle("active", button.dataset.mode === mode));
+  $("#singleURLField").classList.toggle("hidden", mode === "batch");
+  $("#batchFields").classList.toggle("hidden", mode !== "batch");
+  $("#url").required = mode === "single";
+  $("#batchURLs").required = mode === "batch";
+  $("#submitLabel").textContent = mode === "batch" ? "开始批量巡检" : "开始巡检";
+}
+
+document.querySelectorAll(".mode-tabs button").forEach(button => button.addEventListener("click", () => setFormMode(button.dataset.mode)));
+
 async function loadBrowserSession() {
   sessionState = await request("/api/browser/session");
   const status = $("#sessionStatus");
@@ -146,12 +206,22 @@ $("#taskForm").addEventListener("submit", async event => {
   $("#submitTask").disabled = true;
   try {
     const expectedTexts = $("#expectedTexts").value.split(/[，,\n]/).map(text => text.trim()).filter(Boolean);
-    const body = {url:$("#url").value, objective:"检查直播间是否可以正常访问，识别直播状态，并验证指定页面内容。", expected_texts:expectedTexts, expected_live_status:$("#expectedLiveStatus").value, use_authenticated_session:$("#useSession").checked};
-    const task = await request("/api/tasks", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    selectedTaskId = task.id;
-    await loadTasks();
-    await showTask(task.id);
-    $("#detail").scrollIntoView({behavior:"smooth", block:"start"});
+    const shared = {expected_texts:expectedTexts, expected_live_status:$("#expectedLiveStatus").value, use_authenticated_session:$("#useSession").checked};
+    if (formMode === "batch") {
+      const urls = $("#batchURLs").value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+      const campaign = await request("/api/campaigns", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({...shared, name:$("#campaignName").value, urls})});
+      selectedCampaignId = campaign.id;
+      selectedTaskId = null;
+      await loadTasks();
+    } else {
+      const body = {...shared, url:$("#url").value, objective:"检查直播间是否可以正常访问，识别直播状态，并验证指定页面内容。"};
+      const task = await request("/api/tasks", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      selectedCampaignId = null;
+      selectedTaskId = task.id;
+      await loadTasks();
+      await showTask(task.id);
+      $("#detail").scrollIntoView({behavior:"smooth", block:"start"});
+    }
   } catch (error) { $("#formError").textContent = error.message; }
   finally { updateSubmitState(); }
 });
@@ -168,7 +238,7 @@ $("#retryTask").addEventListener("click", async event => {
   finally { event.currentTarget.disabled = false; }
 });
 
-$("#refresh").addEventListener("click", loadTasks);
+$("#refresh").addEventListener("click", () => { selectedCampaignId = null; loadTasks(); });
 $("#closeDetail").addEventListener("click", () => { $("#detail").classList.add("hidden"); selectedTaskId = null; });
 
 const events = new EventSource("/api/events");

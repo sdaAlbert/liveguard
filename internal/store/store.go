@@ -15,6 +15,15 @@ import (
 
 var ErrNotFound = errors.New("task not found")
 
+type TaskRepository interface {
+	RecoverInterrupted() error
+	Create(*domain.Task) error
+	CreateMany([]*domain.Task) error
+	Update(string, func(*domain.Task) error) (*domain.Task, error)
+	Get(string) (*domain.Task, error)
+	List() []*domain.Task
+}
+
 type Store struct {
 	mu    sync.RWMutex
 	path  string
@@ -71,14 +80,25 @@ func (s *Store) RecoverInterrupted() error {
 }
 
 func (s *Store) Create(task *domain.Task) error {
+	return s.CreateMany([]*domain.Task{task})
+}
+
+func (s *Store) CreateMany(tasks []*domain.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.tasks[task.ID]; exists {
-		return errors.New("task already exists")
+	for _, task := range tasks {
+		if _, exists := s.tasks[task.ID]; exists {
+			return errors.New("task already exists")
+		}
 	}
-	copy := clone(task)
-	s.tasks[task.ID] = copy
-	return s.appendLocked(copy)
+	for _, task := range tasks {
+		copy := clone(task)
+		if err := s.appendLocked(copy); err != nil {
+			return err
+		}
+		s.tasks[task.ID] = copy
+	}
+	return nil
 }
 
 func (s *Store) Update(id string, mutate func(*domain.Task) error) (*domain.Task, error) {

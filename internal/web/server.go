@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,7 @@ import (
 var assets embed.FS
 
 type Server struct {
-	store               *store.Store
+	store               store.TaskRepository
 	worker              *worker.Worker
 	sandboxLab          SandboxService
 	artifactDir         string
@@ -49,7 +50,7 @@ type SandboxService interface {
 	SubmitSuiteWithKey(idempotencyKey string) ([]*sandbox.Run, error)
 }
 
-func New(s *store.Store, artifactDir string) *Server {
+func New(s store.TaskRepository, artifactDir string) *Server {
 	return &Server{store: s, artifactDir: artifactDir, subscribers: map[chan domain.Event]struct{}{}}
 }
 
@@ -82,6 +83,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/artifacts/", http.StripPrefix("/artifacts/", http.FileServer(http.Dir(s.artifactDir))))
 	mux.HandleFunc("/api/tasks", s.tasks)
 	mux.HandleFunc("/api/tasks/", s.task)
+	mux.HandleFunc("/api/campaigns", s.campaigns)
+	mux.HandleFunc("/api/campaigns/", s.campaign)
 	mux.HandleFunc("/api/events", s.events)
 	mux.HandleFunc("/api/sandbox/runs", s.sandboxRuns)
 	mux.HandleFunc("/api/sandbox/suite", s.sandboxSuite)
@@ -267,7 +270,7 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "任务仍在执行，结束后才能复测")
 			return
 		}
-		clone := &domain.Task{URL: original.URL, Objective: original.Objective, ExpectedTexts: append([]string(nil), original.ExpectedTexts...), ExpectedLiveStatus: original.ExpectedLiveStatus, UseAuthenticatedSession: original.UseAuthenticatedSession, ParentTaskID: original.ID}
+		clone := &domain.Task{CampaignID: original.CampaignID, CampaignName: original.CampaignName, URL: original.URL, Objective: original.Objective, ExpectedTexts: append([]string(nil), original.ExpectedTexts...), ExpectedLiveStatus: original.ExpectedLiveStatus, UseAuthenticatedSession: original.UseAuthenticatedSession, ParentTaskID: original.ID, MaxAttempts: 3}
 		retry, err := s.createTask(r.Context(), clone, "复测任务已创建，来源："+original.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -307,6 +310,267 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+type campaignSummary struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	Total     int            `json:"total"`
+	Queued    int            `json:"queued"`
+	Running   int            `json:"running"`
+	Passed    int            `json:"passed"`
+	Attention int            `json:"attention"`
+	Retrying  int            `json:"retrying"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	Tasks     []*domain.Task `json:"tasks,omitempty"`
+}
+
+func (s *Server) campaigns(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, summarizeCampaigns(s.store.List(), false))
+	case http.MethodPost:
+		var input struct {
+			Name                    string   `json:"name"`
+			URLs                    []string `json:"urls"`
+			ExpectedTexts           []string `json:"expected_texts"`
+			ExpectedLiveStatus      string   `json:"expected_live_status"`
+			UseAuthenticatedSession bool     `json:"use_authenticated_session"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "请求格式无效")
+			return
+		}
+		urls, err := validateCampaignURLs(input.URLs)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		expectedTexts, err := validateExpectedTexts(input.ExpectedTexts)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		liveStatus, err := validateLiveStatus(input.ExpectedLiveStatus)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.validateBrowserAvailability(input.UseAuthenticatedSession); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		name := strings.TrimSpace(input.Name)
+		if name == "" {
+			name = "直播巡检 " + time.Now().Format("01-02 15:04")
+		}
+		if len([]rune(name)) > 80 {
+			writeError(w, http.StatusBadRequest, "批次名称不能超过 80 个字符")
+			return
+		}
+		campaignID := domain.NewID("campaign")
+		tasks := make([]*domain.Task, 0, len(urls))
+		for _, targetURL := range urls {
+			task := &domain.Task{CampaignID: campaignID, CampaignName: name, URL: targetURL, Objective: "批量检查直播间是否可以正常访问，识别直播状态，并验证指定页面内容。", ExpectedTexts: append([]string(nil), expectedTexts...), ExpectedLiveStatus: liveStatus, UseAuthenticatedSession: input.UseAuthenticatedSession, MaxAttempts: 3}
+			s.prepareTask(r.Context(), task, "批次任务已创建并进入执行队列")
+			tasks = append(tasks, task)
+		}
+		if err := s.store.CreateMany(tasks); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, task := range tasks {
+			s.Publish(task.Events[len(task.Events)-1])
+		}
+		if s.worker != nil {
+			s.worker.Notify()
+		}
+		summaries := summarizeCampaigns(tasks, true)
+		writeJSON(w, http.StatusCreated, summaries[0])
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) campaign(w http.ResponseWriter, r *http.Request) {
+	remainder := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/campaigns/"), "/")
+	parts := strings.Split(remainder, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	id := parts[0]
+	matching := campaignTasks(s.store.List(), id)
+	if len(matching) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "retry-failed" && r.Method == http.MethodPost {
+		var retries []*domain.Task
+		for _, original := range latestCampaignTasks(matching) {
+			if !needsAttention(original) {
+				continue
+			}
+			clone := &domain.Task{CampaignID: original.CampaignID, CampaignName: original.CampaignName, URL: original.URL, Objective: original.Objective, ExpectedTexts: append([]string(nil), original.ExpectedTexts...), ExpectedLiveStatus: original.ExpectedLiveStatus, UseAuthenticatedSession: original.UseAuthenticatedSession, ParentTaskID: original.ID, MaxAttempts: 3}
+			s.prepareTask(r.Context(), clone, "异常任务已重新进入批次队列")
+			retries = append(retries, clone)
+		}
+		if len(retries) == 0 {
+			writeError(w, http.StatusConflict, "当前批次没有需要复测的任务")
+			return
+		}
+		if err := s.store.CreateMany(retries); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, task := range retries {
+			s.Publish(task.Events[len(task.Events)-1])
+		}
+		if s.worker != nil {
+			s.worker.Notify()
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"campaign_id": id, "created": len(retries)})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, summarizeCampaigns(matching, true)[0])
+}
+
+func validateCampaignURLs(input []string) ([]string, error) {
+	if len(input) == 0 || len(input) > 50 {
+		return nil, errors.New("每个批次需要 1-50 个直播间地址")
+	}
+	seen := map[string]bool{}
+	urls := make([]string, 0, len(input))
+	for _, raw := range input {
+		raw = strings.TrimSpace(raw)
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return nil, fmt.Errorf("无效的直播间地址：%s", raw)
+		}
+		if !seen[raw] {
+			seen[raw] = true
+			urls = append(urls, raw)
+		}
+	}
+	return urls, nil
+}
+
+func validateLiveStatus(input string) (string, error) {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "" || input == "any" {
+		return "", nil
+	}
+	if input != "live" && input != "offline" {
+		return "", errors.New("直播状态预期仅支持 any、live 或 offline")
+	}
+	return input, nil
+}
+
+func (s *Server) validateBrowserAvailability(useAuthenticated bool) error {
+	if !useAuthenticated || s.browserSessionState == nil {
+		return nil
+	}
+	state := s.browserSessionState()
+	if state.Open {
+		return errors.New("请先关闭抖音登录窗口，再开始巡检")
+	}
+	if state.Inspecting {
+		return errors.New("另一个登录态巡检正在执行，请稍候")
+	}
+	return nil
+}
+
+func campaignTasks(tasks []*domain.Task, id string) []*domain.Task {
+	var result []*domain.Task
+	for _, task := range tasks {
+		if task.CampaignID == id {
+			result = append(result, task)
+		}
+	}
+	return result
+}
+
+// latestCampaignTasks collapses manual retries so that a campaign continues to
+// represent rooms, rather than every historical attempt for those rooms.
+func latestCampaignTasks(tasks []*domain.Task) []*domain.Task {
+	byURL := map[string]*domain.Task{}
+	for _, task := range tasks {
+		current := byURL[task.URL]
+		if current == nil || task.CreatedAt.After(current.CreatedAt) {
+			byURL[task.URL] = task
+		}
+	}
+	result := make([]*domain.Task, 0, len(byURL))
+	for _, task := range byURL {
+		result = append(result, task)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
+	return result
+}
+
+func summarizeCampaigns(tasks []*domain.Task, includeTasks bool) []campaignSummary {
+	grouped := map[string][]*domain.Task{}
+	for _, task := range tasks {
+		if task.CampaignID == "" {
+			continue
+		}
+		grouped[task.CampaignID] = append(grouped[task.CampaignID], task)
+	}
+	byID := map[string]*campaignSummary{}
+	for id, history := range grouped {
+		latest := latestCampaignTasks(history)
+		if len(latest) == 0 {
+			continue
+		}
+		first := latest[0]
+		summary := &campaignSummary{ID: id, Name: first.CampaignName, CreatedAt: first.CreatedAt, UpdatedAt: first.UpdatedAt}
+		byID[id] = summary
+		for _, task := range latest {
+			summary.Total++
+			if task.CreatedAt.Before(summary.CreatedAt) {
+				summary.CreatedAt = task.CreatedAt
+			}
+			if task.UpdatedAt.After(summary.UpdatedAt) {
+				summary.UpdatedAt = task.UpdatedAt
+			}
+			switch task.Status {
+			case domain.StatusQueued:
+				summary.Queued++
+				if task.Error != "" {
+					summary.Retrying++
+				}
+			case domain.StatusPlanning, domain.StatusRunning:
+				summary.Running++
+			}
+			if task.Report != nil && task.Report.Verdict == "passed" {
+				summary.Passed++
+			}
+			if needsAttention(task) {
+				summary.Attention++
+			}
+			if includeTasks {
+				summary.Tasks = append(summary.Tasks, task)
+			}
+		}
+	}
+	result := make([]campaignSummary, 0, len(byID))
+	for _, summary := range byID {
+		result = append(result, *summary)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
+	return result
+}
+
+func needsAttention(task *domain.Task) bool {
+	if task.Status == domain.StatusFailed || task.Status == domain.StatusNeedsHuman {
+		return true
+	}
+	return task.Report != nil && (task.Report.Verdict == "failed" || task.Report.Verdict == "unverified" || task.Report.Verdict == "needs_human")
+}
+
 func (s *Server) browserSession(w http.ResponseWriter, r *http.Request) {
 	if s.browserSessionState == nil || s.openBrowserSession == nil {
 		writeError(w, http.StatusServiceUnavailable, "专用浏览器会话未启用")
@@ -337,6 +601,18 @@ func (s *Server) browserSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createTask(ctx context.Context, task *domain.Task, eventMessage string) (*domain.Task, error) {
+	s.prepareTask(ctx, task, eventMessage)
+	if err := s.store.Create(task); err != nil {
+		return nil, err
+	}
+	s.Publish(task.Events[len(task.Events)-1])
+	if s.worker != nil {
+		s.worker.Notify()
+	}
+	return task, nil
+}
+
+func (s *Server) prepareTask(ctx context.Context, task *domain.Task, eventMessage string) {
 	now := time.Now().UTC()
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
@@ -346,17 +622,12 @@ func (s *Server) createTask(ctx context.Context, task *domain.Task, eventMessage
 	}
 	task.ID = domain.NewID("task")
 	task.Status = domain.StatusQueued
+	if task.MaxAttempts <= 0 {
+		task.MaxAttempts = 3
+	}
 	task.CreatedAt, task.UpdatedAt, task.Version = now, now, 1
 	task.TraceID, task.TraceParent, task.TraceState = traceID, carrier.Get("traceparent"), carrier.Get("tracestate")
 	task.AddEvent("created", eventMessage)
-	if err := s.store.Create(task); err != nil {
-		return nil, err
-	}
-	s.Publish(task.Events[len(task.Events)-1])
-	if s.worker != nil {
-		s.worker.Notify()
-	}
-	return task, nil
 }
 
 func validateExpectedTexts(input []string) ([]string, error) {

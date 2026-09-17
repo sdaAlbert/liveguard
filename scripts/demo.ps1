@@ -150,7 +150,7 @@ try {
     $keys = @(
         "LIVEGUARD_INFRA_MODE", "LIVEGUARD_LLM_MODE", "LIVEGUARD_HEADLESS",
         "LIVEGUARD_ADDR", "LIVEGUARD_OTEL_ENDPOINT", "LIVEGUARD_SANDBOX_RPC_ADDR",
-        "LIVEGUARD_SANDBOX_RPC_TARGET", "LIVEGUARD_SANDBOX_IMAGE"
+        "LIVEGUARD_SANDBOX_RPC_TARGET", "LIVEGUARD_SANDBOX_IMAGE", "LIVEGUARD_MAX_CONCURRENT"
     )
     $previous = @{}
     foreach ($key in $keys) {
@@ -166,6 +166,7 @@ try {
         $env:LIVEGUARD_SANDBOX_RPC_ADDR = "127.0.0.1:9090"
         $env:LIVEGUARD_SANDBOX_RPC_TARGET = "127.0.0.1:9090"
         $env:LIVEGUARD_SANDBOX_IMAGE = "golang:1.26"
+        $env:LIVEGUARD_MAX_CONCURRENT = "4"
 
         Write-Host "[3/4] Starting the gRPC Sandbox Worker..."
         $worker = Start-Process -FilePath $WorkerExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `

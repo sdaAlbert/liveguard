@@ -2,12 +2,15 @@ package web
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"liveguard/internal/browser"
+	"liveguard/internal/domain"
 	"liveguard/internal/store"
 )
 
@@ -18,6 +21,49 @@ func TestValidateExpectedTexts(t *testing.T) {
 	}
 	if _, err := validateExpectedTexts([]string{"1", "2", "3", "4", "5", "6"}); err == nil {
 		t.Fatal("expected limit error")
+	}
+}
+
+func TestCampaignCreationPersistsAllRoomsAndSummarizesLatestRetry(t *testing.T) {
+	taskStore, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(taskStore, t.TempDir())
+	body := bytes.NewBufferString(`{"name":"晚间巡检","urls":["http://127.0.0.1:8080/demo/live?room=1","http://127.0.0.1:8080/demo/live?room=2"],"expected_texts":["海边电台"],"expected_live_status":"live"}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/campaigns", body)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected created, got %d: %s", response.Code, response.Body.String())
+	}
+	var created campaignSummary
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.Total != 2 || len(created.Tasks) != 2 || len(taskStore.List()) != 2 {
+		t.Fatalf("unexpected campaign: %#v", created)
+	}
+	for _, task := range created.Tasks {
+		if task.MaxAttempts != 3 || task.Status != domain.StatusQueued {
+			t.Fatalf("unexpected task defaults: %#v", task)
+		}
+	}
+
+	old := created.Tasks[0]
+	retry := *old
+	retry.ID = "task-newest-retry"
+	retry.ParentTaskID = old.ID
+	retry.CreatedAt = old.CreatedAt.Add(time.Second)
+	retry.UpdatedAt = retry.CreatedAt
+	retry.Status = domain.StatusCompleted
+	retry.Report = &domain.Report{Verdict: "passed"}
+	if err := taskStore.Create(&retry); err != nil {
+		t.Fatal(err)
+	}
+	summary := summarizeCampaigns(taskStore.List(), true)[0]
+	if summary.Total != 2 || summary.Passed != 1 || len(summary.Tasks) != 2 {
+		t.Fatalf("retry must replace its room in campaign summary: %#v", summary)
 	}
 }
 

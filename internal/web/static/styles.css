@@ -2,7 +2,7 @@
 * { box-sizing:border-box; }
 html { background:var(--paper); color:var(--ink); }
 body { margin:0; min-height:100vh; font-family:"Microsoft YaHei UI","Noto Sans SC",sans-serif; background:linear-gradient(120deg,rgba(35,122,69,.05),transparent 35%); }
-button,input,select { font:inherit; }
+button,input,select,textarea { font:inherit; }
 button { cursor:pointer; }
 .masthead { height:64px; padding:0 4vw; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); background:rgba(255,253,247,.9); }
 .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; }
@@ -25,11 +25,15 @@ main { width:min(1180px,92vw); margin:0 auto; }
 .panel-title span { display:block; font-weight:bold; }
 .panel-title small { display:block; margin-top:3px; color:var(--muted); font-size:10px; }
 .panel-title button { border:0; background:transparent; color:var(--green); font-size:12px; }
+.mode-tabs { display:flex; padding:3px; border-radius:7px; background:#ecebe4; }
+.mode-tabs button { min-width:52px; padding:6px 10px; border-radius:5px; color:var(--muted); }
+.mode-tabs button.active { color:var(--ink); background:white; box-shadow:0 1px 4px rgba(24,32,25,.12); }
 .form-panel { padding-bottom:18px; }
-.form-panel > label,.form-row label { display:block; margin:18px 18px 0; font-size:12px; font-weight:bold; }
+.form-panel > label,.form-row label,.batch-fields label { display:block; margin:18px 18px 0; font-size:12px; font-weight:bold; }
 .form-panel label small { margin-left:4px; color:var(--muted); font-weight:normal; }
-input,select { width:100%; height:46px; margin-top:7px; padding:0 12px; border:1px solid var(--line); border-radius:6px; color:var(--ink); background:white; outline:none; }
-input:focus,select:focus { border-color:var(--green); box-shadow:0 0 0 3px rgba(35,122,69,.1); }
+input,select,textarea { width:100%; height:46px; margin-top:7px; padding:0 12px; border:1px solid var(--line); border-radius:6px; color:var(--ink); background:white; outline:none; }
+textarea { height:auto; padding:12px; resize:vertical; line-height:1.5; }
+input:focus,select:focus,textarea:focus { border-color:var(--green); box-shadow:0 0 0 3px rgba(35,122,69,.1); }
 .form-row { display:grid; grid-template-columns:1.3fr .7fr; }
 .login-card { margin:18px; padding:14px; display:grid; grid-template-columns:1fr auto; gap:12px; align-items:center; border:1px solid var(--line); border-radius:7px; background:#f7f7f1; }
 .login-card b,.login-card span { display:block; }
@@ -44,6 +48,15 @@ input:focus,select:focus { border-color:var(--green); box-shadow:0 0 0 3px rgba(
 .primary:disabled { opacity:.45; cursor:not-allowed; }
 .error { min-height:17px; margin:9px 18px 0; color:var(--red); font-size:12px; }
 .task-list { max-height:475px; overflow:auto; }
+.campaign-list { max-height:475px; overflow:auto; }
+.campaign { padding:15px 16px; border-bottom:1px solid var(--line); }
+.campaign-head,.campaign-meta { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.campaign-head button { padding:0; border:0; color:var(--ink); background:transparent; font-weight:bold; text-align:left; }
+.campaign-meta { margin-top:9px; color:var(--muted); font-size:11px; }
+.campaign-progress { height:6px; margin-top:10px; overflow:hidden; border-radius:99px; background:#e8e6de; }
+.campaign-progress i { height:100%; display:block; background:var(--green); }
+.campaign-attention { color:var(--red); }
+.retry-campaign { margin-top:10px; padding:6px 9px; border:1px solid var(--red); border-radius:5px; color:var(--red); background:white; font-size:11px; }
 .task { width:100%; min-height:70px; padding:13px 16px; display:flex; align-items:center; justify-content:space-between; gap:15px; border:0; border-bottom:1px solid var(--line); background:transparent; text-align:left; }
 .task:hover { background:#f5f7f1; }
 .task-main { min-width:0; }

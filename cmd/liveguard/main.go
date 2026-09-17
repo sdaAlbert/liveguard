@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -37,9 +38,34 @@ func main() {
 		defer cancel()
 		_ = shutdownTrace(shutdownCtx)
 	}()
-	stateStore, err := store.Open(filepath.Join("state", "tasks.jsonl"))
-	if err != nil {
-		log.Fatal(err)
+	durable := strings.EqualFold(os.Getenv("LIVEGUARD_INFRA_MODE"), "durable")
+	databaseURL := envOr("LIVEGUARD_DATABASE_URL", "postgres://liveguard:liveguard_local@127.0.0.1:5433/liveguard?sslmode=disable")
+	var stateStore store.TaskRepository
+	if durable {
+		storeCtx, cancelStore := context.WithTimeout(ctx, 10*time.Second)
+		postgresTasks, openErr := store.OpenPostgres(storeCtx, databaseURL)
+		cancelStore()
+		if openErr != nil {
+			log.Fatalf("durable task store: %v", openErr)
+		}
+		defer postgresTasks.Close()
+		stateStore = postgresTasks
+		if legacy, legacyErr := store.Open(filepath.Join("state", "tasks.jsonl")); legacyErr == nil && len(postgresTasks.List()) == 0 {
+			legacyTasks := legacy.List()
+			if len(legacyTasks) > 0 {
+				if importErr := postgresTasks.CreateMany(legacyTasks); importErr != nil {
+					log.Fatalf("import legacy tasks: %v", importErr)
+				}
+				log.Printf("imported %d legacy tasks into PostgreSQL", len(legacyTasks))
+			}
+		}
+		log.Print("PostgreSQL task store enabled")
+	} else {
+		jsonStore, openErr := store.Open(filepath.Join("state", "tasks.jsonl"))
+		if openErr != nil {
+			log.Fatal(openErr)
+		}
+		stateStore = jsonStore
 	}
 	if err := stateStore.RecoverInterrupted(); err != nil {
 		log.Fatal(err)
@@ -63,9 +89,9 @@ func main() {
 	webServer := webapp.New(stateStore, "artifacts")
 	webServer.SetBrowserSession(browserRunner.OpenSession, browserRunner.SessionState)
 	var toolRunner worker.ToolRunner
-	if strings.EqualFold(os.Getenv("LIVEGUARD_INFRA_MODE"), "durable") {
+	if durable {
 		infraCtx, cancelInfra := context.WithTimeout(ctx, 10*time.Second)
-		postgresStore, err := sandbox.OpenPostgresRunStore(infraCtx, envOr("LIVEGUARD_DATABASE_URL", "postgres://liveguard:liveguard_local@127.0.0.1:5433/liveguard?sslmode=disable"))
+		postgresStore, err := sandbox.OpenPostgresRunStore(infraCtx, databaseURL)
 		if err != nil {
 			cancelInfra()
 			log.Fatalf("durable sandbox postgres: %v", err)
@@ -97,6 +123,7 @@ func main() {
 	}
 	taskWorker := worker.New(stateStore, planner, browserRunner, toolRunner, webServer.Publish)
 	taskWorker.SetToolDecider(toolDecider)
+	taskWorker.SetMaxConcurrent(envInt("LIVEGUARD_MAX_CONCURRENT", 4))
 	webServer.SetAgentEval(func(evalCtx context.Context) agent.EvalReport {
 		return agent.RunEval(evalCtx, toolDecider, agent.ToolPolicy{})
 	})
@@ -142,6 +169,14 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
 }
 
 func loadEnvFiles(paths ...string) {

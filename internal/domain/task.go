@@ -87,12 +87,17 @@ type ToolCall struct {
 
 type Task struct {
 	ID                      string      `json:"id"`
+	CampaignID              string      `json:"campaign_id,omitempty"`
+	CampaignName            string      `json:"campaign_name,omitempty"`
 	URL                     string      `json:"url"`
 	Objective               string      `json:"objective"`
 	ExpectedTexts           []string    `json:"expected_texts,omitempty"`
 	ExpectedLiveStatus      string      `json:"expected_live_status,omitempty"`
 	UseAuthenticatedSession bool        `json:"use_authenticated_session,omitempty"`
 	ParentTaskID            string      `json:"parent_task_id,omitempty"`
+	Attempt                 int         `json:"attempt"`
+	MaxAttempts             int         `json:"max_attempts"`
+	NextAttemptAt           *time.Time  `json:"next_attempt_at,omitempty"`
 	Status                  Status      `json:"status"`
 	Error                   string      `json:"error,omitempty"`
 	Plan                    []CheckSpec `json:"plan,omitempty"`
