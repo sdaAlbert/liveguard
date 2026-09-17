@@ -19,7 +19,7 @@ func TestAppendExpectationsAndSummarizeBusinessVerdict(t *testing.T) {
 	}
 
 	verdict, summary := summarizeChecks([]domain.CheckResult{{Status: domain.CheckFailed}, {Status: domain.CheckUnverified}}, false)
-	if verdict != "failed" || summary != "发现 1 项不符合运营预期" {
+	if verdict != "failed" || summary != "发现 1 项不符合用户预期" {
 		t.Fatalf("unexpected verdict %q summary %q", verdict, summary)
 	}
 	verdict, _ = summarizeChecks(nil, true)

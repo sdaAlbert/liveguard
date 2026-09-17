@@ -22,6 +22,7 @@ import (
 	"liveguard/internal/agent"
 	"liveguard/internal/browser"
 	"liveguard/internal/domain"
+	"liveguard/internal/monitor"
 	"liveguard/internal/sandbox"
 	"liveguard/internal/store"
 	"liveguard/internal/worker"
@@ -34,6 +35,7 @@ type Server struct {
 	store               store.TaskRepository
 	worker              *worker.Worker
 	sandboxLab          SandboxService
+	monitorService      MonitorService
 	artifactDir         string
 	evalRunner          func(context.Context) agent.EvalReport
 	openBrowserSession  func(string) error
@@ -50,6 +52,13 @@ type SandboxService interface {
 	SubmitSuiteWithKey(idempotencyKey string) ([]*sandbox.Run, error)
 }
 
+type MonitorService interface {
+	Start(context.Context, monitor.StartInput) (*monitor.Run, error)
+	List(context.Context) ([]monitor.Summary, error)
+	Get(context.Context, string) (*monitor.Run, error)
+	Stop(context.Context, string) (*monitor.Run, error)
+}
+
 func New(s store.TaskRepository, artifactDir string) *Server {
 	return &Server{store: s, artifactDir: artifactDir, subscribers: map[chan domain.Event]struct{}{}}
 }
@@ -57,6 +66,8 @@ func New(s store.TaskRepository, artifactDir string) *Server {
 func (s *Server) SetWorker(w *worker.Worker) { s.worker = w }
 
 func (s *Server) SetSandboxLab(lab SandboxService) { s.sandboxLab = lab }
+
+func (s *Server) SetMonitorService(service MonitorService) { s.monitorService = service }
 
 func (s *Server) SetAgentEval(runner func(context.Context) agent.EvalReport) { s.evalRunner = runner }
 
@@ -85,6 +96,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tasks/", s.task)
 	mux.HandleFunc("/api/campaigns", s.campaigns)
 	mux.HandleFunc("/api/campaigns/", s.campaign)
+	mux.HandleFunc("/api/monitors", s.monitors)
+	mux.HandleFunc("/api/monitors/", s.monitorRun)
 	mux.HandleFunc("/api/events", s.events)
 	mux.HandleFunc("/api/sandbox/runs", s.sandboxRuns)
 	mux.HandleFunc("/api/sandbox/suite", s.sandboxSuite)
@@ -97,14 +110,102 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/demo/live-broken", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, assets, "static/demo-live-broken.html")
 	})
+	mux.HandleFunc("/monitor", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, assets, "static/monitor.html")
+	})
+	mux.HandleFunc("/inspect", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, assets, "static/index.html")
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
-		http.ServeFileFS(w, r, assets, "static/index.html")
+		http.ServeFileFS(w, r, assets, "static/monitor.html")
 	})
 	return securityHeaders(otelhttp.NewHandler(mux, "liveguard.http"))
+}
+
+func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
+	if s.monitorService == nil {
+		writeError(w, http.StatusServiceUnavailable, "直播信号监控未启用")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		runs, err := s.monitorService.List(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, runs)
+	case http.MethodPost:
+		var input monitor.StartInput
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "请输入直播地址和关注需求")
+			return
+		}
+		input.TargetURL = strings.TrimSpace(input.TargetURL)
+		input.Goal = strings.TrimSpace(input.Goal)
+		parsed, parseErr := url.Parse(input.TargetURL)
+		if parseErr != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			writeError(w, http.StatusBadRequest, "请输入有效的直播 http/https 地址")
+			return
+		}
+		goalLength := len([]rune(input.Goal))
+		if goalLength < 2 || goalLength > 240 {
+			writeError(w, http.StatusBadRequest, "关注需求应为 2-240 个字符")
+			return
+		}
+		run, err := s.monitorService.Start(r.Context(), input)
+		if err != nil {
+			if errors.Is(err, monitor.ErrCapacity) {
+				writeError(w, http.StatusConflict, "最多同时打开 8 个监控窗口，请先停止一个")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, run)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
+	if s.monitorService == nil {
+		writeError(w, http.StatusServiceUnavailable, "直播信号监控未启用")
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/monitors/"), "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	id := parts[0]
+	if len(parts) == 2 && parts[1] == "stop" && r.Method == http.MethodPost {
+		run, err := s.monitorService.Stop(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, run)
+		return
+	}
+	if len(parts) != 1 || r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	run, err := s.monitorService.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, monitor.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
 }
 
 func (s *Server) agentEval(w http.ResponseWriter, r *http.Request) {

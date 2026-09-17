@@ -1,6 +1,6 @@
 # Contributing to LiveGuard
 
-LiveGuard keeps a deliberately narrow scope: evidence-driven livestream page inspection and policy-gated diagnostic execution. Contributions should strengthen that path, its reliability, or its explanation.
+LiveGuard keeps a deliberately narrow scope: personal, goal-driven livestream monitoring plus policy-gated evidence tools. Contributions should strengthen the monitoring state model, signal pipeline, reliability, or explanation.
 
 ## Prerequisites
 
@@ -65,6 +65,7 @@ For online routing, load `OPENAI_API_KEY`, set `LIVEGUARD_LLM_MODE=auto`, and op
 go test ./...
 go vet ./...
 node --check internal/web/static/app.js
+node --check internal/web/static/monitor.js
 ```
 
 For changes to Sandbox behavior, also run the four-case Sandbox Lab from the UI and verify that every temporary container is removed. For Agent routing changes, run the six-case Agent Eval and include expected/actual results in the pull request.
@@ -75,6 +76,7 @@ For changes to Sandbox behavior, also run the four-case Sandbox Lab from the UI 
 - `cmd/sandbox-worker`: gRPC process with Docker access
 - `internal/agent`: planning, tool routing, policy, evals, and circuit breaker
 - `internal/browser`: Chrome evidence collection
+- `internal/monitor`: personal monitor state, goal-aware signal investigation, persistence, and replay source
 - `internal/sandbox`: PostgreSQL Outbox, Redis Streams, execution lifecycle, and policies
 - `internal/sandboxrpc`: gRPC client and server adapters
 - `internal/web`: HTTP API and embedded dashboard

@@ -159,7 +159,7 @@ func (w *Worker) run(ctx context.Context, id string) {
 	w.publishLatest(id)
 	browserMessage := "正在启动独立 Chrome 会话并访问目标页面"
 	if task.UseAuthenticatedSession {
-		browserMessage = "正在使用运营专用登录态访问目标页面"
+		browserMessage = "正在使用用户专用登录态访问目标页面"
 	}
 	w.addEvent(id, "browser", browserMessage)
 	browserCtx, browserSpan := otel.Tracer("liveguard/agent").Start(ctx, "browser.inspect")
@@ -245,8 +245,8 @@ func appendExpectations(plan []domain.CheckSpec, task *domain.Task) []domain.Che
 	result := append([]domain.CheckSpec(nil), plan...)
 	if len(task.ExpectedTexts) > 0 {
 		result = append(result, domain.CheckSpec{
-			Key: "expected_texts", Label: "运营预期文案", Kind: "contains_all", Terms: append([]string(nil), task.ExpectedTexts...),
-			Description: "确认运营配置要求展示的文案都出现在页面中",
+			Key: "expected_texts", Label: "用户预期文案", Kind: "contains_all", Terms: append([]string(nil), task.ExpectedTexts...),
+			Description: "确认用户设置的文案都出现在页面中",
 		})
 	}
 	if task.ExpectedLiveStatus == "live" || task.ExpectedLiveStatus == "offline" {
@@ -256,7 +256,7 @@ func appendExpectations(plan []domain.CheckSpec, task *domain.Task) []domain.Che
 		}
 		result = append(result, domain.CheckSpec{
 			Key: "expected_live_status", Label: label, Kind: "expected_live_status", Terms: []string{task.ExpectedLiveStatus},
-			Description: "将页面可见直播状态与运营预期进行比对",
+			Description: "将页面可见直播状态与用户预期进行比对",
 		})
 	}
 	return result
@@ -276,12 +276,12 @@ func summarizeChecks(checks []domain.CheckResult, needsHuman bool) (string, stri
 		}
 	}
 	if failed > 0 {
-		return "failed", fmt.Sprintf("发现 %d 项不符合运营预期", failed)
+		return "failed", fmt.Sprintf("发现 %d 项不符合用户预期", failed)
 	}
 	if unverified > 0 {
 		return "unverified", fmt.Sprintf("有 %d 项无法自动确认，需要人工复核", unverified)
 	}
-	return "passed", "全部检查符合运营预期"
+	return "passed", "全部检查符合用户预期"
 }
 
 func (w *Worker) transition(id string, status domain.Status, eventType, message string) {

@@ -17,6 +17,7 @@ import (
 	"liveguard/internal/agent"
 	"liveguard/internal/browser"
 	"liveguard/internal/domain"
+	"liveguard/internal/monitor"
 	"liveguard/internal/sandbox"
 	"liveguard/internal/sandboxrpc"
 	"liveguard/internal/store"
@@ -88,6 +89,27 @@ func main() {
 	}
 	webServer := webapp.New(stateStore, "artifacts")
 	webServer.SetBrowserSession(browserRunner.OpenSession, browserRunner.SessionState)
+	var monitorRepository monitor.Repository
+	if durable {
+		monitorCtx, cancelMonitor := context.WithTimeout(ctx, 10*time.Second)
+		postgresMonitors, monitorErr := monitor.OpenPostgres(monitorCtx, databaseURL)
+		cancelMonitor()
+		if monitorErr != nil {
+			log.Fatalf("durable monitor store: %v", monitorErr)
+		}
+		defer postgresMonitors.Close()
+		monitorRepository = postgresMonitors
+	} else {
+		monitorRepository = monitor.NewMemoryRepository()
+	}
+	monitorService := monitor.NewService(monitorRepository, func() {
+		webServer.Publish(domain.Event{ID: domain.NewID("event"), Type: "monitor_update", Message: "monitor state updated", At: time.Now().UTC()})
+	})
+	if err := monitorService.RecoverInterrupted(ctx); err != nil {
+		log.Fatalf("recover monitor runs: %v", err)
+	}
+	defer monitorService.StopAll()
+	webServer.SetMonitorService(monitorService)
 	var toolRunner worker.ToolRunner
 	if durable {
 		infraCtx, cancelInfra := context.WithTimeout(ctx, 10*time.Second)

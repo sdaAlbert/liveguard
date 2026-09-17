@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiveGuard · 我的直播监控室</title>
+  <link rel="stylesheet" href="/static/monitor.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span>LG</span><div><b>LiveGuard</b><small>PERSONAL LIVE RADAR</small></div></a>
+    <nav><a class="active" href="/">监控室</a><a href="/inspect">页面检查</a></nav>
+    <span class="health"><i></i>本地服务在线</span>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div>
+        <p class="eyebrow">YOUR LIVE CONTROL ROOM</p>
+        <h1>不用守着直播，<br>等重要时刻来找你。</h1>
+        <p class="lede">每个直播地址是一扇监控小窗。告诉 Agent 你在等什么，它会持续筛选字幕和画面，只保留值得你查看的时刻。</p>
+      </div>
+      <div class="system-note"><span>DEMO INPUT</span><p>当前使用可复现的 ASR / OCR 信号演示。真实音视频接入正在下一阶段实现。</p></div>
+    </section>
+
+    <section class="command-deck">
+      <div class="deck-label"><span>01</span><div><b>打开新监控窗口</b><small>一个 URL，一项你真正关心的事</small></div></div>
+      <form id="monitorForm">
+        <label>直播地址<input id="targetURL" type="url" placeholder="https://live.douyin.com/直播间号" required autocomplete="off"></label>
+        <label class="goal-field">你想监控什么？<textarea id="monitorGoal" rows="2" maxlength="240" placeholder="例如：出现抽奖倒计时或福袋开启时提醒我" required></textarea></label>
+        <button id="openMonitor" type="submit"><span>打开监控窗口</span><b>＋</b></button>
+      </form>
+      <div class="presets" aria-label="需求示例">
+        <span>试试：</span>
+        <button type="button" data-goal="出现 50 元以上优惠券时提醒我">50 元优惠券</button>
+        <button type="button" data-goal="抽奖或福袋开始前提醒我">抽奖 / 福袋</button>
+        <button type="button" data-goal="公布新品发布时间或重大官宣时提醒我">新品官宣</button>
+        <button type="button" data-goal="游戏进入决胜局或关键团战时提醒我">游戏关键时刻</button>
+      </div>
+      <p id="formError" class="form-error" role="alert"></p>
+    </section>
+
+    <section class="overview">
+      <div class="section-title"><span>02</span><div><b>总监控室</b><small>每张卡片都是一条独立监听链路</small></div></div>
+      <div class="metrics">
+        <span><b id="activeCount">0</b>监听中</span>
+        <span><b id="signalCount">0</b>收到信号</span>
+        <span class="hot"><b id="alertCount">0</b>重要提醒</span>
+        <span><b id="humanCount">0</b>需要处理</span>
+      </div>
+    </section>
+
+    <section id="emptyRoom" class="empty-room">
+      <div class="empty-screen"><i></i><span>NO SIGNAL</span></div>
+      <div><h2>监控室还是空的</h2><p>粘贴一个直播地址，再用一句话告诉 Agent 你不想错过什么。</p></div>
+    </section>
+
+    <section id="monitorGrid" class="monitor-grid hidden" aria-live="polite"></section>
+  </main>
+
+  <template id="monitorCard">
+    <article class="monitor-card">
+      <header>
+        <div class="window-title"><i></i><div><b class="room-name"></b><a class="room-link" target="_blank" rel="noreferrer"></a></div></div>
+        <span class="window-status"></span>
+      </header>
+      <section class="watch-goal"><small>正在等</small><p></p></section>
+      <section class="screen">
+        <div class="scanline"></div>
+        <div class="screen-id"></div>
+        <div class="latest-signal"><span>等待直播信号</span><p>Agent 已开始监听</p></div>
+      </section>
+      <section class="alert-slot"></section>
+      <section class="window-stats">
+        <span><b class="card-signals">0</b>信号</span><span><b class="card-investigations">0</b>调查</span><span><b class="card-alerts">0</b>提醒</span>
+      </section>
+      <details class="agent-detail">
+        <summary>查看 Agent 判断过程 <span>⌄</span></summary>
+        <div class="decision-list"></div>
+      </details>
+      <footer><span class="source-mode">演示信号源</span><button class="stop-monitor" type="button">停止监听</button></footer>
+    </article>
+  </template>
+
+  <script src="/static/monitor.js"></script>
+</body>
+</html>

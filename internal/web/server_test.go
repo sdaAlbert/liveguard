@@ -11,6 +11,7 @@ import (
 
 	"liveguard/internal/browser"
 	"liveguard/internal/domain"
+	"liveguard/internal/monitor"
 	"liveguard/internal/store"
 )
 
@@ -21,6 +22,37 @@ func TestValidateExpectedTexts(t *testing.T) {
 	}
 	if _, err := validateExpectedTexts([]string{"1", "2", "3", "4", "5", "6"}); err == nil {
 		t.Fatal("expected limit error")
+	}
+}
+
+func TestMonitorDemoAPI(t *testing.T) {
+	taskStore, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(taskStore, t.TempDir())
+	monitorService := monitor.NewService(monitor.NewMemoryRepository(), nil)
+	defer monitorService.StopAll()
+	monitorService.SetReplayGap(time.Millisecond)
+	server.SetMonitorService(monitorService)
+
+	response := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"target_url":"https://live.douyin.com/123456","goal":"抽奖开始时提醒我"}`)
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/monitors", body))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("expected accepted, got %d: %s", response.Code, response.Body.String())
+	}
+	var run monitor.Run
+	if err := json.Unmarshal(response.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.TargetURL == "" || run.Goal == "" || len(run.Rooms) != 1 {
+		t.Fatalf("monitor should preserve the personal watch request: %#v", run)
+	}
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/monitors/"+run.ID, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected monitor details, got %d: %s", response.Code, response.Body.String())
 	}
 }
 

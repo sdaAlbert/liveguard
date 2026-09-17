@@ -25,7 +25,7 @@ func TestValidateURLUsesHostBoundary(t *testing.T) {
 func TestEvaluateOperationalExpectations(t *testing.T) {
 	runner := &Runner{}
 	plan := []domain.CheckSpec{
-		{Key: "copy", Label: "运营预期文案", Kind: "contains_all", Terms: []string{"海边电台", "活动入口已开启"}},
+		{Key: "copy", Label: "用户预期文案", Kind: "contains_all", Terms: []string{"海边电台", "活动入口已开启"}},
 		{Key: "status", Label: "预期正在直播", Kind: "expected_live_status", Terms: []string{"live"}},
 	}
 	checks, needsHuman := runner.Evaluate(plan, Result{Title: "直播间", BodyText: "海边电台 正在直播 活动入口已开启"})

@@ -24,4 +24,6 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Check browser UI JavaScript
-        run: node --check internal/web/static/app.js
+        run: |
+          node --check internal/web/static/app.js
+          node --check internal/web/static/monitor.js
