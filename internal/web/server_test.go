@@ -2,35 +2,20 @@ package web
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"net/textproto"
 	"testing"
 	"time"
 
-	"liveguard/internal/browser"
-	"liveguard/internal/domain"
 	"liveguard/internal/monitor"
-	"liveguard/internal/store"
 )
 
-func TestValidateExpectedTexts(t *testing.T) {
-	texts, err := validateExpectedTexts([]string{" 活动入口 ", "活动入口", "直播中"})
-	if err != nil || len(texts) != 2 || texts[0] != "活动入口" {
-		t.Fatalf("unexpected validation result %#v: %v", texts, err)
-	}
-	if _, err := validateExpectedTexts([]string{"1", "2", "3", "4", "5", "6"}); err == nil {
-		t.Fatal("expected limit error")
-	}
-}
-
 func TestMonitorDemoAPI(t *testing.T) {
-	taskStore, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := New(taskStore, t.TempDir())
+	server := New(t.TempDir())
 	monitorService := monitor.NewService(monitor.NewMemoryRepository(), nil)
 	defer monitorService.StopAll()
 	monitorService.SetReplayGap(time.Millisecond)
@@ -54,69 +39,122 @@ func TestMonitorDemoAPI(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("expected monitor details, got %d: %s", response.Code, response.Body.String())
 	}
-}
-
-func TestCampaignCreationPersistsAllRoomsAndSummarizesLatestRetry(t *testing.T) {
-	taskStore, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
-	if err != nil {
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/monitors/"+run.ID+"/goal", bytes.NewBufferString(`{"goal":"聊天区提到决胜局时提醒我"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected goal update, got %d: %s", response.Code, response.Body.String())
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &run); err != nil {
 		t.Fatal(err)
 	}
-	server := New(taskStore, t.TempDir())
-	body := bytes.NewBufferString(`{"name":"晚间巡检","urls":["http://127.0.0.1:8080/demo/live?room=1","http://127.0.0.1:8080/demo/live?room=2"],"expected_texts":["海边电台"],"expected_live_status":"live"}`)
-	request := httptest.NewRequest(http.MethodPost, "/api/campaigns", body)
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusCreated {
-		t.Fatalf("expected created, got %d: %s", response.Code, response.Body.String())
-	}
-	var created campaignSummary
-	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
-		t.Fatal(err)
-	}
-	if created.ID == "" || created.Total != 2 || len(created.Tasks) != 2 || len(taskStore.List()) != 2 {
-		t.Fatalf("unexpected campaign: %#v", created)
-	}
-	for _, task := range created.Tasks {
-		if task.MaxAttempts != 3 || task.Status != domain.StatusQueued {
-			t.Fatalf("unexpected task defaults: %#v", task)
-		}
-	}
-
-	old := created.Tasks[0]
-	retry := *old
-	retry.ID = "task-newest-retry"
-	retry.ParentTaskID = old.ID
-	retry.CreatedAt = old.CreatedAt.Add(time.Second)
-	retry.UpdatedAt = retry.CreatedAt
-	retry.Status = domain.StatusCompleted
-	retry.Report = &domain.Report{Verdict: "passed"}
-	if err := taskStore.Create(&retry); err != nil {
-		t.Fatal(err)
-	}
-	summary := summarizeCampaigns(taskStore.List(), true)[0]
-	if summary.Total != 2 || summary.Passed != 1 || len(summary.Tasks) != 2 {
-		t.Fatalf("retry must replace its room in campaign summary: %#v", summary)
+	if run.Goal != "聊天区提到决胜局时提醒我" {
+		t.Fatalf("goal edit should be visible in returned monitor: %#v", run)
 	}
 }
 
-func TestTaskCreationRejectsBusyLoginProfileBeforeQueueing(t *testing.T) {
-	taskStore, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+func TestMonitorOCRMultipartFlowsIntoAgent(t *testing.T) {
+	server := New(t.TempDir())
+	monitorService := monitor.NewService(monitor.NewMemoryRepository(), nil)
+	monitorService.SetTextRecognizer(monitor.StaticTextRecognizer{Text: "新品正式发布，今晚八点开启预售", Confidence: .93})
+	defer monitorService.StopAll()
+	server.SetMonitorService(monitorService)
+
+	start := httptest.NewRecorder()
+	server.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/monitors", bytes.NewBufferString(`{"target_url":"https://live.douyin.com/ocr","goal":"新品正式发布时提醒我"}`)))
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("expected monitor creation, got %d: %s", start.Code, start.Body.String())
+	}
+	var run monitor.Run
+	if err := json.Unmarshal(start.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("room_id", run.Rooms[0].ID)
+	partHeader := make(textproto.MIMEHeader)
+	partHeader.Set("Content-Disposition", `form-data; name="image"; filename="frame.png"`)
+	partHeader.Set("Content-Type", "image/png")
+	part, err := writer.CreatePart(partHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := New(taskStore, t.TempDir())
-	server.SetBrowserSession(func(string) error { return nil }, func() browser.SessionState {
-		return browser.SessionState{Configured: true, Open: true}
-	})
-	body := bytes.NewBufferString(`{"url":"https://live.douyin.com/123","objective":"检查直播间状态","expected_live_status":"live","use_authenticated_session":true}`)
-	request := httptest.NewRequest(http.MethodPost, "/api/tasks", body)
-	request.Header.Set("Content-Type", "application/json")
+	png, _ := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/FXsAAAAASUVORK5CYII=")
+	_, _ = part.Write(png)
+	_ = writer.Close()
+	requestBody := append([]byte(nil), body.Bytes()...)
+	request := httptest.NewRequest(http.MethodPost, "/api/monitors/"+run.ID+"/ocr", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set("Idempotency-Key", "ocr-upload-1")
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusConflict {
-		t.Fatalf("expected conflict, got %d: %s", response.Code, response.Body.String())
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("expected OCR accepted, got %d: %s", response.Code, response.Body.String())
 	}
-	if len(taskStore.List()) != 0 {
-		t.Fatal("busy login profile must not create a doomed task")
+	var updated monitor.Run
+	if err := json.Unmarshal(response.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Events) != 1 || len(updated.Alerts) != 1 {
+		t.Fatalf("OCR upload should enter Agent loop and alert: %#v", updated)
+	}
+	retryBody := bytes.NewReader(requestBody)
+	retry := httptest.NewRequest(http.MethodPost, "/api/monitors/"+run.ID+"/ocr", retryBody)
+	retry.Header.Set("Content-Type", writer.FormDataContentType())
+	retry.Header.Set("Idempotency-Key", "ocr-upload-1")
+	retried := httptest.NewRecorder()
+	server.Handler().ServeHTTP(retried, retry)
+	if retried.Code != http.StatusAccepted {
+		t.Fatalf("same upload retry should be accepted: %d %s", retried.Code, retried.Body.String())
+	}
+	if err := json.Unmarshal(retried.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Events) != 1 || len(updated.Alerts) != 1 {
+		t.Fatalf("HTTP retry duplicated the event or alert: %#v", updated)
+	}
+}
+
+func TestMonitorAudioMultipartFlowsIntoAgent(t *testing.T) {
+	server := New(t.TempDir())
+	monitorService := monitor.NewService(monitor.NewMemoryRepository(), nil)
+	monitorService.SetTranscriber(monitor.StaticTranscriber{Text: "主播说，抽奖倒计时 00:30，福袋开启", Confidence: .8})
+	defer monitorService.StopAll()
+	server.SetMonitorService(monitorService)
+
+	start := httptest.NewRecorder()
+	server.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/monitors", bytes.NewBufferString(`{"target_url":"https://live.douyin.com/asr","goal":"抽奖开始时提醒我","source_mode":"ocr_upload"}`)))
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("expected monitor creation, got %d: %s", start.Code, start.Body.String())
+	}
+	var run monitor.Run
+	if err := json.Unmarshal(start.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("room_id", run.Rooms[0].ID)
+	observedAt := time.Now().Add(-12 * time.Second).UTC().Truncate(time.Millisecond)
+	_ = writer.WriteField("observed_at", observedAt.Format(time.RFC3339Nano))
+	part, err := writer.CreateFormFile("audio", "clip.webm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("test audio bytes"))
+	_ = writer.Close()
+	request := httptest.NewRequest(http.MethodPost, "/api/monitors/"+run.ID+"/audio", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("expected ASR audio accepted, got %d: %s", response.Code, response.Body.String())
+	}
+	var updated monitor.Run
+	if err := json.Unmarshal(response.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Events) != 1 || updated.Events[0].Source != "asr" || updated.Events[0].Text != "主播说，抽奖倒计时 00:30，福袋开启" || !updated.Events[0].ObservedAt.Equal(observedAt) || len(updated.Alerts) != 1 || !updated.Alerts[0].CreatedAt.After(observedAt) {
+		t.Fatalf("ASR transcript should enter the same Agent loop: %#v", updated)
 	}
 }

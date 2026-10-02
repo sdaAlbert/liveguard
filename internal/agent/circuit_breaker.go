@@ -37,10 +37,10 @@ func (b *CircuitBreaker) BeforeRequest() error {
 		return nil
 	}
 	if now.Before(b.openUntil) {
-		return fmt.Errorf("openai circuit open; retry after %s", b.openUntil.Sub(now).Round(time.Second))
+		return fmt.Errorf("model circuit open; retry after %s", b.openUntil.Sub(now).Round(time.Second))
 	}
 	if b.probeActive {
-		return fmt.Errorf("openai circuit half-open; recovery probe already running")
+		return fmt.Errorf("model circuit half-open; recovery probe already running")
 	}
 	b.probeActive = true
 	return nil

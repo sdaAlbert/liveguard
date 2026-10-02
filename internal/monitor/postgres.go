@@ -45,6 +45,12 @@ func OpenPostgres(ctx context.Context, databaseURL string) (*PostgresRepository,
 }
 
 func (r *PostgresRepository) Create(ctx context.Context, run *Run) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if run == nil || run.ID == "" || run.Status != RunRunning {
+		return errors.New("new monitor must have an id and start running")
+	}
 	payload, err := json.Marshal(run)
 	if err != nil {
 		return err
@@ -54,6 +60,12 @@ func (r *PostgresRepository) Create(ctx context.Context, run *Run) error {
 }
 
 func (r *PostgresRepository) Update(ctx context.Context, id string, mutate func(*Run) error) (*Run, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if mutate == nil {
+		return nil, errors.New("monitor update callback is required")
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -70,7 +82,21 @@ func (r *PostgresRepository) Update(ctx context.Context, id string, mutate func(
 	if err := json.Unmarshal(payload, &run); err != nil {
 		return nil, err
 	}
+	previousStatus := run.Status
+	previousInvestigations := append([]Investigation(nil), run.Investigations...)
 	if err := mutate(&run); err != nil {
+		return nil, err
+	}
+	boundRunHistory(&run)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	desiredStatus := run.Status
+	run.Status = previousStatus
+	if err := TransitionRun(&run, desiredStatus); err != nil {
+		return nil, err
+	}
+	if err := validateInvestigationUpdates(previousInvestigations, run.Investigations); err != nil {
 		return nil, err
 	}
 	run.UpdatedAt = time.Now().UTC()

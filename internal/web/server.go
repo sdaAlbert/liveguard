@@ -6,70 +6,51 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
-	"sort"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
 
-	"liveguard/internal/agent"
 	"liveguard/internal/browser"
 	"liveguard/internal/domain"
 	"liveguard/internal/monitor"
-	"liveguard/internal/sandbox"
-	"liveguard/internal/store"
-	"liveguard/internal/worker"
 )
 
 //go:embed static/*
 var assets embed.FS
 
 type Server struct {
-	store               store.TaskRepository
-	worker              *worker.Worker
-	sandboxLab          SandboxService
 	monitorService      MonitorService
 	artifactDir         string
-	evalRunner          func(context.Context) agent.EvalReport
 	openBrowserSession  func(string) error
 	browserSessionState func() browser.SessionState
-	lastEval            *agent.EvalReport
 	mu                  sync.Mutex
 	subscribers         map[chan domain.Event]struct{}
-}
-
-type SandboxService interface {
-	List() []*sandbox.Run
-	InfraStatus() sandbox.InfraStatus
-	SubmitWithKey(scenarioName, suiteID, idempotencyKey string) (*sandbox.Run, error)
-	SubmitSuiteWithKey(idempotencyKey string) ([]*sandbox.Run, error)
 }
 
 type MonitorService interface {
 	Start(context.Context, monitor.StartInput) (*monitor.Run, error)
 	List(context.Context) ([]monitor.Summary, error)
 	Get(context.Context, string) (*monitor.Run, error)
+	UpdateGoal(context.Context, string, string) (*monitor.Run, error)
 	Stop(context.Context, string) (*monitor.Run, error)
+	Ingest(context.Context, string, monitor.SignalEvent) error
+	IngestFrame(context.Context, string, monitor.VideoFrame) error
+	IngestAudio(context.Context, string, monitor.AudioChunk) error
 }
 
-func New(s store.TaskRepository, artifactDir string) *Server {
-	return &Server{store: s, artifactDir: artifactDir, subscribers: map[chan domain.Event]struct{}{}}
+func New(artifactDir string) *Server {
+	return &Server{artifactDir: artifactDir, subscribers: map[chan domain.Event]struct{}{}}
 }
-
-func (s *Server) SetWorker(w *worker.Worker) { s.worker = w }
-
-func (s *Server) SetSandboxLab(lab SandboxService) { s.sandboxLab = lab }
 
 func (s *Server) SetMonitorService(service MonitorService) { s.monitorService = service }
-
-func (s *Server) SetAgentEval(runner func(context.Context) agent.EvalReport) { s.evalRunner = runner }
 
 func (s *Server) SetBrowserSession(open func(string) error, state func() browser.SessionState) {
 	s.openBrowserSession = open
@@ -92,29 +73,12 @@ func (s *Server) Handler() http.Handler {
 	staticFS, _ := fs.Sub(assets, "static")
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 	mux.Handle("/artifacts/", http.StripPrefix("/artifacts/", http.FileServer(http.Dir(s.artifactDir))))
-	mux.HandleFunc("/api/tasks", s.tasks)
-	mux.HandleFunc("/api/tasks/", s.task)
-	mux.HandleFunc("/api/campaigns", s.campaigns)
-	mux.HandleFunc("/api/campaigns/", s.campaign)
 	mux.HandleFunc("/api/monitors", s.monitors)
 	mux.HandleFunc("/api/monitors/", s.monitorRun)
 	mux.HandleFunc("/api/events", s.events)
-	mux.HandleFunc("/api/sandbox/runs", s.sandboxRuns)
-	mux.HandleFunc("/api/sandbox/suite", s.sandboxSuite)
-	mux.HandleFunc("/api/infra/status", s.infraStatus)
-	mux.HandleFunc("/api/evals/agent", s.agentEval)
 	mux.HandleFunc("/api/browser/session", s.browserSession)
-	mux.HandleFunc("/demo/live", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFileFS(w, r, assets, "static/demo-live.html")
-	})
-	mux.HandleFunc("/demo/live-broken", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFileFS(w, r, assets, "static/demo-live-broken.html")
-	})
 	mux.HandleFunc("/monitor", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, assets, "static/monitor.html")
-	})
-	mux.HandleFunc("/inspect", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFileFS(w, r, assets, "static/index.html")
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -183,6 +147,34 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parts[0]
+	if len(parts) == 2 && parts[1] == "goal" && r.Method == http.MethodPut {
+		var input struct {
+			Goal string `json:"goal"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "请输入新的监控需求")
+			return
+		}
+		if length := len([]rune(strings.TrimSpace(input.Goal))); length < 2 || length > 240 {
+			writeError(w, http.StatusBadRequest, "监控需求应为 2-240 个字符")
+			return
+		}
+		run, err := s.monitorService.UpdateGoal(r.Context(), id, input.Goal)
+		if err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			if errors.Is(err, monitor.ErrInvalidTransition) {
+				writeError(w, http.StatusConflict, "监控已停止，不能修改需求")
+				return
+			}
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, run)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "stop" && r.Method == http.MethodPost {
 		run, err := s.monitorService.Stop(r.Context(), id)
 		if err != nil {
@@ -190,6 +182,78 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, run)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "signals" && r.Method == http.MethodPost {
+		var event monitor.SignalEvent
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&event); err != nil {
+			writeError(w, http.StatusBadRequest, "请输入有效的直播信号")
+			return
+		}
+		if strings.TrimSpace(event.Text) == "" {
+			writeError(w, http.StatusBadRequest, "直播信号文本不能为空")
+			return
+		}
+		if err := s.monitorService.Ingest(r.Context(), id, event); err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		run, err := s.monitorService.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, run)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "ocr" && r.Method == http.MethodPost {
+		roomID, imagePath, cleanup, err := saveOCRUpload(w, r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		defer cleanup()
+		if err := s.monitorService.IngestFrame(r.Context(), id, monitor.VideoFrame{RoomID: roomID, Path: imagePath, EventID: r.Header.Get("Idempotency-Key")}); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		run, err := s.monitorService.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, run)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "audio" && r.Method == http.MethodPost {
+		roomID, audioPath, cleanup, err := saveAudioUpload(w, r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		defer cleanup()
+		observedAt := time.Time{}
+		if value := strings.TrimSpace(r.FormValue("observed_at")); value != "" {
+			observedAt, err = time.Parse(time.RFC3339Nano, value)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "音频片段采集时间格式无效")
+				return
+			}
+		}
+		if err := s.monitorService.IngestAudio(r.Context(), id, monitor.AudioChunk{RoomID: roomID, Path: audioPath, EventID: r.Header.Get("Idempotency-Key"), ObservedAt: observedAt}); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		run, err := s.monitorService.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, run)
 		return
 	}
 	if len(parts) != 1 || r.Method != http.MethodGet {
@@ -208,468 +272,92 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, run)
 }
 
-func (s *Server) agentEval(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.mu.Lock()
-		last := s.lastEval
-		s.mu.Unlock()
-		if last == nil {
-			writeError(w, http.StatusNotFound, "尚未运行 Agent Eval")
-			return
-		}
-		writeJSON(w, http.StatusOK, last)
-	case http.MethodPost:
-		if s.evalRunner == nil {
-			writeError(w, http.StatusServiceUnavailable, "Agent Eval 未启用")
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
-		defer cancel()
-		report := s.evalRunner(ctx)
-		s.mu.Lock()
-		s.lastEval = &report
-		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, report)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
+const maxAudioChunkBytes = 5 << 20
 
-func (s *Server) infraStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+func saveAudioUpload(w http.ResponseWriter, r *http.Request) (roomID, audioPath string, cleanup func(), err error) {
+	cleanup = func() {}
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		return "", "", cleanup, errors.New("请上传一段直播音频")
 	}
-	if s.sandboxLab == nil {
-		writeError(w, http.StatusServiceUnavailable, "Sandbox Lab 未启用")
-		return
+	r.Body = http.MaxBytesReader(w, r.Body, maxAudioChunkBytes+(64<<10))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		return "", "", cleanup, errors.New("音频片段不能超过 5MB")
 	}
-	writeJSON(w, http.StatusOK, s.sandboxLab.InfraStatus())
-}
-
-func (s *Server) sandboxRuns(w http.ResponseWriter, r *http.Request) {
-	if s.sandboxLab == nil {
-		writeError(w, http.StatusServiceUnavailable, "Sandbox Lab 未启用")
-		return
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.sandboxLab.List())
-	case http.MethodPost:
-		var input struct {
-			Scenario string `json:"scenario"`
-		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
-			writeError(w, http.StatusBadRequest, "请求格式无效")
-			return
-		}
-		run, err := s.sandboxLab.SubmitWithKey(strings.TrimSpace(input.Scenario), "", strings.TrimSpace(r.Header.Get("Idempotency-Key")))
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusAccepted, run)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func (s *Server) sandboxSuite(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if s.sandboxLab == nil {
-		writeError(w, http.StatusServiceUnavailable, "Sandbox Lab 未启用")
-		return
-	}
-	runs, err := s.sandboxLab.SubmitSuiteWithKey(strings.TrimSpace(r.Header.Get("Idempotency-Key")))
+	file, header, err := r.FormFile("audio")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return "", "", cleanup, errors.New("请选择音频片段")
 	}
-	writeJSON(w, http.StatusAccepted, runs)
-}
-
-func (s *Server) tasks(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.List())
-	case http.MethodPost:
-		var input struct {
-			URL                     string   `json:"url"`
-			Objective               string   `json:"objective"`
-			ExpectedTexts           []string `json:"expected_texts"`
-			ExpectedLiveStatus      string   `json:"expected_live_status"`
-			UseAuthenticatedSession bool     `json:"use_authenticated_session"`
-		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&input); err != nil {
-			writeError(w, http.StatusBadRequest, "请求格式无效")
-			return
-		}
-		input.URL, input.Objective = strings.TrimSpace(input.URL), strings.TrimSpace(input.Objective)
-		parsed, err := url.Parse(input.URL)
-		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			writeError(w, http.StatusBadRequest, "请输入有效的 http/https 地址")
-			return
-		}
-		if len([]rune(input.Objective)) < 4 || len([]rune(input.Objective)) > 500 {
-			writeError(w, http.StatusBadRequest, "巡检目标应为 4-500 个字符")
-			return
-		}
-		expectedTexts, err := validateExpectedTexts(input.ExpectedTexts)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		input.ExpectedLiveStatus = strings.ToLower(strings.TrimSpace(input.ExpectedLiveStatus))
-		if input.ExpectedLiveStatus != "" && input.ExpectedLiveStatus != "any" && input.ExpectedLiveStatus != "live" && input.ExpectedLiveStatus != "offline" {
-			writeError(w, http.StatusBadRequest, "直播状态预期仅支持 any、live 或 offline")
-			return
-		}
-		if input.ExpectedLiveStatus == "any" {
-			input.ExpectedLiveStatus = ""
-		}
-		if input.UseAuthenticatedSession && s.browserSessionState != nil {
-			state := s.browserSessionState()
-			if state.Open {
-				writeError(w, http.StatusConflict, "请先关闭抖音登录窗口，再开始巡检")
-				return
-			}
-			if state.Inspecting {
-				writeError(w, http.StatusConflict, "另一个登录态巡检正在执行，请稍候")
-				return
-			}
-		}
-		task, err := s.createTask(r.Context(), &domain.Task{URL: input.URL, Objective: input.Objective, ExpectedTexts: expectedTexts, ExpectedLiveStatus: input.ExpectedLiveStatus, UseAuthenticatedSession: input.UseAuthenticatedSession}, "任务已创建并进入执行队列")
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusCreated, task)
+	defer file.Close()
+	roomID = strings.TrimSpace(r.FormValue("room_id"))
+	extension := strings.ToLower(filepath.Ext(header.Filename))
+	switch extension {
+	case ".webm", ".wav", ".ogg", ".mp3", ".m4a", ".opus", ".aac", ".flac":
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		extension = ".webm"
 	}
-}
-
-func (s *Server) task(w http.ResponseWriter, r *http.Request) {
-	remainder := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
-	parts := strings.Split(strings.Trim(remainder, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
-	}
-	id := parts[0]
-	if len(parts) == 2 && parts[1] == "retry" && r.Method == http.MethodPost {
-		original, err := s.store.Get(id)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		if original.Status == domain.StatusQueued || original.Status == domain.StatusPlanning || original.Status == domain.StatusRunning {
-			writeError(w, http.StatusConflict, "任务仍在执行，结束后才能复测")
-			return
-		}
-		clone := &domain.Task{CampaignID: original.CampaignID, CampaignName: original.CampaignName, URL: original.URL, Objective: original.Objective, ExpectedTexts: append([]string(nil), original.ExpectedTexts...), ExpectedLiveStatus: original.ExpectedLiveStatus, UseAuthenticatedSession: original.UseAuthenticatedSession, ParentTaskID: original.ID, MaxAttempts: 3}
-		retry, err := s.createTask(r.Context(), clone, "复测任务已创建，来源："+original.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusCreated, retry)
-		return
-	}
-	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
-		task, err := s.store.Update(id, func(t *domain.Task) error {
-			if t.Status == domain.StatusCompleted || t.Status == domain.StatusFailed {
-				return errors.New("已结束的任务不能取消")
-			}
-			t.Status = domain.StatusCancelled
-			t.AddEvent("cancelled", "用户取消了任务")
-			return nil
-		})
-		if err != nil {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		if s.worker != nil {
-			s.worker.Cancel(id)
-		}
-		writeJSON(w, http.StatusOK, task)
-		return
-	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	task, err := s.store.Get(id)
+	temporary, err := os.CreateTemp("", "liveguard-audio-*"+extension)
 	if err != nil {
-		http.NotFound(w, r)
-		return
+		return "", "", cleanup, err
 	}
-	writeJSON(w, http.StatusOK, task)
+	audioPath = temporary.Name()
+	cleanup = func() { _ = os.Remove(audioPath) }
+	written, copyErr := io.Copy(temporary, io.LimitReader(file, maxAudioChunkBytes+1))
+	closeErr := temporary.Close()
+	if copyErr != nil || closeErr != nil || written <= 0 || written > maxAudioChunkBytes {
+		cleanup()
+		return "", "", func() {}, errors.New("音频片段无效或超过 5MB")
+	}
+	return roomID, audioPath, cleanup, nil
 }
 
-type campaignSummary struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	Total     int            `json:"total"`
-	Queued    int            `json:"queued"`
-	Running   int            `json:"running"`
-	Passed    int            `json:"passed"`
-	Attention int            `json:"attention"`
-	Retrying  int            `json:"retrying"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	Tasks     []*domain.Task `json:"tasks,omitempty"`
-}
+const maxOCRImageBytes = 8 << 20
 
-func (s *Server) campaigns(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, summarizeCampaigns(s.store.List(), false))
-	case http.MethodPost:
-		var input struct {
-			Name                    string   `json:"name"`
-			URLs                    []string `json:"urls"`
-			ExpectedTexts           []string `json:"expected_texts"`
-			ExpectedLiveStatus      string   `json:"expected_live_status"`
-			UseAuthenticatedSession bool     `json:"use_authenticated_session"`
-		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&input); err != nil {
-			writeError(w, http.StatusBadRequest, "请求格式无效")
-			return
-		}
-		urls, err := validateCampaignURLs(input.URLs)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		expectedTexts, err := validateExpectedTexts(input.ExpectedTexts)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		liveStatus, err := validateLiveStatus(input.ExpectedLiveStatus)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.validateBrowserAvailability(input.UseAuthenticatedSession); err != nil {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		name := strings.TrimSpace(input.Name)
-		if name == "" {
-			name = "直播巡检 " + time.Now().Format("01-02 15:04")
-		}
-		if len([]rune(name)) > 80 {
-			writeError(w, http.StatusBadRequest, "批次名称不能超过 80 个字符")
-			return
-		}
-		campaignID := domain.NewID("campaign")
-		tasks := make([]*domain.Task, 0, len(urls))
-		for _, targetURL := range urls {
-			task := &domain.Task{CampaignID: campaignID, CampaignName: name, URL: targetURL, Objective: "批量检查直播间是否可以正常访问，识别直播状态，并验证指定页面内容。", ExpectedTexts: append([]string(nil), expectedTexts...), ExpectedLiveStatus: liveStatus, UseAuthenticatedSession: input.UseAuthenticatedSession, MaxAttempts: 3}
-			s.prepareTask(r.Context(), task, "批次任务已创建并进入执行队列")
-			tasks = append(tasks, task)
-		}
-		if err := s.store.CreateMany(tasks); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		for _, task := range tasks {
-			s.Publish(task.Events[len(task.Events)-1])
-		}
-		if s.worker != nil {
-			s.worker.Notify()
-		}
-		summaries := summarizeCampaigns(tasks, true)
-		writeJSON(w, http.StatusCreated, summaries[0])
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+func saveOCRUpload(w http.ResponseWriter, r *http.Request) (roomID, imagePath string, cleanup func(), err error) {
+	cleanup = func() {}
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		return "", "", cleanup, errors.New("请上传 PNG 或 JPEG 图片")
 	}
-}
+	r.Body = http.MaxBytesReader(w, r.Body, maxOCRImageBytes+(64<<10))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		return "", "", cleanup, errors.New("图片不能超过 8MB，请检查文件后重试")
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		return "", "", cleanup, errors.New("请选择要识别的图片")
+	}
+	defer file.Close()
+	roomID = strings.TrimSpace(r.FormValue("room_id"))
 
-func (s *Server) campaign(w http.ResponseWriter, r *http.Request) {
-	remainder := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/campaigns/"), "/")
-	parts := strings.Split(remainder, "/")
-	if len(parts) == 0 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
+	header := make([]byte, 512)
+	n, readErr := file.Read(header)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return "", "", cleanup, errors.New("无法读取图片")
 	}
-	id := parts[0]
-	matching := campaignTasks(s.store.List(), id)
-	if len(matching) == 0 {
-		http.NotFound(w, r)
-		return
+	extension := map[string]string{"image/png": ".png", "image/jpeg": ".jpg"}[http.DetectContentType(header[:n])]
+	if extension == "" {
+		return "", "", cleanup, errors.New("目前只支持 PNG 和 JPEG 图片")
 	}
-	if len(parts) == 2 && parts[1] == "retry-failed" && r.Method == http.MethodPost {
-		var retries []*domain.Task
-		for _, original := range latestCampaignTasks(matching) {
-			if !needsAttention(original) {
-				continue
-			}
-			clone := &domain.Task{CampaignID: original.CampaignID, CampaignName: original.CampaignName, URL: original.URL, Objective: original.Objective, ExpectedTexts: append([]string(nil), original.ExpectedTexts...), ExpectedLiveStatus: original.ExpectedLiveStatus, UseAuthenticatedSession: original.UseAuthenticatedSession, ParentTaskID: original.ID, MaxAttempts: 3}
-			s.prepareTask(r.Context(), clone, "异常任务已重新进入批次队列")
-			retries = append(retries, clone)
-		}
-		if len(retries) == 0 {
-			writeError(w, http.StatusConflict, "当前批次没有需要复测的任务")
-			return
-		}
-		if err := s.store.CreateMany(retries); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		for _, task := range retries {
-			s.Publish(task.Events[len(task.Events)-1])
-		}
-		if s.worker != nil {
-			s.worker.Notify()
-		}
-		writeJSON(w, http.StatusCreated, map[string]any{"campaign_id": id, "created": len(retries)})
-		return
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", "", cleanup, errors.New("无法读取图片")
 	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+	temporary, err := os.CreateTemp("", "liveguard-ocr-*"+extension)
+	if err != nil {
+		return "", "", cleanup, errors.New("无法保存 OCR 图片")
 	}
-	writeJSON(w, http.StatusOK, summarizeCampaigns(matching, true)[0])
-}
-
-func validateCampaignURLs(input []string) ([]string, error) {
-	if len(input) == 0 || len(input) > 50 {
-		return nil, errors.New("每个批次需要 1-50 个直播间地址")
+	imagePath = temporary.Name()
+	written, copyErr := io.Copy(temporary, io.LimitReader(file, maxOCRImageBytes+1))
+	closeErr := temporary.Close()
+	if copyErr != nil || closeErr != nil || written > maxOCRImageBytes {
+		_ = os.Remove(imagePath)
+		return "", "", cleanup, errors.New("图片不能超过 8MB，或文件读取失败")
 	}
-	seen := map[string]bool{}
-	urls := make([]string, 0, len(input))
-	for _, raw := range input {
-		raw = strings.TrimSpace(raw)
-		parsed, err := url.Parse(raw)
-		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return nil, fmt.Errorf("无效的直播间地址：%s", raw)
-		}
-		if !seen[raw] {
-			seen[raw] = true
-			urls = append(urls, raw)
-		}
-	}
-	return urls, nil
-}
-
-func validateLiveStatus(input string) (string, error) {
-	input = strings.ToLower(strings.TrimSpace(input))
-	if input == "" || input == "any" {
-		return "", nil
-	}
-	if input != "live" && input != "offline" {
-		return "", errors.New("直播状态预期仅支持 any、live 或 offline")
-	}
-	return input, nil
-}
-
-func (s *Server) validateBrowserAvailability(useAuthenticated bool) error {
-	if !useAuthenticated || s.browserSessionState == nil {
-		return nil
-	}
-	state := s.browserSessionState()
-	if state.Open {
-		return errors.New("请先关闭抖音登录窗口，再开始巡检")
-	}
-	if state.Inspecting {
-		return errors.New("另一个登录态巡检正在执行，请稍候")
-	}
-	return nil
-}
-
-func campaignTasks(tasks []*domain.Task, id string) []*domain.Task {
-	var result []*domain.Task
-	for _, task := range tasks {
-		if task.CampaignID == id {
-			result = append(result, task)
-		}
-	}
-	return result
-}
-
-// latestCampaignTasks collapses manual retries so that a campaign continues to
-// represent rooms, rather than every historical attempt for those rooms.
-func latestCampaignTasks(tasks []*domain.Task) []*domain.Task {
-	byURL := map[string]*domain.Task{}
-	for _, task := range tasks {
-		current := byURL[task.URL]
-		if current == nil || task.CreatedAt.After(current.CreatedAt) {
-			byURL[task.URL] = task
-		}
-	}
-	result := make([]*domain.Task, 0, len(byURL))
-	for _, task := range byURL {
-		result = append(result, task)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
-	return result
-}
-
-func summarizeCampaigns(tasks []*domain.Task, includeTasks bool) []campaignSummary {
-	grouped := map[string][]*domain.Task{}
-	for _, task := range tasks {
-		if task.CampaignID == "" {
-			continue
-		}
-		grouped[task.CampaignID] = append(grouped[task.CampaignID], task)
-	}
-	byID := map[string]*campaignSummary{}
-	for id, history := range grouped {
-		latest := latestCampaignTasks(history)
-		if len(latest) == 0 {
-			continue
-		}
-		first := latest[0]
-		summary := &campaignSummary{ID: id, Name: first.CampaignName, CreatedAt: first.CreatedAt, UpdatedAt: first.UpdatedAt}
-		byID[id] = summary
-		for _, task := range latest {
-			summary.Total++
-			if task.CreatedAt.Before(summary.CreatedAt) {
-				summary.CreatedAt = task.CreatedAt
-			}
-			if task.UpdatedAt.After(summary.UpdatedAt) {
-				summary.UpdatedAt = task.UpdatedAt
-			}
-			switch task.Status {
-			case domain.StatusQueued:
-				summary.Queued++
-				if task.Error != "" {
-					summary.Retrying++
-				}
-			case domain.StatusPlanning, domain.StatusRunning:
-				summary.Running++
-			}
-			if task.Report != nil && task.Report.Verdict == "passed" {
-				summary.Passed++
-			}
-			if needsAttention(task) {
-				summary.Attention++
-			}
-			if includeTasks {
-				summary.Tasks = append(summary.Tasks, task)
-			}
-		}
-	}
-	result := make([]campaignSummary, 0, len(byID))
-	for _, summary := range byID {
-		result = append(result, *summary)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
-	return result
-}
-
-func needsAttention(task *domain.Task) bool {
-	if task.Status == domain.StatusFailed || task.Status == domain.StatusNeedsHuman {
-		return true
-	}
-	return task.Report != nil && (task.Report.Verdict == "failed" || task.Report.Verdict == "unverified" || task.Report.Verdict == "needs_human")
+	return roomID, filepath.Clean(imagePath), func() { _ = os.Remove(imagePath) }, nil
 }
 
 func (s *Server) browserSession(w http.ResponseWriter, r *http.Request) {
@@ -699,56 +387,6 @@ func (s *Server) browserSession(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-}
-
-func (s *Server) createTask(ctx context.Context, task *domain.Task, eventMessage string) (*domain.Task, error) {
-	s.prepareTask(ctx, task, eventMessage)
-	if err := s.store.Create(task); err != nil {
-		return nil, err
-	}
-	s.Publish(task.Events[len(task.Events)-1])
-	if s.worker != nil {
-		s.worker.Notify()
-	}
-	return task, nil
-}
-
-func (s *Server) prepareTask(ctx context.Context, task *domain.Task, eventMessage string) {
-	now := time.Now().UTC()
-	carrier := propagation.MapCarrier{}
-	otel.GetTextMapPropagator().Inject(ctx, carrier)
-	traceID := ""
-	if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
-		traceID = spanContext.TraceID().String()
-	}
-	task.ID = domain.NewID("task")
-	task.Status = domain.StatusQueued
-	if task.MaxAttempts <= 0 {
-		task.MaxAttempts = 3
-	}
-	task.CreatedAt, task.UpdatedAt, task.Version = now, now, 1
-	task.TraceID, task.TraceParent, task.TraceState = traceID, carrier.Get("traceparent"), carrier.Get("tracestate")
-	task.AddEvent("created", eventMessage)
-}
-
-func validateExpectedTexts(input []string) ([]string, error) {
-	if len(input) > 5 {
-		return nil, errors.New("最多设置 5 条预期文案")
-	}
-	seen := map[string]bool{}
-	result := make([]string, 0, len(input))
-	for _, text := range input {
-		text = strings.TrimSpace(text)
-		if text == "" || seen[text] {
-			continue
-		}
-		if len([]rune(text)) > 80 {
-			return nil, errors.New("每条预期文案不能超过 80 个字符")
-		}
-		seen[text] = true
-		result = append(result, text)
-	}
-	return result, nil
 }
 
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
