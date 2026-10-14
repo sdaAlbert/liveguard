@@ -7,49 +7,67 @@
   <link rel="stylesheet" href="/static/monitor.css">
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="/"><span class="brand-mark">L</span>LiveGuard</a>
-    <button id="douyinLogin" type="button"><span class="login-dot"></span>登录抖音</button>
-  </header>
-
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="LiveGuard 首页"><span class="brand-mark" aria-hidden="true">L</span>LiveGuard</a>
+    <div class="sidebar-section">监控室</div>
+    <nav class="monitor-nav" aria-label="直播窗口">
+      <button id="allMonitors" class="nav-all selected" type="button" aria-pressed="true"><span class="grid-icon" aria-hidden="true">▦</span>全部监控<span id="navCount" class="nav-count">0</span></button>
+      <div id="monitorTabs" class="monitor-tabs"></div>
+    </nav>
+    <div class="sidebar-footer"><span id="connectionDot" class="status-dot yellow" aria-hidden="true"></span><span id="connectionLabel" role="status">正在连接</span></div>
+  </aside>
+  <div class="workspace">
+  <header class="topbar"><span class="breadcrumb">LiveGuard <span>/</span> 监控室</span><div class="topbar-actions"><button id="modelSettingsOpen" class="login-button" type="button">模型设置</button><button id="douyinLogin" class="login-button" type="button">登录抖音 <span aria-hidden="true">↗</span></button><button id="shutdownApp" class="shutdown-button" type="button">退出程序</button></div></header>
   <main>
+    <div class="page-heading"><h1>监控室</h1><div class="status-legend" aria-label="状态说明"><span><i class="status-dot green" aria-hidden="true"></i>运行</span><span><i class="status-dot red" aria-hidden="true"></i>新提醒</span><span><i class="status-dot yellow" aria-hidden="true"></i>待确认 / 异常</span></div></div>
     <form id="monitorForm" class="monitor-form">
-      <div class="form-heading"><span class="form-icon">＋</span><h1>新建监控</h1></div>
+      <div class="form-heading"><span class="form-icon" aria-hidden="true">＋</span><h2>新建监控</h2></div>
       <label>直播链接<input id="targetURL" type="url" placeholder="粘贴直播间 URL" required autocomplete="off"></label>
       <label>关注内容<input id="monitorGoal" type="text" maxlength="240" placeholder="例如：聊天区提到抽奖，或主播宣布开始活动" required></label>
       <button id="openMonitor" type="submit"><span>开始监控</span><b>→</b></button>
       <p id="formError" class="form-error" role="alert"></p>
     </form>
 
-    <div class="room-heading"><div><h1>监控中</h1><small>直播提醒会显示在对应卡片里</small></div><span id="roomCount">0</span></div>
-    <section id="emptyRoom" class="empty-room"><span class="empty-mark">＋</span><p>添加直播链接，开始你的第一个监控</p></section>
+    <div class="room-heading"><div><h2 id="roomHeading">全部直播</h2><span id="roomCount">0</span></div><span id="roomOverview" class="room-overview"></span></div>
+    <section id="emptyRoom" class="empty-room"><span class="empty-mark" aria-hidden="true">▦</span><h2>还没有监控中的直播</h2><p>粘贴直播链接，告诉 Agent 你想关注什么。</p></section>
     <section id="monitorGrid" class="monitor-grid hidden" aria-live="polite"></section>
   </main>
+  </div>
+
+  <dialog id="modelSettingsDialog" class="settings-dialog" aria-labelledby="modelSettingsTitle">
+    <form id="modelSettingsForm" class="settings-form">
+      <div class="settings-heading"><div><h2 id="modelSettingsTitle">模型设置</h2><p>模型只处理监控目标和直播信号，不会控制浏览器。</p></div><button id="modelSettingsClose" class="dialog-close" type="button" aria-label="关闭">×</button></div>
+      <label>模型提供方<select id="modelProvider"><option value="minimax">MiniMax</option><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="rules">本地规则（不调用模型）</option></select></label>
+      <label id="modelNameLabel">模型名称<input id="modelName" type="text" maxlength="100" autocomplete="off" placeholder="MiniMax-M3"></label>
+      <label id="modelEndpointLabel">API 地址<input id="modelEndpoint" type="url" maxlength="500" autocomplete="url" placeholder="使用默认地址"></label>
+	  <label id="modelVisionLabel" class="settings-checkbox"><input id="modelSupportsVision" type="checkbox">所选模型支持图片理解</label>
+      <label id="modelKeyLabel">API Key<input id="modelApiKey" type="password" maxlength="500" autocomplete="new-password" spellcheck="false" placeholder="仅本次设置时输入；留空可保留当前密钥"></label>
+      <p id="modelProviderNote" class="settings-note"></p>
+      <p class="settings-note">保存设置不会调用模型。设置用于后续信号判断；目标计划会在新建监控或更新目标时重新生成。密钥只保存在本机服务进程内，重启后需重新填写。</p>
+      <p id="modelSettingsStatus" class="settings-status" role="status"></p>
+      <div class="settings-actions"><button id="modelSettingsCancel" type="button">取消</button><button id="modelSettingsSave" type="submit">保存设置</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="monitorDetailDialog" class="detail-dialog" aria-label="监控详情">
+    <div id="monitorDetailContent" class="detail-frame"></div>
+  </dialog>
 
   <template id="monitorCard">
     <article class="monitor-card">
-      <header class="card-head">
-        <div><b class="room-name"></b><span class="window-status"></span></div>
-        <button class="stop-monitor" type="button" aria-label="停止监控"><span></span>停止</button>
-      </header>
-      <form class="goal-edit">
-        <label>监控需求<input class="goal-input" type="text" maxlength="240" required></label>
-        <button class="goal-save" type="submit">更新</button>
-        <span class="goal-status" role="status"></span>
-      </form>
-      <section class="alert-list"></section>
-      <details class="card-detail">
-        <summary>详情</summary>
-        <div class="detail-content">
-          <a class="room-link" target="_blank" rel="noreferrer"></a>
-          <p class="plan-summary"></p>
-          <p class="latest-signal"></p>
-          <p class="capture-error"></p>
-          <p class="window-stats"><span class="card-signals">0</span> 条信号 · <span class="card-investigations">0</span> 次判断</p>
-          <div class="decision-list"></div>
-          <button class="audio-capture" type="button">开启口播识别</button>
-        </div>
-      </details>
+      <button class="card-open-detail" type="button">
+        <span class="card-lamp"><i class="status-dot" aria-hidden="true"></i></span>
+        <span class="card-copy">
+          <b class="room-name"></b>
+          <span class="goal-summary"></span>
+          <span class="feedback-row"><span class="feedback-mark">动态</span><span class="card-feedback"></span></span>
+        </span>
+        <span class="card-chevron" aria-hidden="true">↗</span>
+      </button>
+      <div class="card-controls">
+        <button class="pause-monitor" type="button" aria-label="暂停监控">暂停</button>
+        <button class="stop-monitor" type="button" aria-label="结束监控">结束</button>
+      </div>
     </article>
   </template>
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,23 +21,25 @@ import (
 )
 
 const (
-	InvestigationWaiting    = "waiting_more_evidence"
-	InvestigationConfirmed  = "confirmed"
-	InvestigationSuppressed = "suppressed"
-	InvestigationNeedsHuman = "needs_human"
-	InvestigationFailed     = "failed"
-	maxActiveMonitors       = 8
-	maxConcurrentReviews    = 4
-	maxEventReceipts        = 2048
-	eventReceiptRetention   = 24 * time.Hour
-	maxSignalTextRunes      = 4000
-	maxSignalAge            = 10 * time.Minute
-	maxFutureSignalSkew     = 2 * time.Minute
+	InvestigationWaiting     = "waiting_more_evidence"
+	InvestigationWaitingUser = "waiting_user"
+	InvestigationReviewing   = "reviewing_clarification"
+	InvestigationConfirmed   = "confirmed"
+	InvestigationSuppressed  = "suppressed"
+	InvestigationNeedsHuman  = "needs_human"
+	InvestigationFailed      = "failed"
+	maxActiveMonitors        = 8
+	maxConcurrentReviews     = 4
+	maxEventReceipts         = 2048
+	eventReceiptRetention    = 24 * time.Hour
+	maxSignalTextRunes       = 4000
+	maxFutureSignalSkew      = 2 * time.Minute
 )
 
 var (
 	ErrEventIDConflict = errors.New("event id was already used with different content")
-	ErrStaleSignal     = errors.New("signal is outside the accepted time window")
+	ErrFutureSignal    = errors.New("signal observation time is too far in the future")
+	ErrGoalChanged     = errors.New("monitor goal changed while planning")
 )
 
 type StartInput struct {
@@ -53,16 +56,20 @@ type FrameCapturer interface {
 }
 
 type Service struct {
-	repository  Repository
-	onUpdate    func()
-	replayGap   time.Duration
-	recognizer  TextRecognizer
-	transcriber Transcriber
-	capturer    FrameCapturer
-	captureGap  time.Duration
-	reviewer    UnexpectedEventReviewer
-	reviewGap   time.Duration
-	goalPlanner GoalPlanner
+	repository      Repository
+	frameArchiveDir string
+	onUpdate        func()
+	replayGap       time.Duration
+	recognizer      TextRecognizer
+	transcriber     Transcriber
+	capturer        FrameCapturer
+	captureGap      time.Duration
+	reviewer        UnexpectedEventReviewer
+	reviewGap       time.Duration
+	goalPlanner     GoalPlanner
+	modelMu         sync.RWMutex
+	modelConfig     ModelSettingsStatus
+	modelAPIKey     string
 
 	mu                   sync.Mutex
 	cancels              map[string]context.CancelFunc
@@ -70,14 +77,61 @@ type Service struct {
 	contexts             map[string]context.Context
 	reviewInFlight       map[string]bool
 	reviewSlots          chan struct{}
+	reviewWaiters        []*reviewWaiter
 	reservations         int
+	pending              map[string]*signalQueue
+	retainedFrameBytes   int64
 }
 
 func NewService(repository Repository, onUpdate func()) *Service {
 	if onUpdate == nil {
 		onUpdate = func() {}
 	}
-	return &Service{repository: repository, onUpdate: onUpdate, replayGap: 700 * time.Millisecond, reviewGap: 15 * time.Second, goalPlanner: ruleGoalPlanner{}, cancels: map[string]context.CancelFunc{}, contexts: map[string]context.Context{}, lastUnexpectedReview: map[string]time.Time{}, reviewInFlight: map[string]bool{}, reviewSlots: make(chan struct{}, maxConcurrentReviews)}
+	return &Service{repository: repository, frameArchiveDir: filepath.Join("runtime", "frames"), onUpdate: onUpdate, replayGap: 700 * time.Millisecond, reviewGap: 15 * time.Second, goalPlanner: ruleGoalPlanner{}, cancels: map[string]context.CancelFunc{}, contexts: map[string]context.Context{}, lastUnexpectedReview: map[string]time.Time{}, reviewInFlight: map[string]bool{}, reviewSlots: make(chan struct{}, maxConcurrentReviews), pending: map[string]*signalQueue{}}
+}
+
+func (s *Service) SetFrameArchiveDir(dir string) {
+	if strings.TrimSpace(dir) != "" {
+		s.frameArchiveDir = dir
+	}
+}
+
+// ArchivedFramePath exposes only images referenced by a persisted alert or
+// investigation for this run; callers never provide a filesystem path.
+func (s *Service) ArchivedFramePath(ctx context.Context, runID, archiveID string) (string, error) {
+	run, err := s.repository.Get(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	referenced := false
+	for _, investigation := range run.Investigations {
+		for _, evidence := range investigation.Evidence {
+			if evidence.FrameArchiveID == archiveID {
+				referenced = true
+				break
+			}
+		}
+		if referenced {
+			break
+		}
+	}
+	if !referenced {
+		for _, alert := range run.Alerts {
+			for _, evidence := range alert.Evidence {
+				if evidence.FrameArchiveID == archiveID {
+					referenced = true
+					break
+				}
+			}
+			if referenced {
+				break
+			}
+		}
+	}
+	if !referenced {
+		return "", ErrNotFound
+	}
+	return s.archivedFramePath(runID, archiveID)
 }
 
 // SetReplayGap makes the deterministic signal source fast in tests. The local
@@ -92,6 +146,8 @@ func (s *Service) SetTranscriber(transcriber Transcriber) { s.transcriber = tran
 
 func (s *Service) SetGoalPlanner(planner GoalPlanner) {
 	if planner != nil {
+		s.modelMu.Lock()
+		defer s.modelMu.Unlock()
 		s.goalPlanner = planner
 	}
 }
@@ -101,10 +157,27 @@ func (s *Service) SetFrameCapturer(capturer FrameCapturer) { s.capturer = captur
 // SetUnexpectedEventReviewer lets the model spot high-salience moments outside
 // the user's explicit goal. Calls are throttled per monitor to control cost.
 func (s *Service) SetUnexpectedEventReviewer(reviewer UnexpectedEventReviewer, minInterval time.Duration) {
+	s.modelMu.Lock()
+	defer s.modelMu.Unlock()
 	s.reviewer = reviewer
 	if minInterval > 0 {
 		s.reviewGap = minInterval
 	}
+}
+
+func (s *Service) SetUnexpectedEventReviewerInterval(minInterval time.Duration) {
+	if minInterval <= 0 {
+		return
+	}
+	s.modelMu.Lock()
+	s.reviewGap = minInterval
+	s.modelMu.Unlock()
+}
+
+func (s *Service) agentConfig() (GoalPlanner, UnexpectedEventReviewer, time.Duration) {
+	s.modelMu.RLock()
+	defer s.modelMu.RUnlock()
+	return s.goalPlanner, s.reviewer, s.reviewGap
 }
 
 func (s *Service) SetCaptureInterval(interval time.Duration) {
@@ -148,22 +221,30 @@ func (s *Service) Start(ctx context.Context, input StartInput) (*Run, error) {
 			s.mu.Unlock()
 		}
 	}()
-	plan, planErr := s.goalPlanner.Plan(ctx, input.Goal)
+	planner, reviewer, reviewGap := s.agentConfig()
+	if state, ok := reviewer.(interface{ QuotaExhausted() bool }); ok && state.QuotaExhausted() {
+		return nil, ErrModelQuotaExhausted
+	}
+	plan, planErr := planner.Plan(ctx, input.Goal)
+	if errors.Is(planErr, ErrModelQuotaExhausted) {
+		s.endQuotaExhaustedRuns("", reviewer)
+		return nil, planErr
+	}
 	if planErr != nil {
 		log.Printf("monitor goal planning failed; using bounded local plan: %v", planErr)
 		plan = defaultGoalPlan(input.Goal, "本地规则兜底")
 	}
 	plan = normalizeMonitoringPlan(plan, input.Goal)
-	if catalog, ok := s.reviewer.(interface{ AdditionalToolNames() []string }); ok {
+	if catalog, ok := reviewer.(interface{ AdditionalToolNames() []string }); ok {
 		plan.Tools = append(plan.Tools, catalog.AdditionalToolNames()...)
 	}
 	if s.captureGap >= time.Second {
 		plan.CaptureIntervalSeconds = durationSecondsCeil(s.captureGap)
 	}
-	if s.reviewGap > time.Duration(plan.ReviewIntervalSeconds)*time.Second {
-		plan.ReviewIntervalSeconds = durationSecondsCeil(s.reviewGap)
+	if reviewGap > time.Duration(plan.ReviewIntervalSeconds)*time.Second {
+		plan.ReviewIntervalSeconds = durationSecondsCeil(reviewGap)
 	}
-	plan.Summary = summarizeMonitoringPlan(plan)
+	plan = planForReviewer(plan, input.Goal, reviewer)
 
 	now := time.Now().UTC()
 	roomID := domain.NewID("room")
@@ -171,17 +252,21 @@ func (s *Service) Start(ctx context.Context, input StartInput) (*Run, error) {
 	run := &Run{
 		ID: domain.NewID("monitor"), Name: roomName, TargetURL: input.TargetURL, Goal: input.Goal,
 		Plan: plan, SourceMode: input.SourceMode, Status: RunRunning, StartedAt: now, UpdatedAt: now, Version: 1,
+		GoalVersion: 1, GoalUpdatedAt: now, Sampling: initialSampling(plan, now),
 		Rooms: []Room{{ID: roomID, Name: roomName, Status: "listening", Health: SourceWaiting}},
 	}
 	if err := s.repository.Create(ctx, run); err != nil {
 		return nil, err
 	}
+	// A monitor has no wall-clock deadline. It runs until explicitly stopped,
+	// the service exits, or its model reports exhausted API quota.
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.reservations--
 	reserved = false
 	s.cancels[run.ID] = cancel
 	s.contexts[run.ID] = runCtx
+	s.pending[run.ID] = s.newPendingQueue(runCtx, run.ID, run.GoalVersion)
 	s.mu.Unlock()
 	s.onUpdate()
 	if input.SourceMode == "demo_replay" {
@@ -197,12 +282,26 @@ func (s *Service) Get(ctx context.Context, id string) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
+	_, reviewer, _ := s.agentConfig()
+	if run.Status == RunRunning {
+		run.Plan = planForReviewer(run.Plan, run.Goal, reviewer)
+	}
+	s.mu.Lock()
+	q := s.pending[id]
+	s.mu.Unlock()
+	if q != nil {
+		status := q.stats()
+		run.Pending = &status
+	}
+	if run.Status == RunRunning {
+		run.Sampling = s.effectiveSampling(run, time.Now().UTC())
+	}
 	if run.Status == RunRunning && run.SourceMode == "browser_ocr" && len(run.Rooms) > 0 {
-		interval := time.Duration(run.Plan.CaptureIntervalSeconds) * time.Second
+		interval := time.Duration(run.Sampling.CaptureIntervalSeconds) * time.Second
 		if interval <= 0 {
 			interval = 12 * time.Second
 		}
-		lastSignal := run.Rooms[0].LastSeen
+		lastSignal := run.Rooms[0].LastCaptureAt
 		if lastSignal.IsZero() {
 			lastSignal = run.StartedAt
 		}
@@ -228,31 +327,63 @@ func (s *Service) UpdateGoal(ctx context.Context, id, goal string) (*Run, error)
 	if current.Status != RunRunning {
 		return nil, ErrInvalidTransition
 	}
-	plan, planErr := s.goalPlanner.Plan(ctx, goal)
+	planner, reviewer, reviewGap := s.agentConfig()
+	if state, ok := reviewer.(interface{ QuotaExhausted() bool }); ok && state.QuotaExhausted() {
+		return nil, ErrModelQuotaExhausted
+	}
+	plan, planErr := planner.Plan(ctx, goal)
+	if errors.Is(planErr, ErrModelQuotaExhausted) {
+		s.endQuotaExhaustedRuns(id, reviewer)
+		return nil, planErr
+	}
 	if planErr != nil {
 		log.Printf("monitor goal update planning failed; using bounded local plan: %v", planErr)
 		plan = defaultGoalPlan(goal, "本地规则兜底")
 	}
 	plan = normalizeMonitoringPlan(plan, goal)
-	if catalog, ok := s.reviewer.(interface{ AdditionalToolNames() []string }); ok {
+	if catalog, ok := reviewer.(interface{ AdditionalToolNames() []string }); ok {
 		plan.Tools = append(plan.Tools, catalog.AdditionalToolNames()...)
 	}
 	if s.captureGap >= time.Second {
 		plan.CaptureIntervalSeconds = durationSecondsCeil(s.captureGap)
 	}
-	if s.reviewGap > time.Duration(plan.ReviewIntervalSeconds)*time.Second {
-		plan.ReviewIntervalSeconds = durationSecondsCeil(s.reviewGap)
+	if reviewGap > time.Duration(plan.ReviewIntervalSeconds)*time.Second {
+		plan.ReviewIntervalSeconds = durationSecondsCeil(reviewGap)
 	}
-	plan.Summary = summarizeMonitoringPlan(plan)
+	plan = planForReviewer(plan, goal, reviewer)
 	updated, err := s.repository.Update(ctx, id, func(run *Run) error {
 		if run.Status != RunRunning {
 			return ErrInvalidTransition
 		}
+		if run.GoalVersion != current.GoalVersion {
+			return ErrGoalChanged
+		}
+		for i := range run.Investigations {
+			inv := &run.Investigations[i]
+			if inv.GoalVersion != run.GoalVersion || (inv.Status != InvestigationWaitingUser && inv.Status != InvestigationReviewing) {
+				continue
+			}
+			if err := TransitionInvestigation(inv, InvestigationSuppressed); err != nil {
+				return err
+			}
+			inv.Conclusion = "监控目标已更新，这次求助已结束；后续信号将按新目标判断"
+			inv.UpdatedAt = time.Now().UTC()
+		}
 		run.Goal = goal
 		run.Plan = plan
+		run.GoalVersion++
+		run.GoalUpdatedAt = time.Now().UTC()
+		run.Sampling = initialSampling(plan, run.GoalUpdatedAt)
 		return nil
 	})
 	if err == nil {
+		s.mu.Lock()
+		delete(s.lastUnexpectedReview, id)
+		q := s.pending[id]
+		s.mu.Unlock()
+		if q != nil {
+			q.invalidate(updated.GoalVersion, false)
+		}
 		s.onUpdate()
 	}
 	return updated, err
@@ -274,16 +405,30 @@ func (s *Service) Stop(ctx context.Context, id string) (*Run, error) {
 	s.mu.Lock()
 	cancel := s.cancels[id]
 	runCtx := s.contexts[id]
+	q := s.pending[id]
 	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
 	completedAt := time.Now().UTC()
 	run, err := s.repository.Update(ctx, id, func(run *Run) error {
-		if run.Status != RunRunning {
+		if run.Status != RunRunning && run.Status != RunPaused {
 			return nil
 		}
 		run.Status = RunStopped
+		if q != nil {
+			status := q.stats()
+			status.Waiting = 0
+			status.Reviewing = false
+			run.Pending = &status
+		}
+		for i := range run.Investigations {
+			inv := &run.Investigations[i]
+			if inv.Status == InvestigationWaitingUser || inv.Status == InvestigationReviewing {
+				if err := TransitionInvestigation(inv, InvestigationSuppressed); err != nil {
+					return err
+				}
+				inv.Conclusion = "监控已结束，这次求助已关闭"
+				inv.UpdatedAt = completedAt
+			}
+		}
 		run.CompletedAt = &completedAt
 		for i := range run.Rooms {
 			run.Rooms[i].Status = "stopped"
@@ -291,12 +436,21 @@ func (s *Service) Stop(ctx context.Context, id string) (*Run, error) {
 		return nil
 	})
 	if err == nil {
+		if q != nil {
+			q.invalidate(0, true)
+		}
+		if cancel != nil {
+			cancel()
+		}
+		if s.capturer != nil {
+			s.capturer.Close(id)
+		}
 		s.mu.Lock()
 		if s.contexts[id] == runCtx {
 			delete(s.cancels, id)
 			delete(s.contexts, id)
 			delete(s.lastUnexpectedReview, id)
-			delete(s.reviewInFlight, id)
+			delete(s.pending, id)
 		}
 		s.mu.Unlock()
 	}
@@ -306,19 +460,155 @@ func (s *Service) Stop(ctx context.Context, id string) (*Run, error) {
 	return run, err
 }
 
+// Pause suspends collection and investigation while preserving the monitor's
+// identity, goal and history so Resume can continue the same run.
+func (s *Service) Pause(ctx context.Context, id string) (*Run, error) {
+	s.mu.Lock()
+	cancel, runCtx, q := s.cancels[id], s.contexts[id], s.pending[id]
+	s.mu.Unlock()
+	updated, err := s.repository.Update(ctx, id, func(run *Run) error {
+		if run.Status == RunPaused {
+			return nil
+		}
+		if run.Status != RunRunning {
+			return ErrInvalidTransition
+		}
+		run.Status = RunPaused
+		if q != nil {
+			status := q.stats()
+			status.Waiting, status.Reviewing = 0, false
+			run.Pending = &status
+		}
+		for i := range run.Rooms {
+			run.Rooms[i].Status = "paused"
+		}
+		for i := range run.Investigations {
+			inv := &run.Investigations[i]
+			if inv.Status == InvestigationReviewing && inv.UserAnswer != "" {
+				if err := TransitionInvestigation(inv, InvestigationWaitingUser); err != nil {
+					return err
+				}
+				inv.Conclusion = "监控已暂停；继续后会恢复结合补充的判断"
+				inv.UpdatedAt = time.Now().UTC()
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		if q != nil {
+			q.invalidate(0, true)
+		}
+		if cancel != nil {
+			cancel()
+		}
+		if s.capturer != nil {
+			s.capturer.Close(id)
+		}
+		s.mu.Lock()
+		if s.contexts[id] == runCtx {
+			delete(s.cancels, id)
+			delete(s.contexts, id)
+			delete(s.pending, id)
+			delete(s.lastUnexpectedReview, id)
+		}
+		s.mu.Unlock()
+		s.onUpdate()
+	}
+	return updated, err
+}
+
+// Resume restarts the source loop against the existing durable run and ledger.
+func (s *Service) Resume(ctx context.Context, id string) (*Run, error) {
+	s.mu.Lock()
+	if len(s.cancels)+s.reservations >= maxActiveMonitors {
+		s.mu.Unlock()
+		return nil, ErrCapacity
+	}
+	s.reservations++
+	s.mu.Unlock()
+	updated, err := s.repository.Update(ctx, id, func(run *Run) error {
+		if run.Status != RunPaused {
+			return ErrInvalidTransition
+		}
+		run.Status = RunRunning
+		run.LastError = ""
+		run.StopReason = ""
+		run.CompletedAt = nil
+		for i := range run.Investigations {
+			inv := &run.Investigations[i]
+			if inv.Status == InvestigationWaitingUser && inv.UserAnswer != "" {
+				if err := TransitionInvestigation(inv, InvestigationReviewing); err != nil {
+					return err
+				}
+				inv.Conclusion = "继续监控后，Agent 正在结合补充重新判断"
+				inv.UpdatedAt = time.Now().UTC()
+			}
+		}
+		for i := range run.Rooms {
+			run.Rooms[i].Status = "listening"
+			if run.Rooms[i].Health == SourceNeedsLogin || run.Rooms[i].Health == SourceFailed {
+				run.Rooms[i].Health = SourceWaiting
+				run.Rooms[i].LastError = ""
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		s.mu.Lock()
+		s.reservations--
+		s.mu.Unlock()
+		return nil, err
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.reservations--
+	s.cancels[id], s.contexts[id] = cancel, runCtx
+	s.pending[id] = s.newPendingQueue(runCtx, id, updated.GoalVersion)
+	s.mu.Unlock()
+	for _, inv := range updated.Investigations {
+		if inv.Status == InvestigationReviewing && inv.UserAnswer != "" {
+			go s.resumeClarifiedInvestigation(id, inv.ID)
+		}
+	}
+	if updated.SourceMode == "demo_replay" {
+		seen := make(map[string]bool, len(updated.Events))
+		for _, event := range updated.Events {
+			seen[event.ID] = true
+		}
+		remaining := make([]SignalEvent, 0)
+		for _, event := range demoSignals(updated) {
+			if !seen[event.ID] {
+				remaining = append(remaining, event)
+			}
+		}
+		go s.replay(runCtx, id, remaining)
+	} else if updated.SourceMode == "browser_ocr" && len(updated.Rooms) > 0 {
+		go s.captureLoop(runCtx, id, updated.TargetURL, updated.Rooms[0].ID)
+	}
+	s.onUpdate()
+	return updated, nil
+}
+
 func (s *Service) StopAll() {
 	s.mu.Lock()
 	var ids []string
 	var cancels []context.CancelFunc
+	var queues []*signalQueue
 	for id, cancel := range s.cancels {
 		ids = append(ids, id)
 		cancels = append(cancels, cancel)
+		if q := s.pending[id]; q != nil {
+			queues = append(queues, q)
+			delete(s.pending, id)
+		}
 		delete(s.cancels, id)
 		delete(s.contexts, id)
 		delete(s.lastUnexpectedReview, id)
-		delete(s.reviewInFlight, id)
 	}
 	s.mu.Unlock()
+	for _, q := range queues {
+		q.invalidate(0, true)
+	}
 	for _, cancel := range cancels {
 		cancel()
 	}
@@ -335,82 +625,18 @@ func (s *Service) StopAll() {
 
 func (s *Service) finishRuntime(runID string, runCtx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.contexts[runID] != runCtx {
+		s.mu.Unlock()
 		return
 	}
+	q := s.pending[runID]
+	delete(s.pending, runID)
 	delete(s.cancels, runID)
 	delete(s.contexts, runID)
 	delete(s.lastUnexpectedReview, runID)
-	delete(s.reviewInFlight, runID)
-}
-
-func (s *Service) captureLoop(ctx context.Context, runID, targetURL, roomID string) {
-	defer func() {
-		s.finishRuntime(runID, ctx)
-	}()
-	captureInterval := s.captureGap
-	if captureInterval <= 0 {
-		if run, err := s.repository.Get(ctx, runID); err == nil && run.Plan.CaptureIntervalSeconds > 0 {
-			captureInterval = time.Duration(run.Plan.CaptureIntervalSeconds) * time.Second
-		} else {
-			captureInterval = 12 * time.Second
-		}
-	}
-	var ocrDeduper OCRLineDeduper
-	var lastCaptureAt time.Time
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		captureStarted := time.Now().UTC()
-		captureIntervalMS := int64(0)
-		if !lastCaptureAt.IsZero() {
-			captureIntervalMS = captureStarted.Sub(lastCaptureAt).Milliseconds()
-		}
-		lastCaptureAt = captureStarted
-		frame, err := os.CreateTemp("", "liveguard-frame-*.png")
-		if err != nil {
-			s.setCaptureError(runID, err)
-		} else {
-			framePath := frame.Name()
-			_ = frame.Close()
-			_ = os.Remove(framePath)
-			captureCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-			captureStartedAt := time.Now()
-			err = s.capturer.Capture(captureCtx, runID, targetURL, framePath)
-			captureDuration := time.Since(captureStartedAt)
-			if err == nil {
-				var event SignalEvent
-				perceptionStarted := time.Now()
-				event, err = s.recognizer.Recognize(captureCtx, VideoFrame{RoomID: roomID, Path: framePath})
-				perceptionDuration := time.Since(perceptionStarted)
-				if err == nil {
-					event.FramePath = framePath
-					event.ObservedAt = captureStarted
-					event.CaptureDurationMS = captureDuration.Milliseconds()
-					event.PerceptionDurationMS = perceptionDuration.Milliseconds()
-					novelText := ocrDeduper.Filter(event.Text, captureStarted)
-					if novelText != "" {
-						event.Text = novelText
-						if ingestErr := s.Ingest(captureCtx, runID, event); ingestErr != nil && !errors.Is(ingestErr, context.Canceled) {
-							err = ingestErr
-						}
-					}
-				}
-			}
-			cancel()
-			_ = os.Remove(framePath)
-			s.recordCaptureMetrics(runID, captureStarted, captureIntervalMS, captureDuration.Milliseconds())
-			if err != nil && !errors.Is(err, context.Canceled) {
-				s.setCaptureError(runID, err)
-			} else if err == nil {
-				s.clearCaptureError(runID)
-			}
-		}
-		if !wait(ctx, captureInterval) {
-			return
-		}
+	s.mu.Unlock()
+	if q != nil {
+		q.invalidate(0, true)
 	}
 }
 
@@ -419,6 +645,7 @@ func (s *Service) recordCaptureMetrics(runID string, capturedAt time.Time, inter
 		if run.Status != RunRunning {
 			return errors.New("monitor is not running")
 		}
+		run.Sampling.CaptureCount++
 		for i := range run.Rooms {
 			if run.Rooms[i].LastCaptureAt.Before(capturedAt) {
 				run.Rooms[i].LastCaptureAt = capturedAt
@@ -433,52 +660,71 @@ func (s *Service) recordCaptureMetrics(runID string, capturedAt time.Time, inter
 	}
 }
 
-func (s *Service) setCaptureError(runID string, captureErr error) {
-	_, err := s.repository.Update(context.Background(), runID, func(run *Run) error {
+// Temporary acquisition failures are retryable. Only explicit verification or
+// the consecutive-failure threshold puts the source into an admission-blocking state.
+func (s *Service) setCaptureError(ctx context.Context, runID string, goalVersion uint64, captureErr error, pause bool) (bool, error) {
+	updated, err := s.repository.Update(ctx, runID, func(run *Run) error {
 		if run.Status != RunRunning {
-			return errors.New("monitor is not running")
+			return ErrInvalidTransition
 		}
-		if len(run.Rooms) > 0 {
-			message := captureErr.Error()
-			run.Rooms[0].LastError = message
-			if strings.Contains(strings.ToLower(message), "ocr returned no text") {
-				run.Rooms[0].Health = SourceWaiting
-				run.Rooms[0].LastError = "尚未识别到可用直播文字"
-			} else if containsAny(strings.ToLower(message), []string{"login", "captcha", "验证", "登录"}) {
-				run.Rooms[0].Health = SourceNeedsLogin
-			} else {
-				run.Rooms[0].Health = SourceFailed
-			}
+		if run.GoalVersion != goalVersion {
+			return ErrGoalChanged
 		}
+		if len(run.Rooms) == 0 {
+			return nil
+		}
+		room := &run.Rooms[0]
+		if room.Health == SourceNeedsLogin || room.Health == SourceFailed {
+			return nil
+		}
+		message := captureErr.Error()
+		if containsAny(strings.ToLower(message), []string{"login", "captcha", "验证", "登录"}) {
+			room.Health = SourceNeedsLogin
+			room.LastError = "页面需要登录或验证，已暂停采集；处理后请暂停再点击继续"
+		} else if pause {
+			room.Health = SourceFailed
+			room.LastError = "采集连续失败，已暂停；处理后请暂停再点击继续：" + message
+		} else {
+			room.Health = SourceDelayed
+			room.LastError = "采集暂时失败，正在退避重试：" + message
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	s.onUpdate()
+	paused := len(updated.Rooms) > 0 && (updated.Rooms[0].Health == SourceNeedsLogin || updated.Rooms[0].Health == SourceFailed)
+	return paused, nil
+}
+
+// A stale capture cannot clear login/pause state or revive a stopped/new-goal run.
+func (s *Service) clearCaptureError(ctx context.Context, runID string, goalVersion uint64) error {
+	_, err := s.repository.Update(ctx, runID, func(run *Run) error {
+		if run.Status != RunRunning {
+			return ErrInvalidTransition
+		}
+		if run.GoalVersion != goalVersion {
+			return ErrGoalChanged
+		}
+		if len(run.Rooms) == 0 {
+			return nil
+		}
+		room := &run.Rooms[0]
+		if room.Health == SourceNeedsLogin || room.Health == SourceFailed {
+			return ErrInputPaused
+		}
+		room.LastError = ""
+		room.Health = SourceHealthy
 		return nil
 	})
 	if err == nil {
 		s.onUpdate()
 	}
+	return err
 }
-
-func (s *Service) clearCaptureError(runID string) {
-	_, err := s.repository.Update(context.Background(), runID, func(run *Run) error {
-		if run.Status != RunRunning {
-			return errors.New("monitor is not running")
-		}
-		if len(run.Rooms) > 0 {
-			run.Rooms[0].LastError = ""
-			if run.Rooms[0].LastSeen.IsZero() {
-				run.Rooms[0].Health = SourceWaiting
-			} else {
-				run.Rooms[0].Health = SourceHealthy
-			}
-		}
-		return nil
-	})
-	if err == nil {
-		s.onUpdate()
-	}
-}
-
 func (s *Service) RecoverInterrupted(ctx context.Context) error {
-	runs, err := s.repository.List(ctx)
+	runs, err := s.repository.ListRunning(ctx)
 	if err != nil {
 		return err
 	}
@@ -486,12 +732,17 @@ func (s *Service) RecoverInterrupted(ctx context.Context) error {
 		if run.Status != RunRunning {
 			continue
 		}
-		completedAt := time.Now().UTC()
 		if _, err := s.repository.Update(ctx, run.ID, func(current *Run) error {
-			current.Status = RunStopped
-			current.CompletedAt = &completedAt
+			if current.Status != RunRunning {
+				return nil
+			}
+			current.Status = RunPaused
+			current.CompletedAt = nil
+			current.StopReason = "process_interrupted"
+			current.Pending = &PendingStatus{LastIssue: "未完成工作在进程重启时中断；原观测仍可搜索"}
+			current.LastError = "服务重启中断了上次运行，已暂停；点击继续会重新采集，原流水保留，未完成调查不会重放"
 			for i := range current.Rooms {
-				current.Rooms[i].Status = "stopped"
+				current.Rooms[i].Status = "paused"
 			}
 			return nil
 		}); err != nil {
@@ -507,7 +758,10 @@ func (s *Service) replay(ctx context.Context, runID string, events []SignalEvent
 		if !wait(ctx, s.replayGap) {
 			return
 		}
-		if err := s.Ingest(ctx, runID, event); err != nil {
+		if err := s.SubmitSignal(ctx, runID, event); err != nil {
+			if errors.Is(err, ErrPendingFull) || errors.Is(err, ErrFrameBudget) || errors.Is(err, ErrGoalChanged) {
+				continue
+			}
 			if !errors.Is(err, context.Canceled) {
 				s.fail(runID)
 			}
@@ -580,29 +834,101 @@ func (s *Service) ingest(ctx context.Context, runID string, event SignalEvent) e
 	if err != nil || duplicate {
 		return err
 	}
-	event = acceptedEvent
+	return s.processAccepted(ctx, runID, snapshot, acceptedEvent, false, 0)
+}
+
+// Both synchronous compatibility callers and the background queue use this
+// same decision/commit implementation; queued work waits instead of dropping.
+func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *Run, event SignalEvent, queued bool, priority int) error {
+	if snapshot.GoalVersion > 1 && event.ObservedAt.Before(snapshot.GoalUpdatedAt) {
+		return nil
+	}
 	eventType := classify(event.Text, snapshot.Goal)
 	var review *UnexpectedEventDecision
+	var quotaFailure bool
+	var err error
 	// A configured model handles arbitrary goal conditions as well as proactive
 	// events. Keyword matches cannot bypass semantic checks. During the cooldown
 	// signals remain in the evidence window; no rule-based alert is substituted.
-	if eventType != "human_verification" && s.reviewer != nil {
-		release, allowed, overloaded := s.beginReview(runID, time.Now().UTC(), snapshot.Plan.ReviewIntervalSeconds)
+	_, reviewer, _ := s.agentConfig()
+	snapshot.Plan = planForReviewer(snapshot.Plan, snapshot.Goal, reviewer)
+	if eventType != "human_verification" && reviewer != nil {
+		sampling := s.effectiveSampling(snapshot, time.Now().UTC())
+		var release func()
+		var allowed, overloaded bool
+		if queued {
+			requested := samplingAt(snapshot, time.Now().UTC()).ReviewIntervalSeconds
+			if priority > 0 || pendingPriority(event) > 0 || time.Until(signalDeadline(event)) < time.Minute {
+				requested = -1
+			}
+			release, err = s.awaitReview(ctx, runID, requested)
+			if err != nil {
+				return err
+			}
+			allowed = true
+			// Reload after waiting so previous alerts are visible. The
+			// triggering signal itself remains in the bounded evidence input.
+			current, getErr := s.repository.Get(ctx, runID)
+			if getErr != nil {
+				release()
+				return getErr
+			}
+			if current.Status != RunRunning || current.GoalVersion != snapshot.GoalVersion {
+				release()
+				return ErrGoalChanged
+			}
+			snapshot = current
+			snapshot.Plan = planForReviewer(snapshot.Plan, snapshot.Goal, reviewer)
+			sampling = s.effectiveSampling(snapshot, time.Now().UTC())
+		} else {
+			release, allowed, overloaded = s.beginReview(runID, time.Now().UTC(), sampling.ReviewIntervalSeconds)
+		}
 		if overloaded {
 			s.recordReviewBackpressure(runID)
 		}
 		if allowed {
 			defer release()
-			recent := evidenceWindow(snapshot, event.RoomID, 6)
-			if len(recent) > 6 {
-				recent = recent[:6]
+			recent := []SignalEvent{event}
+			for _, e := range evidenceWindow(snapshot, event.RoomID, 6) {
+				if e.ID != event.ID && len(recent) < 6 {
+					recent = append(recent, e)
+				}
 			}
-			input := UnexpectedEventInput{Goal: snapshot.Goal, Plan: snapshot.Plan, RecentEvidence: recent, RecentAlerts: snapshot.Alerts, TriggerFrame: event.FramePath}
-			if input.TriggerFrame == "" && snapshot.SourceMode == "browser_ocr" && s.capturer != nil {
+			frameCheck := event.Source == SignalFrame
+			input := UnexpectedEventInput{
+				EvidenceAt:  time.Now().UTC(),
+				GoalVersion: snapshot.GoalVersion, GoalUpdatedAt: snapshot.GoalUpdatedAt,
+				Goal: snapshot.Goal,
+				Plan: snapshot.Plan, Sampling: sampling, FrameCheck: frameCheck, RecentEvidence: recent,
+				RecentAlerts: snapshot.Alerts, TriggerFrameObservedAt: event.ObservedAt,
+				SearchObservations: func(queryCtx context.Context, query ObservationQuery) (ObservationPage, error) {
+					ledger, ok := s.repository.(RunLedger)
+					if !ok {
+						return ObservationPage{}, errors.New("repository does not support observation search")
+					}
+					return ledger.SearchObservations(queryCtx, runID, query)
+				},
+				ArchivedFrame: func(queryCtx context.Context, observationID string) (FrameAsset, error) {
+					return s.archivedObservationFrame(queryCtx, runID, observationID)
+				},
+			}
+			_, err := s.repository.Update(ctx, runID, func(run *Run) error {
+				if run.Status != RunRunning || run.GoalVersion != snapshot.GoalVersion {
+					return ErrGoalChanged
+				}
+				run.Sampling.ReviewCount++
+				if frameCheck || (event.FramePath != "" && run.Plan.VisionPolicy == "goal_required") {
+					run.Sampling.LastVisualAttemptAt = time.Now().UTC()
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			if snapshot.SourceMode == "browser_ocr" && s.capturer != nil {
 				input.CaptureFrame = func(captureCtx context.Context) (FrameAsset, error) {
 					captureCtx, cancel := context.WithTimeout(captureCtx, 12*time.Second)
 					defer cancel()
-					capturedAt := time.Now().UTC()
 					file, err := os.CreateTemp("", "liveguard-agent-frame-*.png")
 					if err != nil {
 						return FrameAsset{}, err
@@ -614,10 +940,70 @@ func (s *Service) ingest(ctx context.Context, runID string, event SignalEvent) e
 						_ = os.Remove(framePath)
 						return FrameAsset{}, err
 					}
-					return FrameAsset{Path: framePath, ObservedAt: capturedAt}, nil
+					capturedAt := time.Now().UTC()
+					observation := SignalEvent{ID: domain.NewID("frame"), RoomID: event.RoomID, GoalVersion: snapshot.GoalVersion, Source: SignalFrame, Text: "Agent 请求查看此画面", ObservedAt: capturedAt}
+					var ocrEvidence *SignalEvent
+					if s.recognizer != nil {
+						ocrCtx, cancelOCR := context.WithTimeout(captureCtx, 8*time.Second)
+						recognized, ocrErr := s.recognizer.Recognize(ocrCtx, VideoFrame{RoomID: event.RoomID, Path: framePath, FocusChat: snapshot.Plan.AlertScope == "chat" || goalNeedsChatRegion(snapshot.Goal)})
+						cancelOCR()
+						if ocrErr == nil && strings.TrimSpace(recognized.Text) != "" {
+							recognized.ID = observation.ID + ":ocr"
+							recognized.ParentEventID = observation.ID
+							recognized.RoomID, recognized.GoalVersion = event.RoomID, snapshot.GoalVersion
+							recognized.Source = SignalOCR
+							recognized.ObservedAt = capturedAt
+							recognized.ValidUntil = signalDeadline(recognized)
+							ocrEvidence = &recognized
+						}
+					}
+					return FrameAsset{Path: framePath, ObservedAt: capturedAt, ObservationID: observation.ID, OCR: ocrEvidence}, nil
+				}
+				input.SaveFrame = func(saveCtx context.Context, asset FrameAsset) (FrameAsset, error) {
+					if asset.ArchiveID != "" {
+						return asset, nil
+					}
+					current, getErr := s.repository.Get(saveCtx, runID)
+					if getErr != nil {
+						return FrameAsset{}, getErr
+					}
+					if current.Status != RunRunning || current.GoalVersion != snapshot.GoalVersion {
+						return FrameAsset{}, ErrGoalChanged
+					}
+					archiveID, archiveErr := s.archiveFrame(runID, asset.ObservationID, asset.Path)
+					if archiveErr != nil {
+						return FrameAsset{}, archiveErr
+					}
+					current, getErr = s.repository.Get(saveCtx, runID)
+					if getErr != nil || current.Status != RunRunning || current.GoalVersion != snapshot.GoalVersion {
+						path, pathErr := s.archivedFramePath(runID, archiveID)
+						if pathErr == nil {
+							_ = os.Remove(path)
+						}
+						if getErr != nil {
+							return FrameAsset{}, getErr
+						}
+						return FrameAsset{}, ErrGoalChanged
+					}
+					frameEvent := SignalEvent{ID: asset.ObservationID, RoomID: event.RoomID, GoalVersion: snapshot.GoalVersion, Source: SignalFrame, Text: "Agent 保存的图片证据", FrameArchiveID: archiveID, ObservedAt: asset.ObservedAt, ValidUntil: signalDeadline(SignalEvent{Source: SignalFrame, ObservedAt: asset.ObservedAt})}
+					if ledger, ok := s.repository.(RunLedger); ok {
+						if err := ledger.RecordObservation(saveCtx, runID, frameEvent); err != nil {
+							return FrameAsset{}, err
+						}
+						if asset.OCR != nil {
+							ocrEvent := *asset.OCR
+							ocrEvent.FrameArchiveID = archiveID
+							if err := ledger.RecordObservation(saveCtx, runID, ocrEvent); err != nil {
+								return FrameAsset{}, err
+							}
+							asset.OCR = &ocrEvent
+						}
+					}
+					asset.ArchiveID = archiveID
+					return asset, nil
 				}
 			}
-			decision, reviewErr := s.reviewer.Review(ctx, input)
+			decision, reviewErr := reviewer.Review(ctx, input)
 			if reviewErr == nil {
 				if reviewDecisionIncomplete(decision) {
 					decision.Failure = "本次 AI 调查未形成完整结论，监控会继续运行"
@@ -628,6 +1014,10 @@ func (s *Service) ingest(ctx context.Context, runID string, event SignalEvent) e
 				review = &decision
 			} else {
 				decision.Failure = "AI 暂时无法完成判断，监控会继续运行"
+				if errors.Is(reviewErr, ErrModelQuotaExhausted) {
+					quotaFailure = true
+					decision.Failure = quotaStopMessage
+				}
 				if decision.StopReason == "timeout" {
 					decision.Failure = "本次 AI 调查超时，监控会继续运行"
 				}
@@ -640,29 +1030,62 @@ func (s *Service) ingest(ctx context.Context, runID string, event SignalEvent) e
 		return ctx.Err()
 	}
 	_, err = s.repository.Update(ctx, runID, func(run *Run) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if run.Status != RunRunning {
 			return errors.New("monitor is not running")
 		}
-		if time.Since(event.ObservedAt) > maxSignalAge {
-			return ErrStaleSignal
+		// Human input wins: an older investigation cannot alert or alter the
+		// sampling strategy for a goal that the user has replaced.
+		if run.GoalVersion != snapshot.GoalVersion {
+			return nil
 		}
 		for i := range run.Rooms {
 			if run.Rooms[i].ID == event.RoomID {
 				if event.ObservedAt.After(run.Rooms[i].LastSeen) {
 					run.Rooms[i].LastSeen = event.ObservedAt
 				}
-				run.Rooms[i].Health = SourceHealthy
-				run.Rooms[i].LastError = ""
 			}
 		}
-		if eventType == "human_verification" || (s.reviewer == nil && eventType != "") {
+		if eventType == "human_verification" || (reviewer == nil && eventType != "") {
 			investigate(run, event, eventType)
 		} else if review != nil {
+			if review.Action == "alert" && review.EvidenceBasis == "live" {
+				for _, newer := range run.Events {
+					if newer.Sequence > event.Sequence && !newer.ObservedAt.Before(event.ObservedAt) && newer.RoomID == event.RoomID && (pendingPriority(newer) > 0 || numericRevision(event, newer)) {
+						review.Failure = "调查期间出现较新的取消、更正或数值变化，旧结论未提交，等待新观测复核"
+						break
+					}
+				}
+			}
+			if event.Source == SignalFrame && review.Action == "alert" && (!hasReviewTool(review.ToolCalls, "inspect_live_frame") || strings.TrimSpace(review.VisualFinding) == "") {
+				review.Failure = "画面检查缺少有效看图证据，未生成提醒"
+			}
 			applyUnexpectedReview(run, event, *review)
+			applySamplingDecision(run, *review, time.Now().UTC())
+			run.Sampling = s.effectiveSampling(run, time.Now().UTC())
+			if hasReviewTool(review.ToolCalls, "inspect_live_frame") {
+				run.Sampling.VisualCount++
+				run.Sampling.LastVisualAttemptAt = time.Now().UTC()
+			}
+			if len(run.Investigations) > 0 {
+				metrics := run.Investigations[len(run.Investigations)-1].Review
+				if metrics != nil {
+					metrics.SamplingProposal = review.Sampling
+					metrics.SamplingPolicy = run.Sampling
+				}
+			}
 		}
 		return nil
 	})
 	if err == nil {
+		if eventType == "human_verification" {
+			s.closePending(runID)
+		}
+		if quotaFailure {
+			s.endQuotaExhaustedRuns(runID, reviewer)
+		}
 		s.onUpdate()
 	}
 	return err
@@ -676,8 +1099,8 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 	if !utf8.ValidString(event.Text) || strings.TrimSpace(event.Text) == "" || utf8.RuneCountInString(event.Text) > maxSignalTextRunes {
 		return nil, event, false, errors.New("signal text must contain 1-4000 characters")
 	}
-	if event.Source != SignalOCR && event.Source != SignalASR {
-		return nil, event, false, errors.New("signal source must be ocr or asr")
+	if event.Source != SignalOCR && event.Source != SignalASR && !(event.Source == SignalFrame && event.FramePath != "") {
+		return nil, event, false, errors.New("signal source must be ocr or asr; frame checks require an internal captured image")
 	}
 	if math.IsNaN(event.Confidence) || math.IsInf(event.Confidence, 0) || event.Confidence < 0 || event.Confidence > 1 {
 		return nil, event, false, errors.New("signal confidence must be between 0 and 1")
@@ -687,8 +1110,9 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 		event.ObservedAt = now
 	}
 	event.ObservedAt = event.ObservedAt.UTC()
-	if event.ObservedAt.Before(now.Add(-maxSignalAge)) || event.ObservedAt.After(now.Add(maxFutureSignalSkew)) {
-		return nil, event, false, ErrStaleSignal
+	event.ValidUntil = signalDeadline(event)
+	if event.ObservedAt.After(now.Add(maxFutureSignalSkew)) {
+		return nil, event, false, ErrFutureSignal
 	}
 	event.ID = strings.TrimSpace(event.ID)
 	if event.ID == "" {
@@ -731,6 +1155,9 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 		if run.Status != RunRunning {
 			return errors.New("monitor is not running")
 		}
+		if event.GoalVersion != 0 && event.GoalVersion != run.GoalVersion {
+			return ErrGoalChanged
+		}
 		if run.EventReceipts == nil {
 			run.EventReceipts = []EventReceipt{}
 		}
@@ -752,6 +1179,7 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 			}
 		}
 		run.EventSequence++
+		event.GoalVersion = run.GoalVersion
 		event.Sequence = run.EventSequence
 		run.EventReceipts = append(run.EventReceipts, EventReceipt{ID: event.ID, Fingerprint: hex.EncodeToString(fingerprint[:]), ReceivedAt: now})
 		if len(run.EventReceipts) > maxEventReceipts {
@@ -762,8 +1190,10 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 			for i := range run.Rooms {
 				if run.Rooms[i].ID == event.RoomID {
 					run.Rooms[i].LastSeen = event.ObservedAt
-					run.Rooms[i].Health = SourceHealthy
-					run.Rooms[i].LastError = ""
+					if run.SourceMode != "browser_ocr" {
+						run.Rooms[i].Health = SourceHealthy
+						run.Rooms[i].LastError = ""
+					}
 				}
 			}
 		}
@@ -775,23 +1205,31 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 	if duplicate {
 		return updated, event, true, nil
 	}
+	framePath := event.FramePath
 	for _, stored := range updated.Events {
 		if stored.ID == event.ID {
 			event = stored
 			break
 		}
 	}
-	s.onUpdate()
+	// Repository snapshots deliberately omit temporary file paths. Preserve
+	// this request metadata for the pending review lifetime.
+	event.FramePath = framePath
+	event.GoalVersion = updated.GoalVersion
 	return updated, event, false, nil
 }
 
 func (s *Service) beginReview(runID string, at time.Time, requestedSeconds int) (func(), bool, bool) {
+	_, _, configuredGap := s.agentConfig()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.reviewWaiters) > 0 {
+		return nil, false, true
+	}
 	if s.reviewInFlight[runID] {
 		return nil, false, false
 	}
-	interval := s.reviewGap
+	interval := configuredGap
 	if requestedSeconds > 0 {
 		requested := time.Duration(requestedSeconds) * time.Second
 		if requested > interval {
@@ -808,10 +1246,7 @@ func (s *Service) beginReview(runID string, at time.Time, requestedSeconds int) 
 	}
 	s.lastUnexpectedReview[runID] = at
 	s.reviewInFlight[runID] = true
-	var once sync.Once
-	return func() {
-		once.Do(func() { <-s.reviewSlots; s.mu.Lock(); delete(s.reviewInFlight, runID); s.mu.Unlock() })
-	}, true, false
+	return s.reviewReleaseLocked(runID), true, false
 }
 
 func (s *Service) recordReviewBackpressure(runID string) {
@@ -831,31 +1266,71 @@ func (s *Service) recordReviewBackpressure(runID string) {
 // The runtime does not know whether the signal came from Tesseract, a cloud
 // provider, a browser screenshot, or a deterministic test recognizer.
 func (s *Service) IngestFrame(ctx context.Context, runID string, frame VideoFrame) error {
+	return s.ingestFrame(ctx, runID, frame, s.Ingest)
+}
+
+func (s *Service) SubmitFrame(ctx context.Context, runID string, frame VideoFrame) error {
+	return s.ingestFrame(ctx, runID, frame, s.SubmitSignal)
+}
+
+func (s *Service) ingestFrame(ctx context.Context, runID string, frame VideoFrame, submit func(context.Context, string, SignalEvent) error) error {
 	ctx, release := s.monitorContext(ctx, runID)
 	defer release()
 	if s.recognizer == nil {
 		return errors.New("ocr recognizer is not configured")
 	}
+	if err := s.requireLiveInput(ctx, runID); err != nil {
+		return err
+	}
 	started := time.Now()
 	event, err := s.recognizer.Recognize(ctx, frame)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNoText) {
 		return err
 	}
 	if event.ID == "" {
 		event.ID = frame.EventID
 	}
+	if event.ID == "" {
+		event.ID = domain.NewID("observation")
+	}
+	if event.Source == "" {
+		event.Source = SignalOCR
+	}
+	if event.ObservedAt.IsZero() {
+		event.ObservedAt = time.Now().UTC()
+	}
 	event.FramePath = frame.Path
 	event.PerceptionDurationMS = time.Since(started).Milliseconds()
-	return s.Ingest(ctx, runID, event)
+	if errors.Is(err, ErrNoText) {
+		event.Source, event.Text = SignalFrame, "本次画面没有识别到文字"
+		if ledger, ok := s.repository.(RunLedger); ok {
+			if recordErr := ledger.RecordObservation(ctx, runID, event); recordErr != nil {
+				return recordErr
+			}
+		}
+		return err
+	}
+	return submit(ctx, runID, event)
 }
 
 // IngestAudio transcribes one short, user-authorized audio chunk and sends the
 // text through the same Agent decision path as OCR and other signals.
 func (s *Service) IngestAudio(ctx context.Context, runID string, chunk AudioChunk) error {
+	return s.ingestAudio(ctx, runID, chunk, s.Ingest)
+}
+
+func (s *Service) SubmitAudio(ctx context.Context, runID string, chunk AudioChunk) error {
+	return s.ingestAudio(ctx, runID, chunk, s.SubmitSignal)
+}
+
+func (s *Service) ingestAudio(ctx context.Context, runID string, chunk AudioChunk, submit func(context.Context, string, SignalEvent) error) error {
 	ctx, release := s.monitorContext(ctx, runID)
 	defer release()
 	if s.transcriber == nil {
 		return errors.New("ASR is not configured")
+	}
+	if err := s.requireLiveInput(ctx, runID); err != nil {
+		return err
 	}
 	started := time.Now()
 	event, err := s.transcriber.Transcribe(ctx, chunk)
@@ -875,7 +1350,7 @@ func (s *Service) IngestAudio(ctx context.Context, runID string, chunk AudioChun
 	}
 	event.PerceptionDurationMS = time.Since(started).Milliseconds()
 	log.Printf("ASR transcription completed: monitor=%s characters=%d latency_ms=%d", runID, utf8.RuneCountInString(event.Text), event.PerceptionDurationMS)
-	return s.Ingest(ctx, runID, event)
+	return submit(ctx, runID, event)
 }
 
 func investigate(run *Run, event SignalEvent, eventType string) {
@@ -922,17 +1397,68 @@ func classify(text, goal string) string {
 }
 
 func applyUnexpectedReview(run *Run, event SignalEvent, decision UnexpectedEventDecision) {
+	applyUnexpectedReviewTo(run, event, decision, "")
+}
+
+func applyUnexpectedReviewTo(run *Run, event SignalEvent, decision UnexpectedEventDecision, investigationID string) {
+	if decision.Action == "ask_user" && !hasReviewTool(decision.ToolCalls, "request_user_input") {
+		decision.Failure = "本次求助没有通过服务端工具授权，未向用户发送问题"
+	}
+	if decision.Action == "alert" && !validCommittedCitations(run, event, decision, time.Now().UTC()) {
+		decision.Failure = "引用证据已过期、来自旧目标或缺少明确引用，本次未提醒"
+	}
+	if decision.Action == "alert" && reviewRequiresVision(UnexpectedEventInput{Goal: run.Goal, Plan: run.Plan, FrameCheck: event.Source == SignalFrame}) &&
+		(!hasReviewTool(decision.ToolCalls, "inspect_live_frame") || strings.TrimSpace(decision.VisualFinding) == "") {
+		decision.Failure = "该目标需要实际看图证据，文字判断不能生成画面或聊天区提醒"
+	}
 	now := time.Now().UTC()
 	eventType := "proactive_" + decision.Category
 	inv := Investigation{
-		ID: domain.NewID("investigation"), RoomID: event.RoomID, RoomName: event.RoomName,
-		EventType: eventType, Status: InvestigationSuppressed, CreatedAt: now, UpdatedAt: now,
+		GoalVersion: run.GoalVersion,
+		ID:          domain.NewID("investigation"), RoomID: event.RoomID, RoomName: event.RoomName,
+		EventType: eventType, Status: InvestigationSuppressed, Reason: strings.TrimSpace(decision.Reason), CreatedAt: now, UpdatedAt: now,
 		Evidence: []Evidence{{EventID: event.ID, Source: string(event.Source), Text: event.Text, Confidence: event.Confidence, ObservedAt: event.ObservedAt}},
+	}
+	existingIndex := -1
+	if investigationID != "" {
+		for i := range run.Investigations {
+			if run.Investigations[i].ID == investigationID {
+				existingIndex = i
+				inv = run.Investigations[i]
+				break
+			}
+		}
+		if existingIndex < 0 {
+			return
+		}
+		eventType = inv.EventType
+		if decision.Category != "" {
+			eventType = "proactive_" + decision.Category
+			inv.EventType = eventType
+		}
+	}
+	commit := func() {
+		inv.UpdatedAt = now
+		if existingIndex >= 0 {
+			run.Investigations[existingIndex] = inv
+		} else {
+			run.Investigations = append(run.Investigations, inv)
+		}
 	}
 	inv.Review = &ReviewMetrics{Model: decision.Model, InputTokens: decision.InputTokens, OutputTokens: decision.OutputTokens, LatencyMS: decision.LatencyMS, Turns: decision.Turns, StopReason: decision.StopReason}
 	inv.Review.FormatRepairs = decision.Repairs
+	inv.Review.TransportRetries = decision.TransportRetries
 	if len(decision.UsedEvidence) > 0 {
-		inv.Evidence = append([]Evidence(nil), decision.UsedEvidence...)
+		seen := map[string]bool{}
+		for _, item := range inv.Evidence {
+			seen[item.EventID] = true
+		}
+		for _, item := range decision.UsedEvidence {
+			if !seen[item.EventID] {
+				inv.Evidence = append(inv.Evidence, item)
+				seen[item.EventID] = true
+			}
+		}
 	}
 	reviewOutcome := decision.Reason
 	if decision.Failure != "" {
@@ -944,38 +1470,70 @@ func applyUnexpectedReview(run *Run, event SignalEvent, decision UnexpectedEvent
 		inv.Steps[len(inv.Steps)-1].Succeeded = &call.Succeeded
 		inv.Steps[len(inv.Steps)-1].DurationMS = call.DurationMS
 	}
-	if visualFinding := strings.TrimSpace(decision.VisualFinding); visualFinding != "" {
+	visualFinding := strings.TrimSpace(decision.VisualFinding)
+	if visualFinding == "" && decision.Action != "alert" && decision.Action != "ask_user" && decision.VisualArchiveID != "" {
+		visualFinding = strings.TrimSpace(decision.Reason)
+	}
+	if decision.Action == "ask_user" && decision.VisualArchiveID != "" {
 		visualAt := decision.VisualObservedAt
 		if visualAt.IsZero() {
 			visualAt = now
 		}
-		inv.Evidence = append(inv.Evidence, Evidence{EventID: event.ID, Source: "m3_vision", Text: visualFinding, Confidence: decision.Confidence, ObservedAt: visualAt})
+		inv.Evidence = append(inv.Evidence, Evidence{EventID: decision.VisualEvidenceID, RoomID: event.RoomID, GoalVersion: run.GoalVersion, FrameArchiveID: decision.VisualArchiveID, Source: string(SignalFrame), Text: "Agent 提问时关联的直播截图", Confidence: event.Confidence, ObservedAt: visualAt})
+	}
+	if visualFinding != "" && decision.VisualArchiveID != "" && hasReviewTool(decision.ToolCalls, "inspect_live_frame") {
+		visualAt := decision.VisualObservedAt
+		if visualAt.IsZero() {
+			visualAt = now
+		}
+		inv.Evidence = append(inv.Evidence, Evidence{EventID: decision.VisualEvidenceID, RoomID: event.RoomID, GoalVersion: run.GoalVersion, FrameArchiveID: decision.VisualArchiveID, Source: "vision", Text: visualFinding, Confidence: decision.Confidence, ObservedAt: visualAt})
 	}
 	if decision.Failure != "" {
 		inv.Status = InvestigationFailed
 		inv.Conclusion = decision.Failure
-		run.Investigations = append(run.Investigations, inv)
+		commit()
 		return
 	}
-	if decision.Action == "alert" && decision.Category == "chat_match" {
-		if !hasOCRSource(evidenceWindow(run, event.RoomID, 6)) || strings.TrimSpace(decision.VisualFinding) == "" {
+	if decision.Action == "ask_user" {
+		inv.Status = InvestigationWaitingUser
+		inv.UserQuestion = strings.TrimSpace(decision.UserQuestion)
+		inv.UserOptions = append([]string(nil), decision.UserOptions...)
+		inv.Conclusion = inv.UserQuestion
+		inv.Reason = strings.TrimSpace(decision.Reason)
+		commit()
+		return
+	}
+	if decision.Action == "alert" && (decision.Category == "chat_match" || run.Plan.AlertScope == "chat" || goalNeedsChatRegion(run.Goal)) {
+		ocrCited := false
+		for _, cited := range decision.UsedEvidence {
+			if cited.Source == string(SignalOCR) && cited.FrameArchiveID != "" && cited.FrameArchiveID == decision.VisualArchiveID {
+				ocrCited = true
+			}
+		}
+		if !ocrCited || strings.TrimSpace(decision.VisualFinding) == "" || !hasReviewTool(decision.ToolCalls, "inspect_live_frame") {
 			inv.Conclusion = "聊天区提醒缺少 OCR 或看图证据，已跳过"
-			run.Investigations = append(run.Investigations, inv)
+			commit()
 			return
 		}
 	}
 	if decision.Action == "wait" {
 		inv.Status = InvestigationWaiting
 		inv.Conclusion = "出现可能值得关注的内容，证据还不够明确，继续观察"
+		if reason := strings.TrimSpace(decision.Reason); reason != "" {
+			inv.Conclusion = reason
+		}
 		if decision.StopReason != "finished" && decision.StopReason != "terminal_tool" && decision.StopReason != "" {
 			inv.Conclusion = "本次调查达到" + reviewStopLabel(decision.StopReason) + "，继续监听新证据"
 		}
-		run.Investigations = append(run.Investigations, inv)
+		commit()
 		return
 	}
 	if decision.Action != "alert" || decision.Confidence < 0.72 {
-		inv.Conclusion = "判断为普通内容，未打扰用户"
-		run.Investigations = append(run.Investigations, inv)
+		inv.Conclusion = strings.TrimSpace(decision.Reason)
+		if inv.Conclusion == "" {
+			inv.Conclusion = "没有发现需要提醒的明确证据"
+		}
+		commit()
 		return
 	}
 	if !hasReviewTool(decision.ToolCalls, "search_recent_alerts") {
@@ -983,7 +1541,7 @@ func applyUnexpectedReview(run *Run, event SignalEvent, decision UnexpectedEvent
 	}
 	if hasRecentSemanticAlert(run.Alerts, event, eventType, decision.Summary) {
 		inv.Conclusion = "同一类内容已经提醒，本次提醒已去重"
-		run.Investigations = append(run.Investigations, inv)
+		commit()
 		return
 	}
 	inv.Status = InvestigationConfirmed
@@ -991,9 +1549,11 @@ func applyUnexpectedReview(run *Run, event SignalEvent, decision UnexpectedEvent
 	if !hasReviewTool(decision.ToolCalls, "create_alert") {
 		addStep(&inv, "create_alert", "将目标之外的重要时刻提醒给用户", "已生成带识别原文的主动提醒", now)
 	}
-	run.Investigations = append(run.Investigations, inv)
+	commit()
 	run.Alerts = append(run.Alerts, Alert{
-		ID: domain.NewID("alert"), RoomID: event.RoomID, RoomName: event.RoomName,
+		EvidenceBasis:   decision.EvidenceBasis,
+		SignalToAlertMS: max(0, now.Sub(event.ObservedAt).Milliseconds()),
+		ID:              domain.NewID("alert"), RoomID: event.RoomID, RoomName: event.RoomName,
 		EventType: eventType, Priority: "high", Summary: decision.Summary,
 		Confidence: decision.Confidence, DedupeKey: semanticDedupeKey(event.RoomID, eventType, decision.Summary),
 		Investigation: inv.ID, Evidence: append([]Evidence(nil), inv.Evidence...), CreatedAt: now,
@@ -1026,14 +1586,18 @@ func hasReviewTool(calls []ReviewToolCall, name string) bool {
 
 func toolPurpose(name string) string {
 	switch name {
-	case "read_recent_evidence":
-		return "读取最近的直播文字证据"
+	case "search_observations":
+		return "检索本场近期或整场观测记录"
 	case "search_recent_alerts":
 		return "检查是否已经提醒过同类事件"
+	case "inspect_live_frame":
+		return "查看 Agent 认为需要确认的画面"
+	case "request_user_input":
+		return "向用户询问只有用户才能定义的判断规则"
+	case "save_frame_evidence":
+		return "保存 Agent 已检查并选中的画面"
 	case "create_alert":
 		return "通过策略校验后请求生成提醒"
-	case "analyze_signal_window":
-		return "在 Go 中统计文字重复、否定和验证提示"
 	default:
 		return "Agent 请求执行受限工具"
 	}
@@ -1092,7 +1656,7 @@ func addStep(inv *Investigation, tool, purpose, outcome string, at time.Time) {
 func waitingInvestigation(run *Run, roomID, eventType string) int {
 	for i := len(run.Investigations) - 1; i >= 0; i-- {
 		inv := &run.Investigations[i]
-		if inv.RoomID == roomID && inv.EventType == eventType && inv.Status == InvestigationWaiting {
+		if inv.RoomID == roomID && inv.EventType == eventType && inv.Status == InvestigationWaiting && (run.GoalVersion <= 1 || inv.GoalVersion == run.GoalVersion) {
 			return i
 		}
 	}
@@ -1102,7 +1666,7 @@ func waitingInvestigation(run *Run, roomID, eventType string) int {
 func evidenceWindow(run *Run, roomID string, limit int) []SignalEvent {
 	result := make([]SignalEvent, 0, limit)
 	for i := len(run.Events) - 1; i >= 0 && len(result) < limit; i-- {
-		if run.Events[i].RoomID == roomID {
+		if run.Events[i].RoomID == roomID && currentEvidence(run.Events[i].ObservedAt, run.Events[i].ValidUntil, run.Events[i].GoalVersion, run.GoalVersion, run.GoalUpdatedAt, time.Now().UTC()) {
 			result = append(result, run.Events[i])
 		}
 	}
@@ -1154,4 +1718,20 @@ func setRoomStatus(run *Run, roomID, status string) {
 			return
 		}
 	}
+}
+
+// Check lifecycle before costly OCR/ASR work. A late upload to an ended run must
+// not start a new provider request after its runtime context has been removed.
+func (s *Service) requireLiveInput(ctx context.Context, runID string) error {
+	run, err := s.repository.Get(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != RunRunning {
+		return ErrInvalidTransition
+	}
+	if len(run.Rooms) > 0 && (run.Rooms[0].Health == SourceNeedsLogin || run.Rooms[0].Health == SourceFailed) {
+		return ErrInputPaused
+	}
+	return nil
 }

@@ -26,7 +26,6 @@ func main() {
 		model = "MiniMax-M3"
 	}
 	r := &monitor.MiniMaxUnexpectedEventReviewer{APIKey: key, Model: model, Endpoint: os.Getenv("LIVEGUARD_MONITOR_ENDPOINT")}
-	r.SignalAnalyzer = monitor.LocalSignalAnalyzer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	cases, ok := monitor.SignalEvalCasesForSplit(*split)

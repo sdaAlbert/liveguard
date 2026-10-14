@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,7 @@ type Server struct {
 	artifactDir         string
 	openBrowserSession  func(string) error
 	browserSessionState func() browser.SessionState
+	shutdownApp         func()
 	mu                  sync.Mutex
 	subscribers         map[chan domain.Event]struct{}
 }
@@ -40,10 +42,22 @@ type MonitorService interface {
 	List(context.Context) ([]monitor.Summary, error)
 	Get(context.Context, string) (*monitor.Run, error)
 	UpdateGoal(context.Context, string, string) (*monitor.Run, error)
+	AnswerInvestigation(context.Context, string, string, string) (*monitor.Run, error)
+	Pause(context.Context, string) (*monitor.Run, error)
+	Resume(context.Context, string) (*monitor.Run, error)
 	Stop(context.Context, string) (*monitor.Run, error)
-	Ingest(context.Context, string, monitor.SignalEvent) error
-	IngestFrame(context.Context, string, monitor.VideoFrame) error
-	IngestAudio(context.Context, string, monitor.AudioChunk) error
+	SubmitSignal(context.Context, string, monitor.SignalEvent) error
+	SubmitFrame(context.Context, string, monitor.VideoFrame) error
+	SubmitAudio(context.Context, string, monitor.AudioChunk) error
+}
+
+type ModelSettingsService interface {
+	ModelSettings() monitor.ModelSettingsStatus
+	ConfigureModel(monitor.ModelSettingsInput) (monitor.ModelSettingsStatus, error)
+}
+
+type frameArchiveReader interface {
+	ArchivedFramePath(context.Context, string, string) (string, error)
 }
 
 func New(artifactDir string) *Server {
@@ -56,6 +70,8 @@ func (s *Server) SetBrowserSession(open func(string) error, state func() browser
 	s.openBrowserSession = open
 	s.browserSessionState = state
 }
+
+func (s *Server) SetShutdownHandler(shutdown func()) { s.shutdownApp = shutdown }
 
 func (s *Server) Publish(event domain.Event) {
 	s.mu.Lock()
@@ -77,6 +93,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors/", s.monitorRun)
 	mux.HandleFunc("/api/events", s.events)
 	mux.HandleFunc("/api/browser/session", s.browserSession)
+	mux.HandleFunc("/api/settings/model", s.modelSettings)
+	mux.HandleFunc("/api/shutdown", s.shutdown)
 	mux.HandleFunc("/monitor", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, assets, "static/monitor.html")
 	})
@@ -88,6 +106,64 @@ func (s *Server) Handler() http.Handler {
 		http.ServeFileFS(w, r, assets, "static/monitor.html")
 	})
 	return securityHeaders(otelhttp.NewHandler(mux, "liveguard.http"))
+}
+
+func (s *Server) shutdown(w http.ResponseWriter, r *http.Request) {
+	if !remoteIsLoopback(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, "退出服务仅允许本机访问")
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "请使用 POST 请求退出服务")
+		return
+	}
+	if s.shutdownApp == nil {
+		writeError(w, http.StatusServiceUnavailable, "服务退出功能未启用")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"message": "LiveGuard 正在关闭"})
+	s.shutdownApp()
+}
+
+func (s *Server) modelSettings(w http.ResponseWriter, r *http.Request) {
+	if !remoteIsLoopback(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, "模型设置仅允许本机访问")
+		return
+	}
+	service, ok := s.monitorService.(ModelSettingsService)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "模型设置暂不可用")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, service.ModelSettings())
+	case http.MethodPut:
+		var input monitor.ModelSettingsInput
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "设置格式无效")
+			return
+		}
+		status, err := service.ConfigureModel(input)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
+	default:
+		w.Header().Set("Allow", "GET, PUT")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func remoteIsLoopback(remote string) bool {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = strings.Trim(remote, "[]")
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
@@ -147,6 +223,30 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parts[0]
+	if len(parts) == 3 && parts[1] == "frames" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		reader, ok := s.monitorService.(frameArchiveReader)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		path, err := reader.ArchivedFramePath(r.Context(), id, parts[2])
+		if err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "读取图片证据失败")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, path)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "goal" && r.Method == http.MethodPut {
 		var input struct {
 			Goal string `json:"goal"`
@@ -169,15 +269,69 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, "监控已停止，不能修改需求")
 				return
 			}
+			if errors.Is(err, monitor.ErrGoalChanged) {
+				writeError(w, http.StatusConflict, "需求已被更新，请检查当前需求后重试")
+				return
+			}
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, run)
 		return
 	}
+	if len(parts) == 4 && parts[1] == "investigations" && parts[3] == "reply" && r.Method == http.MethodPost {
+		var input struct {
+			Answer string `json:"answer"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "请输入补充说明")
+			return
+		}
+		if length := len([]rune(strings.TrimSpace(input.Answer))); length < 1 || length > 1000 {
+			writeError(w, http.StatusBadRequest, "补充说明应为 1-1000 个字符")
+			return
+		}
+		run, err := s.monitorService.AnswerInvestigation(r.Context(), id, parts[2], input.Answer)
+		if err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			if errors.Is(err, monitor.ErrInvestigationNotWaiting) || errors.Is(err, monitor.ErrInvalidTransition) {
+				writeError(w, http.StatusConflict, "这条求助已回复、已结束或监控不在运行")
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, run)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "stop" && r.Method == http.MethodPost {
 		run, err := s.monitorService.Stop(r.Context(), id)
 		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, run)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "pause" && r.Method == http.MethodPost {
+		run, err := s.monitorService.Pause(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, run)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "resume" && r.Method == http.MethodPost {
+		run, err := s.monitorService.Resume(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, monitor.ErrCapacity) {
+				writeError(w, http.StatusTooManyRequests, "同时运行的监控已达上限")
+				return
+			}
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -194,7 +348,11 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "直播信号文本不能为空")
 			return
 		}
-		if err := s.monitorService.Ingest(r.Context(), id, event); err != nil {
+		if err := s.monitorService.SubmitSignal(r.Context(), id, event); err != nil {
+			if errors.Is(err, monitor.ErrPendingFull) || errors.Is(err, monitor.ErrFrameBudget) {
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			if errors.Is(err, monitor.ErrNotFound) {
 				http.NotFound(w, r)
 				return
@@ -217,7 +375,11 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer cleanup()
-		if err := s.monitorService.IngestFrame(r.Context(), id, monitor.VideoFrame{RoomID: roomID, Path: imagePath, EventID: r.Header.Get("Idempotency-Key")}); err != nil {
+		if err := s.monitorService.SubmitFrame(r.Context(), id, monitor.VideoFrame{RoomID: roomID, Path: imagePath, EventID: r.Header.Get("Idempotency-Key")}); err != nil {
+			if errors.Is(err, monitor.ErrPendingFull) || errors.Is(err, monitor.ErrFrameBudget) {
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -244,7 +406,11 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if err := s.monitorService.IngestAudio(r.Context(), id, monitor.AudioChunk{RoomID: roomID, Path: audioPath, EventID: r.Header.Get("Idempotency-Key"), ObservedAt: observedAt}); err != nil {
+		if err := s.monitorService.SubmitAudio(r.Context(), id, monitor.AudioChunk{RoomID: roomID, Path: audioPath, EventID: r.Header.Get("Idempotency-Key"), ObservedAt: observedAt}); err != nil {
+			if errors.Is(err, monitor.ErrPendingFull) || errors.Is(err, monitor.ErrFrameBudget) {
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}

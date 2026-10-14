@@ -1,4 +1,4 @@
-param([switch]$Evaluate, [ValidateSet("dev", "holdout-v1")][string]$Split = "dev")
+param([switch]$Evaluate, [switch]$AgentOnly, [ValidateSet("dev", "holdout-v1")][string]$Split = "dev")
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $OpenClawPath = Join-Path $env:USERPROFILE ".openclaw\openclaw.json"
@@ -30,13 +30,21 @@ try {
         }
     }
 
+    if ($AgentOnly) {
+        $env:GOCACHE = Join-Path $RepoRoot ".cache\go-build"
+        Write-Host "Testing real M3 planning and frame tools with synthetic evidence; no ASR or live browser capture. API usage will be charged."
+        & go test -tags=liveapi ./internal/monitor -run '^TestMiniMaxLive(GoalPlanning|VisualPlan|PeriodicFrame)$' -count=1 -v
+        if ($LASTEXITCODE -ne 0) { throw "Agent smoke test failed." }
+        return
+    }
+
     if ($Evaluate) {
         $env:GOCACHE = Join-Path $RepoRoot ".cache\go-build"
         $reportName = if ($Split -eq "dev") { "monitor-eval-dev.json" } else { "monitor-eval-holdout-v1.json" }
         $evalArgs = @('run', './cmd/monitor-eval', '-split', $Split, '-out', ".cache\$reportName")
         Write-Host "Evaluating the '$Split' fixed-text cases with real MiniMax. API usage will be charged. Report: .cache\$reportName"
         & go @evalArgs
-        if ($LASTEXITCODE -ne 0) { throw "Some evaluation cases failed; inspect .cache/monitor-eval.json." }
+        if ($LASTEXITCODE -ne 0) { throw "Some evaluation cases failed; inspect .cache/$reportName." }
         return
     }
 

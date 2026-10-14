@@ -59,9 +59,23 @@ type fixedGoalPlanner struct{ plan MonitoringPlan }
 
 func (p fixedGoalPlanner) Plan(context.Context, string) (MonitoringPlan, error) { return p.plan, nil }
 
-func (r *testUnexpectedReviewer) Review(context.Context, UnexpectedEventInput) (UnexpectedEventDecision, error) {
+func (r *testUnexpectedReviewer) Review(_ context.Context, input UnexpectedEventInput) (UnexpectedEventDecision, error) {
 	r.calls.Add(1)
-	return r.decision, r.err
+	decision := r.decision
+	// Keep this fake aligned with the real reviewer contract: alert decisions
+	// cite the event that caused the review. Tests that exercise a rejection can
+	// still provide incomplete evidence explicitly.
+	if decision.Action == "alert" && len(decision.UsedEvidence) == 0 && len(input.RecentEvidence) > 0 {
+		decision.EvidenceBasis = "live"
+		decision.UsedEvidence = []Evidence{evidenceFromSignal(input.RecentEvidence[0])}
+		if decision.VisualArchiveID != "" {
+			decision.UsedEvidence[0].FrameArchiveID = decision.VisualArchiveID
+		}
+	}
+	if decision.VisualArchiveID != "" && decision.VisualObservedAt.IsZero() && len(input.RecentEvidence) > 0 {
+		decision.VisualObservedAt = input.RecentEvidence[0].ObservedAt
+	}
+	return decision, r.err
 }
 
 func (c *testFrameCapturer) Capture(_ context.Context, _, _, path string) error {
@@ -140,7 +154,7 @@ func TestUserCanUpdateGoalAndPlanWhileMonitorRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Goal != "聊天区出现鱼上钩时提醒我" || updated.Plan.VisionPolicy != "goal_required" || updated.Version <= run.Version {
+	if updated.Goal != "聊天区出现鱼上钩时提醒我" || updated.Plan.VisionPolicy != "agent_decides" || periodicVision(updated.Plan) || updated.GoalVersion != run.GoalVersion+1 || updated.Version <= run.Version {
 		t.Fatalf("user-edited goal and its new bounded plan should be committed together: %#v", updated)
 	}
 	if _, err := service.UpdateGoal(context.Background(), run.ID, "x"); err == nil {
@@ -290,7 +304,7 @@ func TestStartPersistsNormalizedGoalPlan(t *testing.T) {
 	service := NewService(repository, nil)
 	service.SetGoalPlanner(fixedGoalPlanner{plan: MonitoringPlan{
 		Summary: "持续监听主播口播", CaptureIntervalSeconds: 6, ReviewIntervalSeconds: 15,
-		RecommendASR: true, VisionPolicy: "agent_decides", Tools: []string{"read_transcript_window"}, Planner: "MiniMax-M3",
+		RecommendASR: true, VisionPolicy: "agent_decides", Tools: []string{"search_observations"}, Planner: "MiniMax-M3",
 	}})
 	run, err := service.Start(context.Background(), StartInput{
 		TargetURL: "https://live.douyin.com/room-plan", Goal: "主播说出重要消息时实时提醒", SourceMode: "ocr_upload",
@@ -363,7 +377,7 @@ func TestUnexpectedImportantEventCanAlertOutsideUserGoal(t *testing.T) {
 		Action: "alert", Category: "major_announcement", Summary: "直播间公布了新赛季上线时间",
 		Reason: "这是目标之外但明确、即时的重要公告", Confidence: .91,
 		ToolCalls: []ReviewToolCall{
-			{Tool: "read_recent_evidence", Outcome: "已读取 1 条近期字幕证据", Succeeded: true},
+			{Tool: "search_observations", Outcome: "已读取 1 条近期字幕证据", Succeeded: true},
 			{Tool: "search_recent_alerts", Outcome: "未发现同类提醒记录", Succeeded: true},
 			{Tool: "create_alert", Outcome: "提醒请求通过服务端校验", Succeeded: true},
 		},
@@ -404,8 +418,11 @@ func TestChatGoalMatchCreatesOCRBackedAlert(t *testing.T) {
 	reviewer := &testUnexpectedReviewer{decision: UnexpectedEventDecision{
 		Action: "alert", Category: "chat_match", Summary: "聊天区出现关注的新地图讨论",
 		Reason: "可见评论正在讨论用户关注的新地图", VisualFinding: "评论内容位于画面右侧的聊天区域", Confidence: .9,
+		VisualArchiveID: "archive-chat-success",
 		ToolCalls: []ReviewToolCall{
-			{Tool: "read_recent_evidence", Outcome: "已读取可见聊天文字", Succeeded: true},
+			{Tool: "search_observations", Outcome: "已读取可见聊天文字", Succeeded: true},
+			{Tool: "inspect_live_frame", Outcome: "已确认文字位于聊天区域", Succeeded: true},
+			{Tool: "save_frame_evidence", Outcome: "已保存本次看图使用的截图", Succeeded: true},
 			{Tool: "search_recent_alerts", Outcome: "未发现同类提醒", Succeeded: true},
 			{Tool: "create_alert", Outcome: "已生成聊天命中提醒", Succeeded: true},
 		},
@@ -434,7 +451,8 @@ func TestChatGoalMatchRequiresVisibleOCREvidence(t *testing.T) {
 	defer service.StopAll()
 	reviewer := &testUnexpectedReviewer{decision: UnexpectedEventDecision{
 		Action: "alert", Category: "chat_match", Summary: "聊天区出现关注的地图话题", VisualFinding: "右侧聊天区域出现该内容",
-		Confidence: .95,
+		Confidence: .95, VisualArchiveID: "archive-chat-without-ocr",
+		ToolCalls: []ReviewToolCall{{Tool: "inspect_live_frame", Outcome: "已查看截图", Succeeded: true}},
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
 	run, err := service.Start(context.Background(), StartInput{
@@ -529,7 +547,7 @@ func TestUnexpectedReviewFailureIsVisibleAndDoesNotStopMonitoring(t *testing.T) 
 	repository := NewMemoryRepository()
 	service := NewService(repository, nil)
 	reviewer := &testUnexpectedReviewer{err: errors.New("provider unavailable"), decision: UnexpectedEventDecision{
-		ToolCalls: []ReviewToolCall{{Tool: "read_recent_evidence", Outcome: "已读取 1 条近期字幕证据", Succeeded: true}},
+		ToolCalls: []ReviewToolCall{{Tool: "search_observations", Outcome: "已读取 1 条近期字幕证据", Succeeded: true}},
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
 	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/room-fail", Goal: "抽奖时提醒我", SourceMode: "ocr_upload"})
@@ -586,8 +604,8 @@ func TestBrowserCaptureLoopFeedsOCRIntoAgentAndStops(t *testing.T) {
 	if _, err := service.Stop(context.Background(), run.ID); err != nil {
 		t.Fatal(err)
 	}
-	if capturer.closed.Load() != 0 {
-		t.Fatal("stopping monitoring should keep the live browser tab open")
+	if capturer.closed.Load() != 1 {
+		t.Fatal("stopping monitoring should close this run's browser tab")
 	}
 	service.StopAll()
 	if capturer.closedAll.Load() != 1 {

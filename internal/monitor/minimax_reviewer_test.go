@@ -46,17 +46,17 @@ func TestMiniMaxReviewerRunsBoundedToolCallingLoop(t *testing.T) {
 		requests = append(requests, request)
 		w.Header().Set("Content-Type", "application/json")
 		if len(requests) == 1 {
-			_, _ = w.Write([]byte(`{"type":"message","model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tool_evidence","name":"read_recent_evidence","input":{}},{"type":"tool_use","id":"tool_alerts","name":"search_recent_alerts","input":{"category":"major_announcement"}}],"usage":{"input_tokens":130,"output_tokens":44}}`))
+			_, _ = w.Write([]byte(`{"type":"message","model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tool_evidence","name":"search_observations","input":{"scope":"recent"}},{"type":"tool_use","id":"tool_alerts","name":"search_recent_alerts","input":{"category":"major_announcement"}}],"usage":{"input_tokens":130,"output_tokens":44}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"type":"message","model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tool_create","name":"create_alert","input":{"category":"major_announcement","summary":"主播宣布停播一年","reason":"这是明确且时效性强的重要消息","confidence":0.93,"visual_finding":""}}],"usage":{"input_tokens":80,"output_tokens":32}}`))
+		_, _ = w.Write([]byte(`{"type":"message","model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tool_create","name":"create_alert","input":{"category":"major_announcement","summary":"主播宣布停播一年","reason":"这是明确且时效性强的重要消息","confidence":0.93,"visual_finding":"","evidence_ids":["signal-1"],"evidence_basis":"live"}}],"usage":{"input_tokens":80,"output_tokens":32}}`))
 	}))
 	defer server.Close()
 
 	reviewer := MiniMaxUnexpectedEventReviewer{APIKey: "test-key", Model: "MiniMax-M3", Endpoint: server.URL + "/anthropic/v1/messages", Client: server.Client()}
 	decision, err := reviewer.Review(context.Background(), UnexpectedEventInput{
 		Goal:           "抽奖时提醒我",
-		RecentEvidence: []SignalEvent{{RoomID: "room-1", Source: "ocr", Text: "主播宣布本场结束后将停播一年", Confidence: .94, ObservedAt: time.Now().UTC()}},
+		RecentEvidence: []SignalEvent{{ID: "signal-1", RoomID: "room-1", Source: "ocr", Text: "主播宣布本场结束后将停播一年", Confidence: .94, ObservedAt: time.Now().UTC()}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -70,15 +70,23 @@ func TestMiniMaxReviewerRunsBoundedToolCallingLoop(t *testing.T) {
 	if len(decision.ToolCalls) != 3 || !decision.ToolCalls[0].Succeeded || !decision.ToolCalls[1].Succeeded || !decision.ToolCalls[2].Succeeded {
 		t.Fatalf("expected three successful concrete tool calls: %#v", decision.ToolCalls)
 	}
-	if decision.ToolCalls[0].Outcome != "已读取 1 条近期字幕证据" || decision.ToolCalls[1].Outcome != "未发现同类提醒记录" || decision.ToolCalls[2].Outcome != "提醒请求通过服务端校验" {
+	if decision.ToolCalls[0].Outcome != "从近期观测记录中找到 1 条" || decision.ToolCalls[1].Outcome != "未发现同类提醒记录" || decision.ToolCalls[2].Outcome != "提醒请求通过服务端校验" {
 		t.Fatalf("tool audit outcomes should be concise and readable: %#v", decision.ToolCalls)
 	}
 	first := requests[0]
-	if first["model"] != "MiniMax-M3" || first["max_tokens"] != float64(512) || first["tool_choice"].(map[string]any)["type"] != "any" {
+	if first["model"] != "MiniMax-M3" || first["max_tokens"] != float64(512) || first["tool_choice"].(map[string]any)["type"] != "auto" {
 		t.Fatalf("request must enable bounded Anthropic tool use: %#v", first)
 	}
-	if len(first["tools"].([]any)) != 5 || !strings.Contains(first["system"].(string), "inspect_live_frame") {
-		t.Fatalf("request must expose the four evidence/alert tools and structured finish tool: %#v", first)
+	if len(first["tools"].([]any)) != 6 || !strings.Contains(first["system"].(string), "save_frame_evidence") {
+		t.Fatalf("request must expose the current evidence, clarification, and alert tools: %#v", first)
+	}
+	if first["tools"].([]any)[4].(map[string]any)["name"] != "save_frame_evidence" {
+		t.Fatalf("image archival must be an explicit Agent tool: %#v", first["tools"])
+	}
+	for _, tool := range first["tools"].([]any) {
+		if tool.(map[string]any)["name"] == "finish_review" {
+			t.Fatal("no-alert conclusion must be a structured final response, not a tool")
+		}
 	}
 	initial := first["messages"].([]any)[0].(map[string]any)["content"].(string)
 	if !strings.Contains(initial, "抽奖时提醒我") || !strings.Contains(initial, "停播一年") {
@@ -130,8 +138,9 @@ func TestMiniMaxCreateAlertRequiresMatchingNonDuplicateSearch(t *testing.T) {
 }
 
 func TestMiniMaxCreateAlertMustWaitForToolResultsRoundTrip(t *testing.T) {
-	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{RoomID: "room-1", Text: "重要消息"}}}
-	alertInput := []byte(`{"category":"major_announcement","summary":"发布重要消息","reason":"近期字幕明确说明发布时间","confidence":0.9,"visual_finding":""}`)
+	now := time.Now().UTC()
+	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{ID: "signal-1", RoomID: "room-1", Source: SignalOCR, Text: "重要消息", ObservedAt: now}}}
+	alertInput := []byte(`{"category":"major_announcement","summary":"发布重要消息","reason":"近期字幕明确说明发布时间","confidence":0.9,"visual_finding":"","evidence_ids":["signal-1"],"evidence_basis":"live"}`)
 	state := miniMaxReviewState{readEvidenceTurn: 0, searchedCategory: "major_announcement", searchAlertsTurn: 0, frameInspectTurn: -1}
 	result, _, didAlert := runMiniMaxTool(miniMaxContentBlock{ID: "1", Name: "create_alert", Input: alertInput}, input, nil, &state, 0)
 	if didAlert || !result.IsError {
@@ -157,9 +166,11 @@ func TestMiniMaxReviewerCanInspectAndGroundAnAlertInARealImageBlock(t *testing.T
 		case 1:
 			_, _ = w.Write([]byte(`{"model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"inspect","name":"inspect_live_frame","input":{}}],"usage":{"input_tokens":20,"output_tokens":10}}`))
 		case 2:
-			_, _ = w.Write([]byte(`{"model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"read","name":"read_recent_evidence","input":{}},{"type":"tool_use","id":"search","name":"search_recent_alerts","input":{"category":"product_event"}}],"usage":{"input_tokens":50,"output_tokens":20}}`))
+			_, _ = w.Write([]byte(`{"model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"read","name":"search_observations","input":{"scope":"recent"}},{"type":"tool_use","id":"search","name":"search_recent_alerts","input":{"category":"product_event"}}],"usage":{"input_tokens":50,"output_tokens":20}}`))
+		case 3:
+			_, _ = w.Write([]byte(`{"model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"save","name":"save_frame_evidence","input":{}}],"usage":{"input_tokens":30,"output_tokens":10}}`))
 		default:
-			_, _ = w.Write([]byte(`{"model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"create","name":"create_alert","input":{"category":"product_event","summary":"主播展示了红色包装产品","reason":"直播画面显示该产品包装，结合主播字幕确认正在介绍新品","confidence":0.9,"visual_finding":"画面中央展示一个红白配色包装盒，正面可见产品名"}}],"usage":{"input_tokens":40,"output_tokens":20}}`))
+			_, _ = w.Write([]byte(`{"model":"MiniMax-M3","stop_reason":"tool_use","content":[{"type":"tool_use","id":"create","name":"create_alert","input":{"category":"product_event","summary":"主播展示了红色包装产品","reason":"直播画面显示该产品包装，结合主播字幕确认正在介绍新品","confidence":0.9,"visual_finding":"画面中央展示一个红白配色包装盒，正面可见产品名","evidence_ids":["signal-image"],"evidence_basis":"live"}}],"usage":{"input_tokens":40,"output_tokens":20}}`))
 		}
 	}))
 	defer server.Close()
@@ -176,14 +187,19 @@ func TestMiniMaxReviewerCanInspectAndGroundAnAlertInARealImageBlock(t *testing.T
 		t.Fatal(err)
 	}
 	reviewer := MiniMaxUnexpectedEventReviewer{APIKey: "test-key", Model: "MiniMax-M3", Endpoint: server.URL, Client: server.Client()}
+	frameObservedAt := time.Now().UTC()
 	decision, err := reviewer.Review(context.Background(), UnexpectedEventInput{
-		Goal: "主播展示产品时，判断包装是什么颜色并提醒我", TriggerFrame: imagePath,
-		RecentEvidence: []SignalEvent{{RoomID: "room-1", Source: "ocr", Text: "主播正在介绍一款产品", Confidence: .8}},
+		Goal: "主播展示产品时，判断包装是什么颜色并提醒我", TriggerFrame: imagePath, TriggerFrameObservedAt: frameObservedAt,
+		RecentEvidence: []SignalEvent{{ID: "signal-image", RoomID: "room-1", Source: "ocr", Text: "主播正在介绍一款产品", Confidence: .8, ObservedAt: frameObservedAt}},
+		SaveFrame: func(_ context.Context, asset FrameAsset) (FrameAsset, error) {
+			asset.ArchiveID = "saved-frame"
+			return asset, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Action != "alert" || decision.VisualFinding == "" || len(decision.ToolCalls) != 4 || len(requests) != 3 {
+	if decision.Action != "alert" || decision.VisualFinding == "" || len(decision.ToolCalls) != 5 || len(requests) != 4 {
 		t.Fatalf("image-backed alert should complete the bounded loop: %#v requests=%d", decision, len(requests))
 	}
 	firstChoice := requests[0]["tool_choice"].(map[string]any)
@@ -208,11 +224,11 @@ func TestMiniMaxReviewerKeepsToolChoiceAutomaticForGeneralGoals(t *testing.T) {
 	}
 }
 
-func TestInspectFrameCanCaptureTheLatestFrameOnDemandAndCleansIt(t *testing.T) {
+func TestInspectFrameCanCaptureLatestFrameWithoutArchivingIt(t *testing.T) {
 	observedAt := time.Now().UTC()
 	captured := 0
 	framePath := t.TempDir() + "/fresh.png"
-	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{RoomID: "room-1", Source: SignalASR, Text: "主播说正在展示商品"}}, CaptureFrame: func(context.Context) (FrameAsset, error) {
+	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{ID: "asr-1", RoomID: "room-1", Source: SignalASR, Text: "主播说正在展示商品"}}, CaptureFrame: func(context.Context) (FrameAsset, error) {
 		captured++
 		file, err := os.Create(framePath)
 		if err != nil {
@@ -232,14 +248,14 @@ func TestInspectFrameCanCaptureTheLatestFrameOnDemandAndCleansIt(t *testing.T) {
 	if result.IsError || terminal || !state.frameInspected || !state.frameObservedAt.Equal(observedAt) || captured != 1 {
 		t.Fatalf("on-demand frame capture failed: %#v state=%#v calls=%d", result, state, captured)
 	}
-	if _, err := os.Stat(framePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temporary frame was not removed: %v", err)
+	if _, err := os.Stat(framePath); err != nil {
+		t.Fatalf("temporary frame must remain available for an explicit save tool: %v", err)
 	}
-	blocks, ok := result.Content.([]map[string]any)
-	if !ok || len(blocks) != 2 || blocks[1]["type"] != "image" {
+	blocks, ok := result.Content.([]ModelContent)
+	if !ok || len(blocks) != 2 || blocks[1].Image == nil {
 		t.Fatalf("tool did not return image evidence: %#v", result.Content)
 	}
-	failedInput := UnexpectedEventInput{CaptureFrame: func(context.Context) (FrameAsset, error) { return FrameAsset{}, errors.New("chrome disconnected") }}
+	failedInput := UnexpectedEventInput{RecentEvidence: []SignalEvent{{ID: "asr-1", RoomID: "room-1", Source: SignalASR, Text: "主播说正在展示商品"}}, CaptureFrame: func(context.Context) (FrameAsset, error) { return FrameAsset{}, errors.New("chrome disconnected") }}
 	failed, _, _ := r.executeTool(context.Background(), block, failedInput, nil, &miniMaxReviewState{readEvidenceTurn: 0, frameInspectTurn: -1}, 1)
 	if !failed.IsError || !strings.Contains(failed.Content.(string), "could not capture") {
 		t.Fatalf("capture failure must be returned as a tool error: %#v", failed)

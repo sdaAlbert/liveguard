@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,7 +24,6 @@ import (
 
 func main() {
 	loadEnvFiles(".env.local", filepath.Join("..", ".env.local"))
-	normalizeLocalProxyEnv()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	shutdownTrace := func(context.Context) error { return nil }
@@ -41,12 +41,13 @@ func main() {
 		defer cancel()
 		_ = shutdownTrace(shutdownCtx)
 	}()
-	durable := strings.EqualFold(os.Getenv("LIVEGUARD_INFRA_MODE"), "durable")
+	infraMode := strings.ToLower(envOr("LIVEGUARD_INFRA_MODE", "local"))
 	databaseURL := envOr("LIVEGUARD_DATABASE_URL", "postgres://liveguard:liveguard_local@127.0.0.1:5433/liveguard?sslmode=disable")
 	chromePath := envOr("LIVEGUARD_CHROME_PATH", defaultChromePath())
 	webServer := webapp.New("artifacts")
+	webServer.SetShutdownHandler(stop)
 	var monitorRepository monitor.Repository
-	if durable {
+	if infraMode == "durable" {
 		monitorCtx, cancelMonitor := context.WithTimeout(ctx, 10*time.Second)
 		postgresMonitors, monitorErr := monitor.OpenPostgres(monitorCtx, databaseURL)
 		cancelMonitor()
@@ -55,48 +56,58 @@ func main() {
 		}
 		defer postgresMonitors.Close()
 		monitorRepository = postgresMonitors
-	} else {
+	} else if infraMode == "memory" {
 		monitorRepository = monitor.NewMemoryRepository()
+	} else {
+		localPath := envOr("LIVEGUARD_LOCAL_STATE_PATH", filepath.Join("runtime", "liveguard.json"))
+		localRepository, err := monitor.OpenFileRepository(localPath)
+		if err != nil {
+			log.Fatalf("local monitor store: %v", err)
+		}
+		defer func() {
+			if err := localRepository.Close(); err != nil {
+				log.Printf("save local monitor state: %v", err)
+			}
+		}()
+		monitorRepository = localRepository
+		log.Printf("local monitor state persisted to %s", localPath)
 	}
 	monitorService := monitor.NewService(monitorRepository, func() {
 		webServer.Publish(domain.Event{ID: domain.NewID("event"), Type: "monitor_update", Message: "monitor state updated", At: time.Now().UTC()})
 	})
+	monitorService.SetFrameArchiveDir(envOr("LIVEGUARD_FRAME_ARCHIVE_DIR", filepath.Join("runtime", "frames")))
 	monitorLLMMode := strings.ToLower(envOr("LIVEGUARD_MONITOR_LLM_MODE", "deterministic"))
-	monitorProvider := strings.ToLower(envOr("LIVEGUARD_MONITOR_PROVIDER", "openai"))
+	monitorProvider := strings.ToLower(envOr("LIVEGUARD_MONITOR_PROVIDER", "minimax"))
 	interval := envDuration("LIVEGUARD_MONITOR_REVIEW_INTERVAL", 15*time.Second)
-	switch {
-	case monitorLLMMode != "auto":
-		log.Print("unexpected livestream event review disabled; set LIVEGUARD_MONITOR_LLM_MODE=auto to enable")
-	case monitorProvider == "minimax":
-		if key := strings.TrimSpace(os.Getenv("MINIMAX_API_KEY")); key != "" {
-			model := envOr("LIVEGUARD_MONITOR_MODEL", "MiniMax-M3")
-			endpoint := envOr("LIVEGUARD_MONITOR_ENDPOINT", "https://api.minimaxi.com/anthropic/v1/messages")
-			monitorService.SetGoalPlanner(&monitor.MiniMaxGoalPlanner{
-				APIKey: key, Model: model, Endpoint: endpoint, Client: agent.DefaultHTTPClient(),
-			})
-			monitorService.SetUnexpectedEventReviewer(&monitor.MiniMaxUnexpectedEventReviewer{
-				APIKey: key, Model: model, Endpoint: envOr("LIVEGUARD_MONITOR_ENDPOINT", "https://api.minimaxi.com/anthropic/v1/messages"),
-				Client: agent.DefaultHTTPClient(), Breaker: agent.NewCircuitBreaker(2, 30*time.Second),
-				SignalAnalyzer: monitor.LocalSignalAnalyzer{},
-			}, interval)
-			log.Printf("MiniMax goal planning and unexpected livestream review enabled with model %s (hard minimum interval %s)", model, interval)
+	initialModelSettings := monitor.ModelSettingsInput{Provider: "rules"}
+	if raw := strings.TrimSpace(os.Getenv("LIVEGUARD_MONITOR_SUPPORTS_VISION")); raw != "" {
+		if vision, err := strconv.ParseBool(raw); err == nil {
+			initialModelSettings.SupportsVision = &vision
 		} else {
-			log.Print("MiniMax event review disabled; MINIMAX_API_KEY is not configured")
+			log.Print("invalid LIVEGUARD_MONITOR_SUPPORTS_VISION; using declared default model capabilities")
 		}
-	case monitorProvider == "openai":
-		if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
-			model := envOr("LIVEGUARD_MONITOR_MODEL", envOr("LIVEGUARD_MODEL", "gpt-5.6-luna"))
-			monitorService.SetUnexpectedEventReviewer(&monitor.OpenAIUnexpectedEventReviewer{
-				APIKey: key, Model: model, Endpoint: os.Getenv("LIVEGUARD_MONITOR_ENDPOINT"), Client: agent.DefaultHTTPClient(),
-				Breaker: agent.NewCircuitBreaker(2, 30*time.Second),
-			}, interval)
-			log.Printf("unexpected livestream event review enabled with OpenAI model %s (max once per %s per monitor)", model, interval)
-		} else {
-			log.Print("OpenAI event review disabled; OPENAI_API_KEY is not configured")
-		}
-	default:
-		log.Printf("unexpected livestream event review disabled; unsupported provider %q", monitorProvider)
 	}
+	if monitorLLMMode == "auto" {
+		initialModelSettings.Provider = monitorProvider
+		initialModelSettings.Model = envOr("LIVEGUARD_MONITOR_MODEL", envOr("LIVEGUARD_MODEL", ""))
+		initialModelSettings.Endpoint = strings.TrimSpace(os.Getenv("LIVEGUARD_MONITOR_ENDPOINT"))
+		if monitorProvider == "minimax" {
+			initialModelSettings.APIKey = strings.TrimSpace(os.Getenv("MINIMAX_API_KEY"))
+		} else if monitorProvider == "openai" {
+			initialModelSettings.APIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		} else if monitorProvider == "deepseek" {
+			initialModelSettings.APIKey = strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
+		}
+	}
+	if _, modelErr := monitorService.ConfigureModel(initialModelSettings); modelErr != nil {
+		log.Printf("model configuration unavailable; using local rules: %v", modelErr)
+		_, _ = monitorService.ConfigureModel(monitor.ModelSettingsInput{Provider: "rules"})
+	} else if initialModelSettings.Provider == "rules" {
+		log.Print("unexpected livestream event review disabled; configure a model from the local settings window")
+	} else {
+		log.Printf("%s livestream model configured (minimum review interval %s)", initialModelSettings.Provider, interval)
+	}
+	monitorService.SetUnexpectedEventReviewerInterval(interval)
 	if monitorProvider == "minimax" && !strings.EqualFold(envOr("LIVEGUARD_ASR_MODE", "auto"), "off") {
 		if key := strings.TrimSpace(os.Getenv("MINIMAX_API_KEY")); key != "" {
 			monitorService.SetTranscriber(monitor.MiniMaxTranscriber{
@@ -116,7 +127,7 @@ func main() {
 	defer liveCapturer.Shutdown()
 	monitorService.SetFrameCapturer(liveCapturer)
 	if strings.TrimSpace(os.Getenv("LIVEGUARD_LIVE_CAPTURE_INTERVAL")) != "" {
-		monitorService.SetCaptureInterval(envDuration("LIVEGUARD_LIVE_CAPTURE_INTERVAL", 12*time.Second))
+		monitorService.SetCaptureInterval(envDuration("LIVEGUARD_LIVE_CAPTURE_INTERVAL", 6*time.Second))
 	}
 	if binary := strings.TrimSpace(os.Getenv("LIVEGUARD_TESSERACT_BIN")); binary != "" {
 		monitorService.SetTextRecognizer(monitor.TesseractRecognizer{
@@ -143,17 +154,6 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
-}
-
-// normalizeLocalProxyEnv repairs only the stale loopback ports this project
-// has encountered. Other proxy values are left untouched.
-func normalizeLocalProxyEnv() {
-	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
-		value := strings.TrimSpace(os.Getenv(name))
-		if value == "http://127.0.0.1:7890" || value == "http://127.0.0.1:7890/" || value == "http://127.0.0.1:9" || value == "http://127.0.0.1:9/" {
-			_ = os.Setenv(name, "http://127.0.0.1:7897")
-		}
-	}
 }
 
 func allowedHosts() map[string]bool {

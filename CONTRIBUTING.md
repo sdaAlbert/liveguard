@@ -20,6 +20,5 @@ If MiniMax is configured in local OpenClaw settings, the launcher can reuse that
 - `internal/monitor`: monitor lifecycle, evidence, tools, alerts, and evaluation.
 - `internal/browser`: dedicated Chrome session and frame capture.
 - `internal/web`: monitor UI and HTTP API.
-- `docs/DESIGN-LIVE-SIGNAL-AGENT.md`: source of truth for scope, implementation, and acceptance status.
 
 Redis, Kafka, task schedulers, batch inspections, and the old Sandbox Lab are outside the current scope. New infrastructure should address a demonstrated need in the monitor flow.

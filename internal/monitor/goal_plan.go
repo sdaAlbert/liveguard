@@ -25,13 +25,15 @@ func defaultGoalPlan(goal, planner string) MonitoringPlan {
 	if fast {
 		captureSeconds, reviewSeconds = 6, 15
 	}
-	tools := []string{"read_recent_evidence", "search_recent_alerts", "create_alert", "inspect_live_frame"}
-	if asr {
-		tools = append(tools, "read_transcript_window")
+	if visual && !fast {
+		reviewSeconds = 30
 	}
+	tools := []string{"search_observations", "search_recent_alerts", "create_alert", "inspect_live_frame"}
 	visionPolicy := "agent_decides"
+	signals := []string{"ocr"}
 	if visual {
 		visionPolicy = "goal_required"
+		signals = append(signals, "vision")
 	}
 	strategy := "持续读取直播字幕；有新信号时按需判断，并检查重复提醒。"
 	if asr {
@@ -44,6 +46,10 @@ func defaultGoalPlan(goal, planner string) MonitoringPlan {
 		strategy += " 目标依赖画面属性，必须先检查当前画面再作结论。"
 	}
 	consent := []string{}
+	alertScope := "any"
+	if goalNeedsChatRegion(goal) {
+		alertScope = "chat"
+	}
 	if asr {
 		consent = append(consent, "需要你在监控卡片手动开启口播识别并授权分享音频")
 	}
@@ -51,6 +57,8 @@ func defaultGoalPlan(goal, planner string) MonitoringPlan {
 		Summary: strategy, CaptureIntervalSeconds: captureSeconds, ReviewIntervalSeconds: reviewSeconds,
 		UseOCR: true, RecommendASR: asr, VisionPolicy: visionPolicy, Tools: tools,
 		UserConsent: consent, Planner: planner,
+		Signals:    signals,
+		AlertScope: alertScope,
 	}
 }
 
@@ -81,12 +89,27 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 	}
 	if goalRequiresFrameInspection(goal) {
 		plan.VisionPolicy = "goal_required"
-	} else if plan.VisionPolicy == "goal_required" {
+	} else if plan.VisionPolicy == "goal_required" && !periodicVision(plan) {
 		// A model cannot silently turn a spoken-content request into mandatory
 		// image uploads; explicit visual intent is the only required-image case.
 		plan.VisionPolicy = "agent_decides"
 	}
-	allowed := map[string]bool{"read_recent_evidence": true, "search_recent_alerts": true, "create_alert": true, "inspect_live_frame": true, "read_transcript_window": true}
+	signals := []string{"ocr"}
+	if goalRequiresFrameInspection(goal) || periodicVision(plan) {
+		signals = append(signals, "vision")
+	}
+	plan.Signals = signals
+	if plan.AlertScope != "chat" {
+		plan.AlertScope = "any"
+	}
+	if goalNeedsChatRegion(goal) {
+		plan.AlertScope = "chat"
+	}
+	if goalIsExplicitTextOnly(goal) {
+		plan.Signals = []string{"ocr"}
+		plan.VisionPolicy = "agent_decides"
+	}
+	allowed := map[string]bool{"search_observations": true, "search_recent_alerts": true, "create_alert": true, "inspect_live_frame": true}
 	seen := map[string]bool{}
 	tools := make([]string, 0, len(plan.Tools)+4)
 	for _, name := range plan.Tools {
@@ -95,7 +118,7 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 			seen[name] = true
 		}
 	}
-	for _, name := range []string{"read_recent_evidence", "search_recent_alerts", "create_alert"} {
+	for _, name := range []string{"search_observations", "search_recent_alerts", "create_alert"} {
 		if !seen[name] {
 			tools = append(tools, name)
 			seen[name] = true
@@ -105,20 +128,9 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 		tools = append(tools, "inspect_live_frame")
 	}
 	if plan.RecommendASR {
-		if !seen["read_transcript_window"] {
-			tools = append(tools, "read_transcript_window")
-		}
 		if len(plan.UserConsent) == 0 {
 			plan.UserConsent = []string{"需要你在监控卡片手动开启口播识别并授权分享音频"}
 		}
-	} else {
-		filtered := tools[:0]
-		for _, name := range tools {
-			if name != "read_transcript_window" {
-				filtered = append(filtered, name)
-			}
-		}
-		tools = filtered
 	}
 	plan.Tools = tools
 	plan.UserConsent = compactStrings(plan.UserConsent)
@@ -131,16 +143,24 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 
 func summarizeMonitoringPlan(plan MonitoringPlan) string {
 	parts := []string{fmt.Sprintf("本地 OCR 每 %d 秒采样", plan.CaptureIntervalSeconds)}
-	parts = append(parts, fmt.Sprintf("目标外信号最短每 %d 秒交给 Agent 复核", plan.ReviewIntervalSeconds))
+	parts = append(parts, fmt.Sprintf("信号最短每 %d 秒交给 Agent 复核", plan.ReviewIntervalSeconds))
 	if plan.RecommendASR {
 		parts = append(parts, "建议你授权开启口播识别")
 	} else {
 		parts = append(parts, "当前计划以画面文字为主")
 	}
-	if plan.VisionPolicy == "goal_required" {
+	if plan.ModelCapabilities != nil && !plan.ModelCapabilities.Vision {
+		parts = append(parts, "当前模型仅处理文字，不执行看图")
+	} else if plan.VisionPolicy == "goal_required" {
 		parts = append(parts, "目标依赖画面属性，先调用看图工具")
 	} else {
 		parts = append(parts, "Agent 可按需调用看图工具")
+	}
+	if periodicVision(plan) {
+		parts = append(parts, "无新文字时也会定时检查画面；短暂事件可能落在采样间隔内")
+	}
+	if plan.CapabilityWarning != "" {
+		parts = append(parts, plan.CapabilityWarning)
 	}
 	return strings.Join(parts, "；")
 }
@@ -148,6 +168,15 @@ func summarizeMonitoringPlan(plan MonitoringPlan) string {
 func goalNeedsSpeechSignals(goal string) bool {
 	goal = strings.ToLower(goal)
 	return containsAny(goal, []string{"口播", "主播说", "说出", "说的", "提到", "宣布", "播报", "新闻", "对话", "声音", "语音", "每条", "每一条", "讲到", "asr", "speech", "spoken"})
+}
+
+func goalIsExplicitTextOnly(goal string) bool {
+	goal = strings.ToLower(goal)
+	return containsAny(goal, []string{"字幕", "文字", "聊天区", "评论", "口播", "主播说", "说出", "说的", "提到", "播报"}) && !containsAny(goal, []string{"画面里", "画面中", "查看画面", "看一下画面", "图像", "看图", "视觉", "看到", "颜色", "外观", "展示", "包装"})
+}
+
+func goalNeedsChatRegion(goal string) bool {
+	return containsAny(strings.ToLower(goal), []string{"聊天", "弹幕", "评论", "有人问", "观众问", "网友问", "chat", "comment"})
 }
 
 func goalNeedsFastPlan(goal string) bool {

@@ -2,6 +2,9 @@ package monitor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"time"
 )
@@ -80,23 +83,30 @@ func SignalEvalCasesForSplit(split string) ([]SignalEvalCase, bool) {
 }
 
 type SignalEvalResult struct {
-	Name          string           `json:"name"`
-	Category      string           `json:"category"`
-	ExpectedAlert bool             `json:"expected_alert"`
-	Action        string           `json:"action"`
-	Passed        bool             `json:"passed"`
-	Error         string           `json:"error,omitempty"`
-	InputTokens   int64            `json:"input_tokens"`
-	OutputTokens  int64            `json:"output_tokens"`
-	LatencyMS     int64            `json:"latency_ms"`
-	ToolCalls     int              `json:"tool_calls"`
-	StopReason    string           `json:"stop_reason,omitempty"`
-	Reason        string           `json:"reason,omitempty"`
-	ToolAudit     []ReviewToolCall `json:"tool_audit,omitempty"`
-	FormatRepairs int              `json:"format_repairs,omitempty"`
+	Model          string           `json:"model"`
+	BaselineAlert  bool             `json:"baseline_alert"`
+	BaselinePassed bool             `json:"baseline_passed"`
+	Name           string           `json:"name"`
+	Category       string           `json:"category"`
+	ExpectedAlert  bool             `json:"expected_alert"`
+	Action         string           `json:"action"`
+	Passed         bool             `json:"passed"`
+	Error          string           `json:"error,omitempty"`
+	InputTokens    int64            `json:"input_tokens"`
+	OutputTokens   int64            `json:"output_tokens"`
+	LatencyMS      int64            `json:"latency_ms"`
+	ToolCalls      int              `json:"tool_calls"`
+	StopReason     string           `json:"stop_reason,omitempty"`
+	Reason         string           `json:"reason,omitempty"`
+	ToolAudit      []ReviewToolCall `json:"tool_audit,omitempty"`
+	FormatRepairs  int              `json:"format_repairs,omitempty"`
 }
 
 type SignalEvalReport struct {
+	DatasetSHA256     string             `json:"dataset_sha256"`
+	ExpectedCases     int                `json:"expected_cases"`
+	Completed         bool               `json:"completed"`
+	Baseline          BaselineMetrics    `json:"legacy_keyword_baseline"`
 	Source            string             `json:"source"`
 	DatasetSplit      string             `json:"dataset_split"`
 	CreatedAt         time.Time          `json:"created_at"`
@@ -112,6 +122,24 @@ type SignalEvalReport struct {
 	ToolCalls         int                `json:"tool_calls"`
 }
 
+type BaselineMetrics struct {
+	Passed            int     `json:"passed"`
+	Precision         float64 `json:"precision"`
+	Recall            float64 `json:"recall"`
+	FalsePositiveRate float64 `json:"false_positive_rate"`
+}
+
+// Compare the same samples against the prior local keyword matcher, with
+// ordinary negation, low-confidence and exact-repeat guards. It cannot infer
+// arbitrary amounts or visual regions. No case-specific exceptions are used.
+func keywordBaseline(sample SignalEvalCase) bool {
+	if sample.Duplicate || sample.Confidence < .5 || containsAny(sample.Text, []string{"取消", "不会", "不安排", "没有", "不实", "结束"}) {
+		return false
+	}
+	kind := classify(sample.Text, sample.Goal)
+	return kind != "" && kind != "human_verification"
+}
+
 // Fixed text cases are evaluated by the actual supplied reviewer. This is not
 // browser/ASR end-to-end testing or an estimate of production model quality.
 func RunSignalEval(ctx context.Context, reviewer UnexpectedEventReviewer) SignalEvalReport {
@@ -119,8 +147,12 @@ func RunSignalEval(ctx context.Context, reviewer UnexpectedEventReviewer) Signal
 }
 
 func RunSignalEvalCases(ctx context.Context, reviewer UnexpectedEventReviewer, split string, cases []SignalEvalCase) SignalEvalReport {
-	report := SignalEvalReport{Source: "fixed_text_signals", DatasetSplit: split, CreatedAt: time.Now().UTC()}
+	report := SignalEvalReport{Source: "fixed_text_signals", DatasetSplit: split, CreatedAt: time.Now().UTC(), ExpectedCases: len(cases)}
+	encodedCases, _ := json.Marshal(cases)
+	digest := sha256.Sum256(encodedCases)
+	report.DatasetSHA256 = hex.EncodeToString(digest[:])
 	var truePositive, falsePositive, positive, negative int
+	var baselineTP, baselineFP int
 	var latencies []int64
 	for _, sample := range cases {
 		if ctx.Err() != nil {
@@ -136,10 +168,16 @@ func RunSignalEvalCases(ctx context.Context, reviewer UnexpectedEventReviewer, s
 		decision, err := reviewer.Review(ctx, input)
 		result := SignalEvalResult{Name: sample.Name, Category: sample.Category, ExpectedAlert: sample.ExpectAlert, Action: decision.Action, InputTokens: decision.InputTokens, OutputTokens: decision.OutputTokens, LatencyMS: time.Since(started).Milliseconds(), ToolCalls: len(decision.ToolCalls), StopReason: decision.StopReason}
 		result.Reason = decision.Reason
+		result.Model = decision.Model
 		result.ToolAudit = decision.ToolCalls
 		result.FormatRepairs = decision.Repairs
-		alerted := decision.Action == "alert" && err == nil
-		result.Passed = err == nil && alerted == sample.ExpectAlert
+		alerted := decision.Action == "alert" && decision.Confidence >= .72 && err == nil && !decision.FormatRejected && !reviewDecisionIncomplete(decision)
+		result.Passed = err == nil && !reviewDecisionIncomplete(decision) && !decision.FormatRejected && alerted == sample.ExpectAlert
+		result.BaselineAlert = keywordBaseline(sample)
+		result.BaselinePassed = result.BaselineAlert == sample.ExpectAlert
+		if result.BaselinePassed {
+			report.Baseline.Passed++
+		}
 		if err != nil {
 			result.Error = err.Error()
 			report.Errors++
@@ -149,11 +187,17 @@ func RunSignalEvalCases(ctx context.Context, reviewer UnexpectedEventReviewer, s
 		}
 		if sample.ExpectAlert {
 			positive++
+			if result.BaselineAlert {
+				baselineTP++
+			}
 			if alerted {
 				truePositive++
 			}
 		} else {
 			negative++
+			if result.BaselineAlert {
+				baselineFP++
+			}
 			if alerted {
 				falsePositive++
 			}
@@ -167,15 +211,21 @@ func RunSignalEvalCases(ctx context.Context, reviewer UnexpectedEventReviewer, s
 	if truePositive+falsePositive > 0 {
 		report.Precision = float64(truePositive) / float64(truePositive+falsePositive)
 	}
+	if baselineTP+baselineFP > 0 {
+		report.Baseline.Precision = float64(baselineTP) / float64(baselineTP+baselineFP)
+	}
 	if positive > 0 {
 		report.Recall = float64(truePositive) / float64(positive)
+		report.Baseline.Recall = float64(baselineTP) / float64(positive)
 	}
 	if negative > 0 {
 		report.FalsePositiveRate = float64(falsePositive) / float64(negative)
+		report.Baseline.FalsePositiveRate = float64(baselineFP) / float64(negative)
 	}
 	if len(latencies) > 0 {
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 		report.P95LatencyMS = latencies[(95*len(latencies)+99)/100-1]
 	}
+	report.Completed = len(report.Cases) == len(cases)
 	return report
 }

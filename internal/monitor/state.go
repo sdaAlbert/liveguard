@@ -24,7 +24,26 @@ func TransitionInvestigation(investigation *Investigation, next string) error {
 	}
 	if investigation.Status == InvestigationWaiting {
 		switch next {
-		case InvestigationConfirmed, InvestigationSuppressed, InvestigationNeedsHuman, InvestigationFailed:
+		case InvestigationConfirmed, InvestigationSuppressed, InvestigationNeedsHuman, InvestigationFailed, InvestigationWaitingUser:
+			investigation.Status = next
+			return nil
+		}
+	}
+	if investigation.Status == InvestigationWaitingUser && next == InvestigationReviewing {
+		investigation.Status = next
+		return nil
+	}
+	if investigation.Status == InvestigationWaitingUser && next == InvestigationSuppressed {
+		investigation.Status = next
+		return nil
+	}
+	if investigation.Status == InvestigationReviewing && next == InvestigationWaitingUser {
+		investigation.Status = next
+		return nil
+	}
+	if investigation.Status == InvestigationReviewing {
+		switch next {
+		case InvestigationConfirmed, InvestigationSuppressed, InvestigationNeedsHuman, InvestigationFailed, InvestigationWaiting:
 			investigation.Status = next
 			return nil
 		}

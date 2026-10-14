@@ -10,9 +10,7 @@ import (
 // Plan is the small, inspectable decision produced before a tool runs.
 // Keeping it explicit makes the Agent loop testable without requiring an LLM.
 type Plan struct {
-	Actions       []string
-	NeedsEvidence bool
-	Conclusion    string
+	Actions []string
 }
 
 type Planner interface {
@@ -62,12 +60,18 @@ func (r Runtime) Handle(run *Run, event SignalEvent, eventType string) {
 	index := waitingInvestigation(run, event.RoomID, eventType)
 	if index < 0 {
 		run.Investigations = append(run.Investigations, Investigation{
-			ID: domain.NewID("investigation"), RoomID: event.RoomID, RoomName: event.RoomName,
+			GoalVersion: run.GoalVersion,
+			ID:          domain.NewID("investigation"), RoomID: event.RoomID, RoomName: event.RoomName,
 			EventType: eventType, Status: InvestigationWaiting, CreatedAt: now, UpdatedAt: now,
 		})
 		index = len(run.Investigations) - 1
 	}
 	inv := &run.Investigations[index]
+	if eventType != "human_verification" && (run.Plan.AlertScope == "chat" || goalNeedsChatRegion(run.Goal)) {
+		inv.Status = InvestigationWaiting
+		inv.Conclusion = "聊天区目标需要模型看图确认；本地规则模式继续保存文字，不生成未经确认的提醒"
+		return
+	}
 	inv.Evidence = append(inv.Evidence, Evidence{EventID: event.ID, Source: string(event.Source), Text: event.Text, Confidence: event.Confidence, ObservedAt: event.ObservedAt})
 	inv.UpdatedAt = now
 
@@ -112,7 +116,8 @@ func (r Runtime) Handle(run *Run, event SignalEvent, eventType string) {
 	profile := profileForGoal(run.Goal)
 	r.executor.Execute(run, inv, "create_alert", event, now)
 	run.Alerts = append(run.Alerts, Alert{
-		ID: domain.NewID("alert"), RoomID: event.RoomID, RoomName: event.RoomName,
+		SignalToAlertMS: max(0, now.Sub(event.ObservedAt).Milliseconds()),
+		ID:              domain.NewID("alert"), RoomID: event.RoomID, RoomName: event.RoomName,
 		EventType: eventType, Priority: profile.priority, Summary: profile.conclusion,
 		Confidence: verification.Confidence, DedupeKey: event.RoomID + ":" + eventType,
 		Investigation: inv.ID, Evidence: append([]Evidence(nil), inv.Evidence...), CreatedAt: now,
@@ -141,7 +146,7 @@ func (deterministicPlanner) Plan(run *Run, event SignalEvent, eventType string, 
 			actions = append(actions, "reanalyze_evidence")
 		}
 	}
-	return Plan{Actions: actions, NeedsEvidence: !strong && !crossSource}
+	return Plan{Actions: actions}
 }
 
 type defaultToolExecutor struct{}

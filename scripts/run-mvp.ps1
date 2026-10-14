@@ -4,19 +4,11 @@ $OriginalMiniMaxAPIKey = $env:MINIMAX_API_KEY
 Push-Location $RepoRoot
 try {
     $env:GOCACHE = Join-Path $RepoRoot ".cache\go-build"
-    $env:LIVEGUARD_INFRA_MODE = "local"
+    if (-not $env:LIVEGUARD_INFRA_MODE) { $env:LIVEGUARD_INFRA_MODE = "local" }
     if (-not $env:LIVEGUARD_OTEL_ENDPOINT) { $env:LIVEGUARD_OTEL_ENDPOINT = "off" }
     if (-not $env:LIVEGUARD_MONITOR_LLM_MODE) { $env:LIVEGUARD_MONITOR_LLM_MODE = "auto" }
 
-    # Repair only known stale local proxy ports; preserve any other user proxy configuration.
-    foreach ($proxyName in @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")) {
-        $proxyValue = [Environment]::GetEnvironmentVariable($proxyName)
-        if ($proxyValue -match '^http://127\.0\.0\.1:(9|7890)/?$') {
-            [Environment]::SetEnvironmentVariable($proxyName, "http://127.0.0.1:7897")
-        }
-    }
-
-    if ($env:LIVEGUARD_MONITOR_PROVIDER -ne "openai") {
+    if (-not $env:LIVEGUARD_MONITOR_PROVIDER -or $env:LIVEGUARD_MONITOR_PROVIDER -eq "minimax") {
         $openClawPath = Join-Path $env:USERPROFILE ".openclaw\openclaw.json"
         $providerId = if ($env:LIVEGUARD_MINIMAX_PROVIDER_ID) { $env:LIVEGUARD_MINIMAX_PROVIDER_ID } else { "minimax-cn" }
         if ((-not $env:MINIMAX_API_KEY -or -not $env:LIVEGUARD_MONITOR_PROVIDER) -and (Test-Path -LiteralPath $openClawPath)) {
@@ -43,11 +35,21 @@ try {
 
     New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot ".cache") | Out-Null
     Write-Host "Starting LiveGuard MVP at http://$env:LIVEGUARD_ADDR"
-    Write-Host "This mode uses local memory; PostgreSQL is optional."
-    if ($env:LIVEGUARD_MONITOR_PROVIDER -eq "minimax") {
-        Write-Host "MiniMax $env:LIVEGUARD_MONITOR_MODEL plans each goal; review cadence is selected per monitor and clamped by server policy."
+    if ($env:LIVEGUARD_INFRA_MODE -eq "durable") {
+        $databaseLabel = if ($env:LIVEGUARD_DATABASE_URL) { $env:LIVEGUARD_DATABASE_URL } else { "postgres://liveguard@127.0.0.1:5433/liveguard" }
+        Write-Host "This mode uses PostgreSQL-backed run and observation history: $databaseLabel"
     } else {
-        Write-Host "Local goal planning is active; set LIVEGUARD_MONITOR_PROVIDER=minimax to enable M3 planning and proactive review."
+        $statePath = if ($env:LIVEGUARD_LOCAL_STATE_PATH) { $env:LIVEGUARD_LOCAL_STATE_PATH } else { "runtime/liveguard.json" }
+        Write-Host "This mode saves monitor history and Agent decisions locally: $statePath"
+    }
+    if ($env:LIVEGUARD_MONITOR_PROVIDER -eq "minimax" -and $env:MINIMAX_API_KEY) {
+        Write-Host "MiniMax $env:LIVEGUARD_MONITOR_MODEL is configured for goal planning and signal review."
+    } elseif ($env:LIVEGUARD_MONITOR_PROVIDER -eq "openai" -and $env:OPENAI_API_KEY) {
+        Write-Host "OpenAI is configured for goal planning and signal review using Chat Completions."
+    } elseif ($env:LIVEGUARD_MONITOR_PROVIDER -eq "deepseek" -and $env:DEEPSEEK_API_KEY) {
+        Write-Host "DeepSeek is configured for goal planning and signal review using Chat Completions."
+    } else {
+        Write-Host "Local rules are active. Add a model API in the Model settings window after startup."
     }
     Write-Host "Press Ctrl+C to stop."
     go run .\cmd\liveguard

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestMiniMaxRepairsNarrativeFinalWithAStructuredTool(t *testing.T) {
+func TestMiniMaxRepairsNarrativeFinalWithStructuredDecision(t *testing.T) {
 	turns := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		var input map[string]any
@@ -27,18 +27,21 @@ func TestMiniMaxRepairsNarrativeFinalWithAStructuredTool(t *testing.T) {
 		if len(messages) != 3 {
 			t.Errorf("format correction history not preserved: %d messages", len(messages))
 		}
-		_, _ = w.Write([]byte(`{"model":"fixture","content":[{"type":"tool_use","id":"finish","name":"finish_review","input":{"action":"ignore","category":"other","reason":"日常闲聊","confidence":0.95}}]}`))
+		if input["tool_choice"].(map[string]any)["type"] != "auto" {
+			t.Errorf("review must allow a structured final response: %#v", input["tool_choice"])
+		}
+		_, _ = w.Write([]byte(`{"model":"fixture","stop_reason":"end_turn","content":[{"type":"text","text":"{\"action\":\"ignore\",\"category\":\"other\",\"reason\":\"日常闲聊\",\"confidence\":0.95}"}]}`))
 	}))
 	defer server.Close()
 	r := MiniMaxUnexpectedEventReviewer{Model: "fixture", Endpoint: server.URL, Client: server.Client()}
 	decision, err := r.Review(context.Background(), UnexpectedEventInput{Goal: "重要消息提醒", RecentEvidence: []SignalEvent{{Text: "今天午饭吃了什么", Confidence: .9}}})
-	if err != nil || decision.Action != "ignore" || decision.Repairs != 1 || len(decision.ToolCalls) != 1 || decision.ToolCalls[0].Tool != "finish_review" {
-		t.Fatalf("format repair failed or invented tool calls: %#v %v", decision, err)
+	if err != nil || decision.Action != "ignore" || decision.Repairs != 1 || len(decision.ToolCalls) != 0 {
+		t.Fatalf("structured no-alert final response failed: %#v %v", decision, err)
 	}
 }
 
 func TestMiniMaxPreservesCompleteProviderBlocksInToolHistory(t *testing.T) {
-	raw := []byte(`[{"type":"thinking","thinking":"fixture reasoning","signature":"provider-field"},{"type":"tool_use","id":"read","name":"read_recent_evidence","input":{}}]`)
+	raw := []byte(`[{"type":"thinking","thinking":"fixture reasoning","signature":"provider-field"},{"type":"tool_use","id":"read","name":"search_observations","input":{"scope":"recent"}}]`)
 	var blocks []miniMaxContentBlock
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		t.Fatal(err)
@@ -55,11 +58,11 @@ func TestMiniMaxPreservesCompleteProviderBlocksInToolHistory(t *testing.T) {
 	}
 }
 
-func TestFinishReviewCannotBeUsedToCreateAnAlert(t *testing.T) {
-	block := miniMaxContentBlock{ID: "finish", Name: "finish_review", Input: json.RawMessage(`{"action":"alert","category":"custom_goal","reason":"bypass alert checks","confidence":0.99}`)}
+func TestRemovedFinishReviewToolIsRejected(t *testing.T) {
+	block := miniMaxContentBlock{ID: "finish", Name: "finish_review", Input: json.RawMessage(`{"action":"ignore"}`)}
 	result, _, terminal := runMiniMaxTool(block, UnexpectedEventInput{}, nil, &miniMaxReviewState{}, 0)
 	if !result.IsError || terminal {
-		t.Fatal("finish_review bypassed the alert policy")
+		t.Fatal("removed finish_review tool was still accepted")
 	}
 }
 
@@ -74,9 +77,10 @@ func TestVisualGoalCannotAlertWithoutAnAvailableInspectedFrame(t *testing.T) {
 }
 
 func TestChatMatchNeedsVisibleOCREvidence(t *testing.T) {
-	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{Source: SignalOCR, Text: "观众：你们最喜欢哪款？", Confidence: .9}}}
-	state := miniMaxReviewState{readEvidenceTurn: 0, searchAlertsTurn: 0, searchedCategory: "chat_match", frameInspected: true}
-	valid := miniMaxContentBlock{ID: "create", Name: "create_alert", Input: json.RawMessage(`{"category":"chat_match","summary":"聊天区出现关注的商品型号","reason":"可见评论提到用户关注的型号","confidence":0.91,"visual_finding":"该内容位于画面右侧的聊天区域"}`)}
+	now := time.Now().UTC()
+	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{ID: "ocr-1", RoomID: "room-1", Source: SignalOCR, Text: "观众：你们最喜欢哪款？", Confidence: .9, ObservedAt: now, FrameArchiveID: "frame-archive"}}}
+	state := miniMaxReviewState{readEvidenceTurn: 0, searchAlertsTurn: 0, searchedCategory: "chat_match", frameInspected: true, frameObservedAt: now, frameArchiveID: "frame-archive"}
+	valid := miniMaxContentBlock{ID: "create", Name: "create_alert", Input: json.RawMessage(`{"category":"chat_match","summary":"聊天区出现关注的商品型号","reason":"可见评论提到用户关注的型号","confidence":0.91,"visual_finding":"该内容位于画面右侧的聊天区域","evidence_ids":["ocr-1"],"evidence_basis":"live"}`)}
 	result, decision, terminal := (&MiniMaxUnexpectedEventReviewer{}).executeTool(context.Background(), valid, input, nil, &state, 1)
 	if result.IsError || !terminal || decision.Category != "chat_match" {
 		t.Fatalf("valid chat match alert was rejected: result=%#v decision=%#v terminal=%v", result, decision, terminal)

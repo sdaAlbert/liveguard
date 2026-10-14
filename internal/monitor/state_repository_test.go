@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ import (
 )
 
 func TestLifecycleTransitionTable(t *testing.T) {
-	valid := [][2]RunStatus{{RunRunning, RunStopped}, {RunRunning, RunFailed}, {RunRunning, RunCompleted}, {RunStopped, RunStopped}}
+	valid := [][2]RunStatus{{RunRunning, RunPaused}, {RunRunning, RunStopped}, {RunRunning, RunFailed}, {RunRunning, RunCompleted}, {RunPaused, RunRunning}, {RunPaused, RunStopped}, {RunStopped, RunStopped}}
 	for _, pair := range valid {
 		if err := validateRunTransition(pair[0], pair[1]); err != nil {
 			t.Errorf("%s -> %s: %v", pair[0], pair[1], err)
@@ -62,7 +63,7 @@ func TestSignalIdempotencyValidationAndArrivalSequence(t *testing.T) {
 	if current.Rooms[0].Health != SourceHealthy {
 		t.Fatalf("valid signal not reflected in health: %#v", current.Rooms[0])
 	}
-	invalid := []SignalEvent{{ID: "x", RoomID: run.Rooms[0].ID, Source: "camera", Text: "hi"}, {ID: "y", RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "hi", Confidence: 1.1}, {ID: "nan", RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "hi", Confidence: math.NaN()}, {ID: "z", RoomID: "elsewhere", Source: SignalASR, Text: "hi"}, {ID: "t", RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "old", ObservedAt: time.Now().Add(-maxSignalAge - time.Second)}}
+	invalid := []SignalEvent{{ID: "x", RoomID: run.Rooms[0].ID, Source: "camera", Text: "hi"}, {ID: "y", RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "hi", Confidence: 1.1}, {ID: "nan", RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "hi", Confidence: math.NaN()}, {ID: "z", RoomID: "elsewhere", Source: SignalASR, Text: "hi"}, {ID: "t", RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "future", ObservedAt: time.Now().Add(maxFutureSignalSkew + time.Minute)}}
 	for _, item := range invalid {
 		if err := s.Ingest(context.Background(), run.ID, item); err == nil {
 			t.Errorf("accepted invalid signal %#v", item)
@@ -72,6 +73,41 @@ func TestSignalIdempotencyValidationAndArrivalSequence(t *testing.T) {
 
 func TestMemoryRepositoryContractAndConcurrentUpdates(t *testing.T) {
 	runRepositoryContract(t, NewMemoryRepository())
+}
+
+func TestFileRepositoryPersistsRunInvestigationAndObservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "liveguard.json")
+	repo, err := OpenFileRepository(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &Run{ID: domain.NewID("persisted"), Status: RunRunning, Version: 1, StartedAt: time.Now().UTC(), Rooms: []Room{}, Events: []SignalEvent{}}
+	if err := repo.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.Update(context.Background(), run.ID, func(current *Run) error {
+		current.Investigations = append(current.Investigations, Investigation{ID: "investigation-1", Status: InvestigationConfirmed, Conclusion: "识别到主播宣布活动开始", Steps: []AgentStep{{Tool: "search_observations", Outcome: "找到一条匹配字幕"}}})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RecordObservation(context.Background(), run.ID, SignalEvent{ID: "observation-1", Source: SignalOCR, Text: "活动现在开始", ObservedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileRepository(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.Get(context.Background(), run.ID)
+	if err != nil || len(got.Investigations) != 1 || got.Investigations[0].Conclusion != "识别到主播宣布活动开始" || len(got.Investigations[0].Steps) != 1 {
+		t.Fatalf("investigation not restored: %#v %v", got, err)
+	}
+	page, err := reopened.SearchObservations(context.Background(), run.ID, ObservationQuery{Limit: 12})
+	if err != nil || len(page.Events) != 1 || page.Events[0].Text != "活动现在开始" {
+		t.Fatalf("observation not restored: %#v %v", page, err)
+	}
 }
 
 func TestPostgresRepositoryContractWhenConfigured(t *testing.T) {
@@ -87,6 +123,69 @@ func TestPostgresRepositoryContractWhenConfigured(t *testing.T) {
 	runRepositoryContract(t, repo)
 }
 
+func TestPostgresObservationAndPausedRunPersistAcrossReconnect(t *testing.T) {
+	url := os.Getenv("LIVEGUARD_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("set LIVEGUARD_TEST_DATABASE_URL to run isolated PostgreSQL persistence check")
+	}
+	ctx := context.Background()
+	repo, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := domain.NewID("persistence")
+	t.Cleanup(func() {
+		if reopened, openErr := OpenPostgres(context.Background(), url); openErr == nil {
+			_, _ = reopened.db.Exec(`DELETE FROM live_monitor_runs WHERE id=$1`, id)
+			_ = reopened.Close()
+		}
+	})
+	now := time.Now().UTC()
+	run := &Run{ID: id, Status: RunRunning, StartedAt: now, UpdatedAt: now, Rooms: []Room{}}
+	if err := repo.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	archiveDir := t.TempDir()
+	sourceFrame := filepath.Join(t.TempDir(), "capture.png")
+	if err := os.WriteFile(sourceFrame, []byte("test screenshot bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archiver := NewService(repo, nil)
+	archiver.SetFrameArchiveDir(archiveDir)
+	archiveID, err := archiver.archiveFrame(id, "observation-persisted", sourceFrame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := SignalEvent{ID: "observation-persisted", Source: SignalOCR, Text: "persisted observation contract", Confidence: .9, ObservedAt: now, FrameArchiveID: archiveID}
+	if _, err := repo.Update(ctx, id, func(current *Run) error {
+		current.Events = append(current.Events, observation)
+		current.Status = RunPaused
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restored, err := reopened.Get(ctx, id)
+	if err != nil || restored.Status != RunPaused {
+		t.Fatalf("paused run did not survive reconnect: status=%v err=%v", restored.Status, err)
+	}
+	observations, err := reopened.SearchObservations(ctx, id, ObservationQuery{Text: "persisted observation contract", Limit: 3})
+	if err != nil || len(observations.Events) != 1 || observations.Events[0].FrameArchiveID != observation.FrameArchiveID {
+		t.Fatalf("observation or archive reference did not survive reconnect: %#v err=%v", observations, err)
+	}
+	archiver.SetFrameArchiveDir(archiveDir)
+	if _, err := archiver.archivedFramePath(id, observations.Events[0].FrameArchiveID); err != nil {
+		t.Fatalf("archived screenshot did not remain readable: %v", err)
+	}
+}
+
 func TestRecoverInterruptedStopsPersistedMonitors(t *testing.T) {
 	repo := NewMemoryRepository()
 	now := time.Now().UTC()
@@ -98,8 +197,8 @@ func TestRecoverInterruptedStopsPersistedMonitors(t *testing.T) {
 		t.Fatal(err)
 	}
 	recovered, err := repo.Get(context.Background(), run.ID)
-	if err != nil || recovered.Status != RunStopped || recovered.CompletedAt == nil || recovered.Rooms[0].Status != "stopped" {
-		t.Fatalf("persisted active monitor was not stopped on recovery: %#v %v", recovered, err)
+	if err != nil || recovered.Status != RunPaused || recovered.CompletedAt != nil || recovered.Rooms[0].Status != "paused" || recovered.StopReason != "process_interrupted" {
+		t.Fatalf("persisted active monitor was not paused for manual continuation: %#v %v", recovered, err)
 	}
 }
 

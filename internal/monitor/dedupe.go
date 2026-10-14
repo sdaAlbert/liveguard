@@ -27,6 +27,11 @@ func hasRecentSemanticAlert(alerts []Alert, event SignalEvent, _ string, summary
 		now = time.Now().UTC()
 	}
 	textKey, summaryKey := normalizedEventText(event.Text), normalizedEventText(summary)
+	// A periodic tick describes the sampling operation, not scene content.
+	// Equal tick text must never suppress two different visual events.
+	if event.Source == SignalFrame {
+		textKey = ""
+	}
 	for _, alert := range alerts {
 		age := now.Sub(alert.CreatedAt)
 		if alert.RoomID != event.RoomID || age < 0 || age > alertDedupeWindow {
@@ -36,6 +41,9 @@ func hasRecentSemanticAlert(alerts []Alert, event SignalEvent, _ string, summary
 			return true
 		}
 		for _, evidence := range alert.Evidence {
+			if evidence.Source == string(SignalFrame) {
+				continue
+			}
 			if textKey != "" && textKey == normalizedEventText(evidence.Text) {
 				return true
 			}

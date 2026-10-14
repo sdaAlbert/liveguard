@@ -6,6 +6,7 @@ type RunStatus string
 
 const (
 	RunRunning   RunStatus = "running"
+	RunPaused    RunStatus = "paused"
 	RunCompleted RunStatus = "completed"
 	RunStopped   RunStatus = "stopped"
 	RunFailed    RunStatus = "failed"
@@ -25,8 +26,11 @@ const (
 type SignalSource string
 
 const (
-	SignalOCR SignalSource = "ocr"
-	SignalASR SignalSource = "asr"
+	SignalOCR    SignalSource = "ocr"
+	SignalASR    SignalSource = "asr"
+	SignalVision SignalSource = "vision"
+	// Frame checks are created only by browser capture, never by HTTP uploads.
+	SignalFrame SignalSource = "frame"
 )
 
 type Room struct {
@@ -42,18 +46,35 @@ type Room struct {
 }
 
 type SignalEvent struct {
+	GoalVersion          uint64       `json:"goal_version,omitempty"`
+	ParentEventID        string       `json:"parent_event_id,omitempty"`
 	ID                   string       `json:"id"`
 	RoomID               string       `json:"room_id"`
 	RoomName             string       `json:"room_name"`
 	Source               SignalSource `json:"source"`
 	Text                 string       `json:"text"`
 	Confidence           float64      `json:"confidence"`
+	TextRegions          []TextRegion `json:"text_regions,omitempty"`
 	ObservedAt           time.Time    `json:"observed_at"`
+	ValidUntil           time.Time    `json:"valid_until,omitempty"`
 	ReceivedAt           time.Time    `json:"received_at,omitempty"`
 	Sequence             uint64       `json:"sequence,omitempty"`
 	PerceptionDurationMS int64        `json:"perception_duration_ms,omitempty"`
 	CaptureDurationMS    int64        `json:"capture_duration_ms,omitempty"`
 	FramePath            string       `json:"-"`
+	FrameArchiveID       string       `json:"frame_archive_id,omitempty"`
+}
+
+// TextRegion preserves OCR line geometry and optional capture-area context for
+// downstream review. Area is a focus hint, not proof that text belongs to chat.
+type TextRegion struct {
+	Area       string  `json:"area,omitempty"`
+	Text       string  `json:"text"`
+	X          int     `json:"x"`
+	Y          int     `json:"y"`
+	Width      int     `json:"width"`
+	Height     int     `json:"height"`
+	Confidence float64 `json:"confidence"`
 }
 
 type EventReceipt struct {
@@ -63,11 +84,16 @@ type EventReceipt struct {
 }
 
 type Evidence struct {
-	EventID    string    `json:"event_id"`
-	Source     string    `json:"source"`
-	Text       string    `json:"text"`
-	Confidence float64   `json:"confidence"`
-	ObservedAt time.Time `json:"observed_at"`
+	ValidUntil     time.Time    `json:"valid_until,omitempty"`
+	RoomID         string       `json:"room_id,omitempty"`
+	GoalVersion    uint64       `json:"goal_version,omitempty"`
+	FrameArchiveID string       `json:"frame_archive_id,omitempty"`
+	TextRegions    []TextRegion `json:"text_regions,omitempty"`
+	EventID        string       `json:"event_id"`
+	Source         string       `json:"source"`
+	Text           string       `json:"text"`
+	Confidence     float64      `json:"confidence"`
+	ObservedAt     time.Time    `json:"observed_at"`
 }
 
 type AgentStep struct {
@@ -82,63 +108,84 @@ type AgentStep struct {
 }
 
 type ReviewMetrics struct {
-	Model         string `json:"model,omitempty"`
-	InputTokens   int64  `json:"input_tokens"`
-	OutputTokens  int64  `json:"output_tokens"`
-	LatencyMS     int64  `json:"latency_ms"`
-	Turns         int    `json:"turns"`
-	StopReason    string `json:"stop_reason,omitempty"`
-	FormatRepairs int    `json:"format_repairs,omitempty"`
+	TransportRetries int               `json:"transport_retries,omitempty"`
+	SamplingProposal *SamplingProposal `json:"sampling_proposal,omitempty"`
+	SamplingPolicy   SamplingState     `json:"sampling_policy"`
+	Model            string            `json:"model,omitempty"`
+	InputTokens      int64             `json:"input_tokens"`
+	OutputTokens     int64             `json:"output_tokens"`
+	LatencyMS        int64             `json:"latency_ms"`
+	Turns            int               `json:"turns"`
+	StopReason       string            `json:"stop_reason,omitempty"`
+	FormatRepairs    int               `json:"format_repairs,omitempty"`
 }
 
 type Investigation struct {
-	ID         string         `json:"id"`
-	RoomID     string         `json:"room_id"`
-	RoomName   string         `json:"room_name"`
-	EventType  string         `json:"event_type"`
-	Status     string         `json:"status"`
-	Conclusion string         `json:"conclusion,omitempty"`
-	Evidence   []Evidence     `json:"evidence,omitempty"`
-	Steps      []AgentStep    `json:"steps"`
-	CreatedAt  time.Time      `json:"created_at"`
-	UpdatedAt  time.Time      `json:"updated_at"`
-	Review     *ReviewMetrics `json:"review,omitempty"`
+	GoalVersion  uint64         `json:"goal_version"`
+	UserQuestion string         `json:"user_question,omitempty"`
+	UserOptions  []string       `json:"user_options,omitempty"`
+	UserAnswer   string         `json:"user_answer,omitempty"`
+	ID           string         `json:"id"`
+	RoomID       string         `json:"room_id"`
+	RoomName     string         `json:"room_name"`
+	EventType    string         `json:"event_type"`
+	Status       string         `json:"status"`
+	Conclusion   string         `json:"conclusion,omitempty"`
+	Reason       string         `json:"reason,omitempty"`
+	Evidence     []Evidence     `json:"evidence,omitempty"`
+	Steps        []AgentStep    `json:"steps"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+	Review       *ReviewMetrics `json:"review,omitempty"`
 }
 
 type Alert struct {
-	ID            string     `json:"id"`
-	RoomID        string     `json:"room_id"`
-	RoomName      string     `json:"room_name"`
-	EventType     string     `json:"event_type"`
-	Priority      string     `json:"priority"`
-	Summary       string     `json:"summary"`
-	Confidence    float64    `json:"confidence"`
-	DedupeKey     string     `json:"dedupe_key"`
-	Investigation string     `json:"investigation_id"`
-	Evidence      []Evidence `json:"evidence"`
-	CreatedAt     time.Time  `json:"created_at"`
+	EvidenceBasis   string     `json:"evidence_basis,omitempty"`
+	SignalToAlertMS int64      `json:"signal_to_alert_ms"`
+	ID              string     `json:"id"`
+	RoomID          string     `json:"room_id"`
+	RoomName        string     `json:"room_name"`
+	EventType       string     `json:"event_type"`
+	Priority        string     `json:"priority"`
+	Summary         string     `json:"summary"`
+	Confidence      float64    `json:"confidence"`
+	DedupeKey       string     `json:"dedupe_key"`
+	Investigation   string     `json:"investigation_id"`
+	Evidence        []Evidence `json:"evidence"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 // MonitoringPlan is the inspectable execution policy derived from the user's
 // natural-language goal. Runtime limits are normalized and enforced server-side.
 type MonitoringPlan struct {
-	Summary                string   `json:"summary"`
-	CaptureIntervalSeconds int      `json:"capture_interval_seconds"`
-	ReviewIntervalSeconds  int      `json:"review_interval_seconds"`
-	UseOCR                 bool     `json:"use_ocr"`
-	RecommendASR           bool     `json:"recommend_asr"`
-	VisionPolicy           string   `json:"vision_policy"`
-	Tools                  []string `json:"tools"`
-	UserConsent            []string `json:"user_consent,omitempty"`
-	Planner                string   `json:"planner"`
+	ModelCapabilities      *ModelCapabilities `json:"model_capabilities,omitempty"`
+	CapabilityWarning      string             `json:"capability_warning,omitempty"`
+	Summary                string             `json:"summary"`
+	CaptureIntervalSeconds int                `json:"capture_interval_seconds"`
+	ReviewIntervalSeconds  int                `json:"review_interval_seconds"`
+	UseOCR                 bool               `json:"use_ocr"`
+	RecommendASR           bool               `json:"recommend_asr"`
+	VisionPolicy           string             `json:"vision_policy"`
+	AlertScope             string             `json:"alert_scope"`
+	Tools                  []string           `json:"tools"`
+	UserConsent            []string           `json:"user_consent,omitempty"`
+	Planner                string             `json:"planner"`
+	Signals                []string           `json:"signals"`
+	FormatRepairs          int                `json:"format_repairs,omitempty"`
 }
 
 type Run struct {
+	StopReason              string          `json:"stop_reason,omitempty"`
+	LastError               string          `json:"last_error,omitempty"`
+	Pending                 *PendingStatus  `json:"pending,omitempty"`
 	ID                      string          `json:"id"`
 	Name                    string          `json:"name"`
 	TargetURL               string          `json:"target_url"`
 	Goal                    string          `json:"goal"`
+	GoalVersion             uint64          `json:"goal_version"`
+	GoalUpdatedAt           time.Time       `json:"goal_updated_at"`
 	Plan                    MonitoringPlan  `json:"plan"`
+	Sampling                SamplingState   `json:"sampling"`
 	SourceMode              string          `json:"source_mode"`
 	Status                  RunStatus       `json:"status"`
 	Rooms                   []Room          `json:"rooms"`
@@ -156,6 +203,8 @@ type Run struct {
 }
 
 type Summary struct {
+	StopReason     string    `json:"stop_reason,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
 	TargetURL      string    `json:"target_url"`
@@ -177,6 +226,7 @@ type Summary struct {
 
 func (r *Run) Summary() Summary {
 	summary := Summary{ID: r.ID, Name: r.Name, TargetURL: r.TargetURL, Goal: r.Goal, SourceMode: r.SourceMode, Status: r.Status, Rooms: len(r.Rooms), Events: len(r.Events), Candidates: len(r.Investigations), Alerts: len(r.Alerts), StartedAt: r.StartedAt, UpdatedAt: r.UpdatedAt}
+	summary.StopReason, summary.LastError = r.StopReason, r.LastError
 	if len(r.Events) > 0 {
 		summary.LatestSignal = r.Events[len(r.Events)-1].Text
 	}
@@ -188,7 +238,7 @@ func (r *Run) Summary() Summary {
 		switch investigation.Status {
 		case "suppressed":
 			summary.Suppressed++
-		case "needs_human":
+		case "needs_human", InvestigationWaitingUser:
 			summary.NeedsHuman++
 		}
 	}

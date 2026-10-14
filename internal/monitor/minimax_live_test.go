@@ -63,9 +63,49 @@ func TestMiniMaxLiveGoalPlanning(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("MiniMax-M3 live monitoring plan: summary=%q capture_seconds=%d review_seconds=%d asr=%t vision=%s tools=%v", plan.Summary, plan.CaptureIntervalSeconds, plan.ReviewIntervalSeconds, plan.RecommendASR, plan.VisionPolicy, plan.Tools)
-	if plan.Planner != "MiniMax-M3" || !plan.RecommendASR || !containsString(plan.Tools, "read_transcript_window") || plan.VisionPolicy == "goal_required" {
+	if plan.Planner != "MiniMax-M3" || !plan.RecommendASR || !containsString(plan.Tools, "search_observations") || plan.VisionPolicy == "goal_required" {
 		t.Fatalf("M3 did not plan spoken-content monitoring from the user's goal: %#v", plan)
 	}
+}
+
+func TestMiniMaxLiveVisualPlan(t *testing.T) {
+	planner := MiniMaxGoalPlanner{APIKey: strings.TrimSpace(os.Getenv("MINIMAX_API_KEY")), Model: "MiniMax-M3", Endpoint: os.Getenv("LIVEGUARD_MONITOR_ENDPOINT")}
+	if planner.APIKey == "" {
+		t.Fatal("MINIMAX_API_KEY is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	plan, err := planner.Plan(ctx, "钓鱼直播里，看到鱼被拉出水面就提醒我")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !periodicVision(plan) {
+		t.Fatalf("visual goal lacks independent frame sampling: %+v", plan)
+	}
+	t.Logf("visual plan: signals=%v capture=%ds review=%ds", plan.Signals, plan.CaptureIntervalSeconds, plan.ReviewIntervalSeconds)
+}
+
+func TestMiniMaxLivePeriodicFrame(t *testing.T) {
+	key := strings.TrimSpace(os.Getenv("MINIMAX_API_KEY"))
+	if key == "" {
+		t.Fatal("MINIMAX_API_KEY is required")
+	}
+	path := filepath.Join(t.TempDir(), "synthetic-red-bottle.png")
+	if err := writeRedProductImage(path); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	goal := "画面中出现红色瓶子时提醒我"
+	plan := normalizeMonitoringPlan(defaultGoalPlan(goal, "test"), goal)
+	r := &MiniMaxUnexpectedEventReviewer{APIKey: key, Model: "MiniMax-M3", Endpoint: os.Getenv("LIVEGUARD_MONITOR_ENDPOINT")}
+	d, err := r.Review(context.Background(), UnexpectedEventInput{Goal: goal, Plan: plan, Sampling: initialSampling(plan, now), FrameCheck: true, TriggerFrame: path, TriggerFrameObservedAt: now, RecentEvidence: []SignalEvent{{ID: "frame-tick", RoomID: "synthetic", Source: SignalFrame, Text: "定时画面检查，没有新增 OCR 文字", ObservedAt: now}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Action != "alert" || !hasReviewTool(d.ToolCalls, "inspect_live_frame") || d.VisualFinding == "" || reviewDecisionIncomplete(d) {
+		t.Fatalf("synthetic picture did not produce verified alert: %+v", d)
+	}
+	t.Logf("synthetic image only: action=%s vision=%q sampling=%+v tokens=%d/%d latency=%dms", d.Action, d.VisualFinding, d.Sampling, d.InputTokens, d.OutputTokens, d.LatencyMS)
 }
 
 func TestMiniMaxLiveASR(t *testing.T) {
