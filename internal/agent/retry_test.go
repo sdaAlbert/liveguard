@@ -75,24 +75,30 @@ func TestModelRequestCancellationDuringBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var calls atomic.Int32
-	first := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backoffStarted := make(chan struct{})
+	client := &http.Client{Transport: retryTestRoundTripper(func(r *http.Request) (*http.Response, error) {
 		calls.Add(1)
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(429)
-		close(first)
-	}))
-	defer server.Close()
-	req, _ := http.NewRequestWithContext(ctx, "POST", server.URL, strings.NewReader("body"))
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"1"}},
+			Body:       retryTestBody{closed: backoffStarted},
+			Request:    r,
+		}, nil
+	})}
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://provider.example/v1/messages", strings.NewReader("body"))
 	done := make(chan error, 1)
 	go func() {
-		res, _, err := doModelRequest(server.Client(), req, time.Millisecond)
+		res, _, err := doModelRequest(client, req, time.Millisecond)
 		if res != nil {
 			res.Body.Close()
 		}
 		done <- err
 	}()
-	<-first
+	select {
+	case <-backoffStarted:
+	case <-time.After(time.Second):
+		t.Fatal("retry response was not closed before backoff")
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -105,4 +111,16 @@ func TestModelRequestCancellationDuringBackoff(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatal("request replayed after cancellation")
 	}
+}
+
+type retryTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f retryTestRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type retryTestBody struct{ closed chan struct{} }
+
+func (b retryTestBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (b retryTestBody) Close() error {
+	close(b.closed)
+	return nil
 }
