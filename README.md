@@ -1,74 +1,96 @@
 # LiveGuard
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/sdaAlbert/liveguard/actions/workflows/ci.yml/badge.svg)](https://github.com/sdaAlbert/liveguard/actions/workflows/ci.yml)
 
-LiveGuard 是一个本地运行的直播监控 Agent。输入直播地址和关注目标，它会持续采集可见画面中的文字，并在你授权后转写口播；Agent 结合当前信号与历史观测判断是否需要提醒。提醒会保存在本地监控室，并附带证据和调查记录。
+LiveGuard is a locally run livestream monitoring agent. Add a livestream URL and describe what you want to watch for. LiveGuard collects visible on-screen text, can transcribe audio that you explicitly share, and uses an agent to review incoming signals together with recorded observations. Alerts stay in the local monitoring room with their evidence and investigation history.
 
-## 能做什么
+The project works with livestream pages from Douyin, Bilibili, Kuaishou, and similar platforms through the same browser capture, OCR, and agent workflow. It does not call platform-private APIs. Bilibili is the main platform used for development and multi-room testing. Platform login, anti-abuse controls, and concurrent-viewing limits still apply; LiveGuard does not bypass them.
 
-- 使用专用 Chrome 会话截图，通过本地 OCR 采集直播画面文字。
-- 可选地处理用户主动分享的直播音频；当前 ASR 接入 MiniMax。
-- 以本地网页查看监控、证据、调查过程和提醒；可选 PostgreSQL 持久化。
-- 监控卡片可暂停/继续；持久化模式重启后，中断的运行会转为已暂停，用户可继续采集并保留原流水。
+## What it does
 
-## 架构与行为
+- Captures a dedicated Chrome session and uses local OCR to read visible text from the livestream page.
+- Optionally transcribes audio that you explicitly share from the browser; the current ASR integration uses MiniMax.
+- Provides a local web UI for monitors, evidence, investigation steps, and alerts. Monitor state and the observation ledger are stored in local JSON files.
+- Lets you pause and resume monitors. In persistent mode, monitors that were running when the process stopped are restored as paused, with their saved history intact.
 
-一次监控从用户提供的直播地址和关注目标开始。系统将目标整理为采集计划，然后持续接收截图 OCR、用户授权的口播转写，以及按计划产生的画面检查信号。
+## Screenshots from a running instance
+
+These screenshots show the local UI while LiveGuard is running. The monitoring room summarizes several livestream tasks; a monitor detail page shows recent judgments, evidence, and the agent's investigation state. You can also add a clarification while an investigation is in progress.
+
+![LiveGuard monitoring room with multiple active monitors](docs/images/monitor-room.png)
+
+The monitoring room uses status indicators for running monitors, new alerts, and items that need confirmation or attention. Each card shows the livestream, monitoring goal, and latest agent status. The page also summarizes new alerts and pending work. In this snapshot, several monitors are active while some signals are waiting to be reviewed.
+
+![LiveGuard monitor detail page showing evidence and agent review](docs/images/investigation-detail.png)
+
+The detail page shows a product-launch monitor. The agent first reports that OCR has not found a clear launch announcement and that the visible price is uncertain. After the user adds a budget, the agent starts reviewing the evidence again. The page shows the monitoring goal, latest judgment, evidence source, and whether the current frame was inspected. The platform status at the top also says login or verification is required, illustrating that capture health and investigation progress are separate states.
+
+Each screenshot captures one moment in an asynchronous workflow. It does not mean that every signal produces an alert, and it is not an accuracy or end-to-end latency benchmark. For queue behavior, evidence rules, and evaluation limits, see the [architecture](docs/ARCHITECTURE.md) and [evaluation](docs/EVALUATION.md) documents (currently in Chinese).
+
+## Architecture and behavior
+
+A monitor starts with a livestream URL and a monitoring goal. LiveGuard turns the goal into a capture plan, then receives OCR signals, audio transcripts that the user has authorized, and scheduled frame checks.
 
 ```mermaid
 flowchart LR
-    U[直播地址与关注目标] --> P[目标计划]
-    P --> C[专用 Chrome 截图]
-    C --> O[本地 OCR]
-    A[用户授权的音频] --> S[ASR 转写]
-    O --> Q[观测记录与有界队列]
+    U[Livestream URL and goal] --> P[Monitoring plan]
+    P --> C[Dedicated Chrome capture]
+    C --> O[Local OCR]
+    A[User-authorized audio] --> S[ASR transcription]
+    O --> Q[Observation ledger and bounded queue]
     S --> Q
-    Q --> R[Agent 调查]
-    R --> H[检索历史观测与提醒]
-    R --> V[按需检查截图]
+    Q --> R[Agent investigation]
+    R --> H[Search observations and recent alerts]
+    R --> V[Inspect a frame when needed]
     H --> R
     V --> R
-    R --> G[Go 校验并保存提醒]
-    G --> UI[本地监控室]
+    R --> G[Go validates and saves an alert]
+    G --> UI[Local monitoring room]
 ```
 
-Agent 每次处理一条待调查信号，可以搜索已记录的文字观测、查看近期提醒，并在需要时检查截图。提醒由服务端校验证据引用、重复项、目标版本和监控状态后写入；模型不能直接改监控状态或发送外部消息。调查有轮数、工具调用数和执行时间限制，细节见[架构文档](docs/ARCHITECTURE.md)。
+For each investigation, the agent can search recorded text observations, check recent alerts, and inspect a screenshot when needed. The Go service validates evidence references, duplicates, the current goal version, and monitor state before it saves an alert. The model cannot directly change monitor state or send messages outside the app. Investigations have limits on turns, tool calls, and execution time; see the [architecture guide](docs/ARCHITECTURE.md).
 
-监控会话可以持续运行，但采集只覆盖实际观察到的画面和音频；采样间隔、页面可见区域和 OCR 质量都会影响信号覆盖。发生登录验证、输入异常或模型额度耗尽时，系统会显示相应状态。完整运行边界见[运行文档](docs/OPERATIONS.md)。
+LiveGuard supports up to 8 active monitors and up to 4 concurrent agent investigations across the process. Investigations for the same monitor run one at a time. OCR capture and model review are scheduled independently: capture starts with a 1-second interval and adjusts to the machine's screenshot and OCR speed. While a model is busy, pending review triggers can be coalesced while recognized text remains searchable. Temporary capture failures use backoff and retry.
 
-## 从哪里开始读
+Monitoring can run continuously, but LiveGuard only analyzes signals it actually captures. Sampling interval, visible page area, and OCR quality affect coverage. The app reports login or verification requirements, persistent input failures, and model quota exhaustion. The limit of 8 active monitors is a scheduling capacity, not a promise that every computer can OCR 8 streams every second or call 8 models at once. See the [evaluation notes](docs/EVALUATION.md) and [operational limits](docs/OPERATIONS.md) for measurement conditions.
 
-如果你第一次看 LiveGuard，建议先读[项目导览](docs/PROJECT-GUIDE.md)。它会从文件夹职责讲起，再按“网页创建任务 → 采集信号 → 排队调查 → 校验并保存提醒”的顺序解释核心代码、状态、异步处理和错误边界。
+## Where to start reading
+
+If you are new to the project, start with the [project guide](docs/PROJECT-GUIDE.md). It explains the folders and follows a request from “create a monitor” through “capture a signal,” “queue an investigation,” and “validate and save an alert.” The detailed project documents are currently in Chinese.
 
 ```text
-cmd/liveguard       程序入口与依赖装配
-internal/web        HTTP 接口、SSE 和本地网页
-internal/monitor    监控生命周期、信号队列、证据、调查和存储
-internal/agent      有界工具循环、请求重试和熔断
-internal/browser    专用 Chrome 会话与截图
-cmd/monitor-eval    固定文字集模型评测
-cmd/monitor-load    合成信号负载测量
+cmd/liveguard       Application entry point and dependency wiring
+internal/web        HTTP handlers, SSE updates, and local web UI
+internal/monitor    Monitor lifecycle, signal queues, evidence, reviews, and storage
+internal/agent      Bounded tool loop, request retries, and circuit breaker
+internal/browser    Dedicated Chrome session and screenshot capture
+cmd/monitor-eval    Fixed text-set model evaluation
+cmd/monitor-load    Synthetic signal load measurement
 ```
 
-测试覆盖状态迁移、异步队列、幂等、超时/取消、工具限制和 HTTP 流程。仓库也有文字模型评测与合成负载程序；现有负载程序走同步 `Ingest` 和 mock 模型，尚不能证明真实采集或异步队列的端到端吞吐。评测结果的适用范围和建议补测项见[评测文档](docs/EVALUATION.md)。
+Automated tests cover state transitions, asynchronous queues, idempotency, timeouts and cancellation, tool limits, and HTTP flows. The repository also includes text evaluation and synthetic load programs. Their results have specific limits: mock load does not establish real capture or end-to-end livestream throughput. See the [evaluation guide](docs/EVALUATION.md) for details.
 
-## 模型
+## Models
 
-选择模型提供方、模型名称和 API Key。图片理解由所选模型能力决定；自定义模型需支持工具调用，并在支持图片输入时启用图片理解。
+Choose a model provider, model name, and API key in the app. Image understanding depends on the configured model's declared capabilities. Custom models must support tool calling; enable image understanding only when the model accepts image input.
 
-| 提供方 | 默认模型 | 图片输入 |
+| Provider | Project default | Presets / status |
 |---|---|---|
-| MiniMax | `MiniMax-M3` | 支持 |
-| OpenAI | `gpt-4.1-mini` | 支持 |
-| DeepSeek | `deepseek-flash` | 支持 |
+| MiniMax | `MiniMax-M3` | `MiniMax-M3` |
+| OpenAI | `gpt-6-luna` | `gpt-6-luna`, `gpt-6-sol` |
+| DeepSeek | `deepseek-flash` | Current alias for DeepSeek V4.1 Flash |
 
-口播转写是独立配置，目前接入 MiniMax ASR。
+You can select a provider preset or enter another compatible model ID. Custom models must support tool calling, and their image capability should match the model you selected. For Chat Completions, LiveGuard sets `reasoning_effort: "none"` for GPT-6 Luna and GPT-6 Sol. Availability still depends on your account and the provider. See the [OpenAI deployment checklist](https://developers.openai.com/api/docs/guides/deployment-checklist) and [DeepSeek V4.1 Flash announcement](https://api-docs.deepseek.com/news/news260910/).
 
-LiveGuard 只能分析实际采集到的信号，不能保证覆盖所有评论或短暂画面变化。提醒目前只保存在应用中，不会发送到微信、短信或其他外部渠道。当前提供 Windows 快速启动流程；项目限制和安全说明见[运行文档](docs/OPERATIONS.md)。
+Audio transcription is configured separately and currently uses MiniMax ASR.
 
-## 快速开始
+LiveGuard can only analyze signals it captures; it cannot guarantee coverage of every comment or brief visual change. Alerts are stored in the app and are not sent to WeChat, SMS, or other external channels. The current quick-start flow is for Windows. See the [operations guide](docs/OPERATIONS.md) for limitations and security details.
 
-需要 Windows 10/11、Go 1.25、Google Chrome 和 Tesseract OCR。中文识别建议安装 `chi_sim` 数据包。
+## Quick start
+
+Requirements: Windows 10/11, Go 1.25, Google Chrome, and Tesseract OCR. For Chinese text recognition, install the `chi_sim` language data.
 
 ```powershell
 git clone https://github.com/sdaAlbert/liveguard.git
@@ -76,21 +98,22 @@ cd liveguard
 powershell -ExecutionPolicy Bypass -File ./scripts/run-mvp.ps1
 ```
 
-打开 <http://127.0.0.1:8080>，在专用 Chrome 窗口登录直播平台，然后新建监控。需要使用大模型时，在网页右上角的“模型设置”中选择提供方并配置 API Key；模型设置不会发送探测请求。没有配置大模型时可使用本地规则模式。
+Open <http://127.0.0.1:8080>. Sign in to the livestream platform in the dedicated Chrome window, then create a monitor. To use an LLM, open **Model settings** in the top-right corner and configure a provider and API key. Saving model settings does not send a probe request. Without an LLM, you can use the local rules mode.
 
-## 文档
+## Documentation
 
-- [文档导航](docs/README.md)：按初次阅读顺序或具体问题查找资料。
-- [项目导览：从目录到一次提醒](docs/PROJECT-GUIDE.md)：面向初次阅读者，解释术语、目录、完整调用路线、状态和可靠性设计。
-- [架构与 Agent 行为](docs/ARCHITECTURE.md)：数据流、模型适配、工具、证据、调度、上下文与持久化设计。
-- [运行、配置与故障处理](docs/OPERATIONS.md)：运行时长、API 配置、PostgreSQL、接口、限制和恢复方式。
-- [评测与验证](docs/EVALUATION.md)：现有测试地图、历史评测、负载测量和结果适用范围。
-- [仍存在的风险](docs/PROJECT-REVIEW.md)：采集覆盖、长期存储、事件统计和改进优先级。
-- [贡献指南](CONTRIBUTING.md)
+- [Documentation index](docs/README.md) (Chinese): reading paths and topic index.
+- [Project guide](docs/PROJECT-GUIDE.md) (Chinese): folders, terminology, full request path, state, and reliability design.
+- [Architecture and agent behavior](docs/ARCHITECTURE.md) (Chinese): data flow, model adapters, tools, evidence, scheduling, context, and persistence.
+- [Agent Harness guide](docs/AGENT-HARNESS.md) (Chinese): the generic tool loop, livestream integration, asynchronous scheduling, final validation, limits, failure handling, and evaluation.
+- [Operations and troubleshooting](docs/OPERATIONS.md) (Chinese): startup, configuration, local data files, APIs, limits, and recovery.
+- [Evaluation and verification](docs/EVALUATION.md) (Chinese): automated tests, historical model results, load measurements, and their limits.
+- [Known project risks](docs/PROJECT-REVIEW.md) (Chinese): capture coverage, storage growth, event tracking, and known limitations.
+- [Contributing](CONTRIBUTING.md)
 
-## 安全与隐私
+## Security and privacy
 
-服务默认只监听本机，不适合作为公网服务直接部署。API Key 保存在 Go 服务进程内存或用户配置的环境变量中；不要提交密钥、登录资料或私人截图。详细说明见[运行文档](docs/OPERATIONS.md#安全边界)。
+The server listens on localhost by default and is not intended to be exposed directly to the public internet. API keys stay in the Go process memory or in environment variables that you configure. Do not commit secrets, login data, or private screenshots.
 
 ## License
 
