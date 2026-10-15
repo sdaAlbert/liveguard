@@ -70,7 +70,7 @@ cmd/monitor-eval    固定文字集模型评测
 cmd/monitor-load    合成信号负载测量
 ```
 
-测试覆盖状态迁移、异步队列、幂等、超时/取消、工具限制和 HTTP 流程。仓库也有文字模型评测与合成负载程序；现有负载程序走同步 `Ingest` 和 mock 模型，尚不能证明真实采集或异步队列的端到端吞吐。各类评测结果的适用范围见[评测文档](docs/EVALUATION.md)。
+测试覆盖状态迁移、异步队列、幂等、超时/取消、工具限制和 HTTP 流程。仓库也有文字评测入口与合成负载程序；文字评测结果暂不作为模型质量结论。同步 `Ingest` 与异步 `SubmitSignal` 都有 mock 负载测量，但不能证明真实模型或真实直播端到端吞吐。各类数据的适用范围见[评测文档](docs/EVALUATION.md)。
 
 ## 模型
 
@@ -102,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File ./scripts/run-mvp.ps1
 
 ## 文档
 
-- [文档导航](docs/README.md)：按初次阅读顺序或具体问题查找资料。
+- [文档导航](docs/README.md)：按初次阅读顺序或具体问题查找资料；每篇文档顶部可切换英文。
 - [项目导览：从目录到一次提醒](docs/PROJECT-GUIDE.md)：面向初次阅读者，解释术语、目录、完整调用路线、状态和可靠性设计。
 - [架构与 Agent 行为](docs/ARCHITECTURE.md)：数据流、模型适配、工具、证据、调度、上下文与持久化设计。
 - [Agent Harness 详解](docs/AGENT-HARNESS.md)：从通用工具循环到直播领域接入、异步调度、最终提交、预算、失败处理、评测和面试讲解。

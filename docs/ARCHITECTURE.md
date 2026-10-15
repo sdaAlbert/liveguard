@@ -1,5 +1,7 @@
 # LiveGuard 架构：Agent 执行与证据链
 
+[English](ARCHITECTURE.en.md) | 简体中文
+
 本文聚焦 Agent 为什么以当前方式运行：模型从哪里获得证据、能够调用什么、并发和时效由谁控制，以及提醒如何经过服务端校验后提交。目录、术语和一次监控的入门路线见[项目导览](PROJECT-GUIDE.md)。
 
 ## 目录
