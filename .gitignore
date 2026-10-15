@@ -1,7 +1,10 @@
 .env
 .env.local
 artifacts/
+# Runtime state and generated test artifacts may live at the repository root
+# or beneath a package directory (for example internal/monitor/runtime/).
 runtime/
+**/runtime/
 state/
 liveguard.exe
 .cache/
