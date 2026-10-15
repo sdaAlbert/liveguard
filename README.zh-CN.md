@@ -108,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File ./scripts/run-mvp.ps1
 - [Agent Harness 详解](docs/AGENT-HARNESS.md)：从通用工具循环到直播领域接入、异步调度、最终提交、预算、失败处理、评测和面试讲解。
 - [运行、配置与故障处理](docs/OPERATIONS.md)：运行时长、本机数据文件、API 配置、接口、限制和恢复方式。
 - [评测与验证](docs/EVALUATION.md)：现有测试地图、历史评测、负载测量和结果适用范围。
-- [仍存在的风险](docs/PROJECT-REVIEW.md)：采集覆盖、长期存储、事件统计和改进优先级。
+- [优化路线图](docs/ROADMAP.md)：已知问题、候选改进方向和验收证据。
 - [贡献指南](CONTRIBUTING.md)
 
 ## 安全与隐私

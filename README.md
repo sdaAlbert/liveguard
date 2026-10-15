@@ -108,7 +108,7 @@ Open <http://127.0.0.1:8080>. Sign in to the livestream platform in the dedicate
 - [Agent Harness guide](docs/AGENT-HARNESS.md) (Chinese): the generic tool loop, livestream integration, asynchronous scheduling, final validation, limits, failure handling, and evaluation.
 - [Operations and troubleshooting](docs/OPERATIONS.md) (Chinese): startup, configuration, local data files, APIs, limits, and recovery.
 - [Evaluation and verification](docs/EVALUATION.md) (Chinese): automated tests, historical model results, load measurements, and their limits.
-- [Known project risks](docs/PROJECT-REVIEW.md) (Chinese): capture coverage, storage growth, event tracking, and known limitations.
+- [Improvement roadmap](docs/ROADMAP.md) (Chinese): known gaps, candidate improvements, and evidence for completion.
 - [Contributing](CONTRIBUTING.md)
 
 ## Security and privacy
