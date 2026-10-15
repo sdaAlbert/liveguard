@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"liveguard/internal/browser"
 	"liveguard/internal/monitor"
 )
 
@@ -22,7 +23,7 @@ func TestMonitorDemoAPI(t *testing.T) {
 	server.SetMonitorService(monitorService)
 
 	response := httptest.NewRecorder()
-	body := bytes.NewBufferString(`{"target_url":"https://live.douyin.com/123456","goal":"抽奖开始时提醒我"}`)
+	body := bytes.NewBufferString(`{"target_url":"https://live.example.com/123456","goal":"抽奖开始时提醒我"}`)
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/monitors", body))
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("expected accepted, got %d: %s", response.Code, response.Body.String())
@@ -52,6 +53,28 @@ func TestMonitorDemoAPI(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionOpensTheUserProvidedPlatformURL(t *testing.T) {
+	server := New(t.TempDir())
+	var opened string
+	server.SetBrowserSession(func(target string) error {
+		opened = target
+		return nil
+	}, func() browser.SessionState { return browser.SessionState{Configured: true, Open: true} })
+
+	target := "https://live.platform-b.example/room-2"
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/browser/session", bytes.NewBufferString(`{"url":"`+target+`"}`)))
+	if response.Code != http.StatusAccepted || opened != target {
+		t.Fatalf("browser session should open the supplied platform URL: status=%d opened=%q body=%s", response.Code, opened, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/browser/session", bytes.NewBufferString(`{"url":""}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("browser session must require a user-provided URL instead of choosing a platform default: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestMonitorOCRMultipartFlowsIntoAgent(t *testing.T) {
 	server := New(t.TempDir())
 	monitorService := monitor.NewService(monitor.NewMemoryRepository(), nil)
@@ -60,7 +83,7 @@ func TestMonitorOCRMultipartFlowsIntoAgent(t *testing.T) {
 	server.SetMonitorService(monitorService)
 
 	start := httptest.NewRecorder()
-	server.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/monitors", bytes.NewBufferString(`{"target_url":"https://live.douyin.com/ocr","goal":"新品正式发布时提醒我"}`)))
+	server.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/monitors", bytes.NewBufferString(`{"target_url":"https://live.example.com/ocr","goal":"新品正式发布时提醒我"}`)))
 	if start.Code != http.StatusAccepted {
 		t.Fatalf("expected monitor creation, got %d: %s", start.Code, start.Body.String())
 	}
@@ -123,7 +146,7 @@ func TestMonitorAudioMultipartFlowsIntoAgent(t *testing.T) {
 	server.SetMonitorService(monitorService)
 
 	start := httptest.NewRecorder()
-	server.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/monitors", bytes.NewBufferString(`{"target_url":"https://live.douyin.com/asr","goal":"抽奖开始时提醒我","source_mode":"ocr_upload"}`)))
+	server.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/monitors", bytes.NewBufferString(`{"target_url":"https://live.example.com/asr","goal":"抽奖开始时提醒我","source_mode":"ocr_upload"}`)))
 	if start.Code != http.StatusAccepted {
 		t.Fatalf("expected monitor creation, got %d: %s", start.Code, start.Body.String())
 	}

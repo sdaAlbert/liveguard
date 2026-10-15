@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"liveguard/internal/agent"
 )
@@ -29,9 +31,24 @@ func (p *ChatCompletionsProvider) Capabilities() ModelCapabilities {
 	return ModelCapabilities{ToolCalling: true, Vision: p.Vision}
 }
 func (p *ChatCompletionsProvider) NewSession(config ModelSessionConfig) ModelSession {
+	initial := any(config.Initial)
+	if len(config.InitialContent) > 0 {
+		parts := make([]map[string]any, 0, len(config.InitialContent)*2)
+		for _, block := range config.InitialContent {
+			if block.Text != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": block.Text})
+			}
+			if block.Image != nil {
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]string{
+					"url": "data:" + block.Image.MIMEType + ";base64," + block.Image.Data,
+				}})
+			}
+		}
+		initial = parts
+	}
 	return &chatSession{model: p, config: config, messages: []any{
 		map[string]any{"role": "system", "content": config.System},
-		map[string]any{"role": "user", "content": config.Initial},
+		map[string]any{"role": "user", "content": initial},
 	}}
 }
 
@@ -70,6 +87,27 @@ type chatAssistantMessage struct {
 }
 
 func (s *chatSession) Next(ctx context.Context, previous []agent.Observation, requiredTool, feedback string) (reply ModelReply, err error) {
+	started := time.Now()
+	trace := modelCallTraceFromContext(ctx)
+	statusCode, retries := 0, 0
+	clientTimeout := time.Duration(0)
+	deadlineBudgetMS := int64(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		deadlineBudgetMS = time.Until(deadline).Milliseconds()
+	}
+	defer func() {
+		if reply.Model == "" {
+			reply.Model = s.model.Model
+		}
+		outcome := "completed"
+		timeoutSource := modelTimeoutSource(ctx, trace, clientTimeout, err)
+		errorText := ""
+		if err != nil {
+			outcome = "failed"
+			errorText = err.Error()
+		}
+		log.Printf("model request %s: provider=%s model=%s review_id=%q turn=%d http_status=%d retries=%d latency_ms=%d context_budget_ms=%d client_timeout_ms=%d timeout_source=%s input_tokens=%d output_tokens=%d error=%q", outcome, s.model.Provider, reply.Model, trace.ReviewID, trace.Turn, statusCode, retries, time.Since(started).Milliseconds(), deadlineBudgetMS, clientTimeout.Milliseconds(), timeoutSource, reply.InputTokens, reply.OutputTokens, errorText)
+	}()
 	var imageParts []map[string]any
 	// First complete all tool replies; images then enter a user content message,
 	// because Chat Completions tool-role messages carry text, not image blocks.
@@ -123,6 +161,12 @@ func (s *chatSession) Next(ctx context.Context, previous []agent.Observation, re
 	}
 	if s.model.Provider == "openai" {
 		requestBody["max_completion_tokens"] = s.config.MaxOutputTokens
+		// GPT-6 models currently expose tool calling through Chat Completions
+		// only with reasoning disabled. The Agent already performs its own
+		// bounded tool loop, so use the model's non-reasoning mode here.
+		if s.model.Model == "gpt-6-luna" || s.model.Model == "gpt-6-sol" {
+			requestBody["reasoning_effort"] = "none"
+		}
 	} else {
 		requestBody["max_tokens"] = s.config.MaxOutputTokens
 	}
@@ -140,12 +184,16 @@ func (s *chatSession) Next(ctx context.Context, previous []agent.Observation, re
 	if client == nil {
 		client = agent.DefaultHTTPClient()
 	}
-	response, retries, err := agent.DoModelRequest(client, request)
+	clientTimeout = client.Timeout
+	response, requestRetries, requestErr := agent.DoModelRequest(client, request)
+	retries = requestRetries
+	err = requestErr
 	reply.TransportRetries = retries
 	if err != nil {
 		return reply, fmt.Errorf("Chat Completions request: %w", err)
 	}
 	defer response.Body.Close()
+	statusCode = response.StatusCode
 	if response.StatusCode/100 != 2 {
 		var apiError chatCompletionResponse
 		_ = json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&apiError)

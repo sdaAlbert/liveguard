@@ -12,18 +12,21 @@ type ModelConfig struct {
 	Capabilities ModelCapabilities
 }
 
-type modelDefaults struct{ Model, Endpoint string }
+type modelDefaults struct {
+	Model, Endpoint string
+	Models          []string
+}
 
 var providerDefaults = map[string]modelDefaults{
-	"minimax":  {Model: "MiniMax-M3", Endpoint: "https://api.minimaxi.com/anthropic/v1/messages"},
-	"openai":   {Model: "gpt-4.1-mini", Endpoint: "https://api.openai.com/v1/chat/completions"},
-	"deepseek": {Model: "deepseek-flash", Endpoint: "https://api.deepseek.com/chat/completions"},
+	"minimax":  {Model: "MiniMax-M3", Models: []string{"MiniMax-M3"}, Endpoint: "https://api.minimaxi.com/anthropic/v1/messages"},
+	"openai":   {Model: "gpt-6-luna", Models: []string{"gpt-6-luna", "gpt-6-sol"}, Endpoint: "https://api.openai.com/v1/chat/completions"},
+	"deepseek": {Model: "deepseek-flash", Models: []string{"deepseek-flash"}, Endpoint: "https://api.deepseek.com/chat/completions"},
 }
 
 func defaultVisionCapability(provider, model string) bool {
 	model = strings.ToLower(model)
 	return (provider == "minimax" && model == "minimax-m3") ||
-		(provider == "openai" && model == "gpt-4.1-mini") ||
+		(provider == "openai" && (model == "gpt-6-luna" || model == "gpt-6-sol")) ||
 		(provider == "deepseek" && model == "deepseek-flash")
 }
 

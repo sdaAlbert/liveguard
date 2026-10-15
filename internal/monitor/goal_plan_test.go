@@ -15,7 +15,7 @@ func TestRuleGoalPlannerSelectsSignalsAndIntervalsFromGoal(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan = normalizeMonitoringPlan(plan, "请实时监控主播说出的每一条新消息，出现时马上提醒我")
-	if !plan.UseOCR || !plan.RecommendASR || plan.CaptureIntervalSeconds != 6 || plan.ReviewIntervalSeconds != 15 {
+	if !plan.UseOCR || !plan.RecommendASR || plan.CaptureIntervalSeconds != 1 || plan.ReviewIntervalSeconds != 15 {
 		t.Fatalf("expected a fast multimodal plan for spoken time-sensitive goals: %#v", plan)
 	}
 	if !containsString(plan.Tools, "search_observations") || len(plan.UserConsent) == 0 {
@@ -34,7 +34,7 @@ func TestNormalizePlanEnforcesSafetyAndSupportedIntervals(t *testing.T) {
 		Summary: "看画面和口播", CaptureIntervalSeconds: 1, ReviewIntervalSeconds: 1,
 		RecommendASR: true, VisionPolicy: "unknown", Tools: []string{"run_shell", "search_observations"},
 	}, "判断商品包装是什么颜色并听主播说了什么")
-	if !plan.UseOCR || plan.CaptureIntervalSeconds != 6 || plan.ReviewIntervalSeconds != 60 {
+	if !plan.UseOCR || plan.CaptureIntervalSeconds != 1 || plan.ReviewIntervalSeconds != 60 {
 		t.Fatalf("unsupported model-selected rates must clamp to safe defaults: %#v", plan)
 	}
 	if plan.VisionPolicy != "goal_required" || !containsString(plan.Tools, "inspect_live_frame") || !containsString(plan.Tools, "search_observations") {

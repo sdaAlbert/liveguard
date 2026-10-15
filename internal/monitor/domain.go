@@ -33,16 +33,47 @@ const (
 	SignalFrame SignalSource = "frame"
 )
 
+type BaselineStatus string
+
+const (
+	BaselinePending     BaselineStatus = "pending"
+	BaselineReviewing   BaselineStatus = "reviewing"
+	BaselineReady       BaselineStatus = "ready"
+	BaselineNeedsLogin  BaselineStatus = "needs_login"
+	BaselineUnavailable BaselineStatus = "unavailable"
+)
+
+// LiveBaseline is the one-time, textual profile produced from the first live
+// frame. The source image is temporary and is never stored in this record.
+type LiveBaseline struct {
+	Status                         BaselineStatus `json:"status"`
+	StreamType                     string         `json:"stream_type,omitempty"`
+	Summary                        string         `json:"summary,omitempty"`
+	VisibleRegions                 []string       `json:"visible_regions,omitempty"`
+	SuggestedReviewIntervalSeconds int            `json:"suggested_review_interval_seconds,omitempty"`
+	RecommendVision                bool           `json:"recommend_vision,omitempty"`
+	RecommendASR                   bool           `json:"recommend_asr,omitempty"`
+	Reason                         string         `json:"reason,omitempty"`
+	Model                          string         `json:"model,omitempty"`
+	InputTokens                    int64          `json:"input_tokens,omitempty"`
+	OutputTokens                   int64          `json:"output_tokens,omitempty"`
+	LatencyMS                      int64          `json:"latency_ms,omitempty"`
+	CheckedAt                      time.Time      `json:"checked_at,omitempty"`
+	Error                          string         `json:"error,omitempty"`
+}
+
 type Room struct {
-	ID                string       `json:"id"`
-	Name              string       `json:"name"`
-	Status            string       `json:"status"`
-	LastSeen          time.Time    `json:"last_seen,omitempty"`
-	LastCaptureAt     time.Time    `json:"last_capture_at,omitempty"`
-	CaptureIntervalMS int64        `json:"capture_interval_ms,omitempty"`
-	CaptureDurationMS int64        `json:"capture_duration_ms,omitempty"`
-	LastError         string       `json:"last_error,omitempty"`
-	Health            SourceHealth `json:"health"`
+	ID                   string       `json:"id"`
+	Name                 string       `json:"name"`
+	Platform             string       `json:"platform,omitempty"`
+	Status               string       `json:"status"`
+	LastSeen             time.Time    `json:"last_seen,omitempty"`
+	LastCaptureAt        time.Time    `json:"last_capture_at,omitempty"`
+	CaptureIntervalMS    int64        `json:"capture_interval_ms,omitempty"`
+	CaptureDurationMS    int64        `json:"capture_duration_ms,omitempty"`
+	PerceptionDurationMS int64        `json:"perception_duration_ms,omitempty"`
+	LastError            string       `json:"last_error,omitempty"`
+	Health               SourceHealth `json:"health"`
 }
 
 type SignalEvent struct {
@@ -65,8 +96,8 @@ type SignalEvent struct {
 	FrameArchiveID       string       `json:"frame_archive_id,omitempty"`
 }
 
-// TextRegion preserves OCR line geometry and optional capture-area context for
-// downstream review. Area is a focus hint, not proof that text belongs to chat.
+// TextRegion preserves OCR line geometry and screen-area context for downstream
+// review. Area is a geometric hint, not proof that text belongs to chat.
 type TextRegion struct {
 	Area       string  `json:"area,omitempty"`
 	Text       string  `json:"text"`
@@ -182,9 +213,11 @@ type Run struct {
 	Name                    string          `json:"name"`
 	TargetURL               string          `json:"target_url"`
 	Goal                    string          `json:"goal"`
+	UserInstructions        []string        `json:"user_instructions,omitempty"`
 	GoalVersion             uint64          `json:"goal_version"`
 	GoalUpdatedAt           time.Time       `json:"goal_updated_at"`
 	Plan                    MonitoringPlan  `json:"plan"`
+	Baseline                *LiveBaseline   `json:"baseline,omitempty"`
 	Sampling                SamplingState   `json:"sampling"`
 	SourceMode              string          `json:"source_mode"`
 	Status                  RunStatus       `json:"status"`

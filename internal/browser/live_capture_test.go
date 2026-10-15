@@ -6,20 +6,80 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
 
+func TestDevToolsCallRespectsContextWhileBrowserStalls(t *testing.T) {
+	server := httptest.NewServer(websocket.Handler(func(conn *websocket.Conn) {
+		defer conn.Close()
+		var request any
+		_ = websocket.JSON.Receive(conn, &request)
+		// Deliberately never return a CDP response; wait until the client closes.
+		_ = websocket.JSON.Receive(conn, &request)
+	}))
+	defer server.Close()
+	config, err := websocket.NewConfig("ws"+strings.TrimPrefix(server.URL, "http"), "http://127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := websocket.DialConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	page := &livePage{conn: conn}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := page.call(ctx, "Page.captureScreenshot", nil); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled browser returned success")
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("CDP ignores capture timeout and blocks the monitoring worker")
+	}
+}
+
+func TestPageCreationDoesNotBlockOtherRoomsBeyondTheirDeadline(t *testing.T) {
+	c := &LiveCapturer{}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, _, err := c.page(ctx, "other-room", "https://example.com"); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("page lock wait = %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("a stalled browser setup blocked every other room")
+	}
+}
+
 func TestValidateLiveURLOnlyAllowsConfiguredHosts(t *testing.T) {
-	allowed := map[string]bool{"douyin.com": true, "127.0.0.1": true}
-	for _, target := range []string{"https://live.douyin.com/123", "http://127.0.0.1:8080/demo/live"} {
+	allowed := map[string]bool{"platform-a.example": true, "127.0.0.1": true}
+	for _, target := range []string{"https://live.platform-a.example/123", "http://127.0.0.1:8080/demo/live"} {
 		if err := validateLiveURL(target, allowed); err != nil {
 			t.Fatalf("expected allowed URL %q: %v", target, err)
 		}
 	}
-	for _, target := range []string{"file:///C:/secret", "https://example.com/live", "javascript:alert(1)"} {
+	for _, target := range []string{"file:///C:/secret", "https://platform-b.example/live", "javascript:alert(1)"} {
 		if err := validateLiveURL(target, allowed); err == nil {
 			t.Fatalf("expected URL to be rejected: %q", target)
+		}
+	}
+}
+
+func TestValidateLiveURLSupportsDifferentPlatformsWithoutAnAllowlist(t *testing.T) {
+	for _, target := range []string{"https://live.platform-a.example/room", "https://live.platform-b.example/room", "https://live.platform-c.example/room", "https://live.platform-d.example/room"} {
+		if err := validateLiveURL(target, nil); err != nil {
+			t.Fatalf("platform URL should be accepted by the shared browser workflow: %q: %v", target, err)
 		}
 	}
 }
@@ -63,7 +123,7 @@ func TestFirstMonitorReusesLoginTabAndNavigatesToRequestedURL(t *testing.T) {
 
 	loginPage := &livePage{targetID: "login-tab", conn: connection}
 	capturer := &LiveCapturer{pages: map[string]*livePage{"__liveguard_login__": loginPage}}
-	targetURL := "https://live.douyin.com/room-123"
+	targetURL := "https://live.example.com/room-123"
 
 	page, created, err := capturer.page(context.Background(), "monitor-1", targetURL)
 	if err != nil {

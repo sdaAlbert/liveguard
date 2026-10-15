@@ -74,7 +74,7 @@ func TestMiniMaxReviewerRunsBoundedToolCallingLoop(t *testing.T) {
 		t.Fatalf("tool audit outcomes should be concise and readable: %#v", decision.ToolCalls)
 	}
 	first := requests[0]
-	if first["model"] != "MiniMax-M3" || first["max_tokens"] != float64(512) || first["tool_choice"].(map[string]any)["type"] != "auto" {
+	if first["model"] != "MiniMax-M3" || first["max_tokens"] != float64(reviewMaxOutputTokens) || first["tool_choice"].(map[string]any)["type"] != "auto" {
 		t.Fatalf("request must enable bounded Anthropic tool use: %#v", first)
 	}
 	if len(first["tools"].([]any)) != 6 || !strings.Contains(first["system"].(string), "save_frame_evidence") {
@@ -191,9 +191,8 @@ func TestMiniMaxReviewerCanInspectAndGroundAnAlertInARealImageBlock(t *testing.T
 	decision, err := reviewer.Review(context.Background(), UnexpectedEventInput{
 		Goal: "主播展示产品时，判断包装是什么颜色并提醒我", TriggerFrame: imagePath, TriggerFrameObservedAt: frameObservedAt,
 		RecentEvidence: []SignalEvent{{ID: "signal-image", RoomID: "room-1", Source: "ocr", Text: "主播正在介绍一款产品", Confidence: .8, ObservedAt: frameObservedAt}},
-		SaveFrame: func(_ context.Context, asset FrameAsset) (FrameAsset, error) {
-			asset.ArchiveID = "saved-frame"
-			return asset, nil
+		RecordFrameEvidence: func(_ context.Context, asset FrameAsset) error {
+			return nil
 		},
 	})
 	if err != nil {

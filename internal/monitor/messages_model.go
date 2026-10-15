@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"liveguard/internal/agent"
 )
@@ -27,7 +29,11 @@ func (m *MessagesModel) Capabilities() ModelCapabilities {
 	return ModelCapabilities{ToolCalling: true, Vision: m.Vision}
 }
 func (m *MessagesModel) NewSession(config ModelSessionConfig) ModelSession {
-	return &messagesSession{model: m, config: config, messages: []map[string]any{{"role": "user", "content": config.Initial}}}
+	content := any(config.Initial)
+	if len(config.InitialContent) > 0 {
+		content = messagesToolContent(config.InitialContent)
+	}
+	return &messagesSession{model: m, config: config, messages: []map[string]any{{"role": "user", "content": content}}}
 }
 
 type messagesSession struct {
@@ -84,6 +90,27 @@ type miniMaxMessageResponse struct {
 }
 
 func (s *messagesSession) Next(ctx context.Context, previous []agent.Observation, requiredTool, feedback string) (reply ModelReply, err error) {
+	started := time.Now()
+	trace := modelCallTraceFromContext(ctx)
+	statusCode, retries := 0, 0
+	clientTimeout := time.Duration(0)
+	deadlineBudgetMS := int64(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		deadlineBudgetMS = time.Until(deadline).Milliseconds()
+	}
+	defer func() {
+		if reply.Model == "" {
+			reply.Model = s.model.Model
+		}
+		outcome := "completed"
+		timeoutSource := modelTimeoutSource(ctx, trace, clientTimeout, err)
+		errorText := ""
+		if err != nil {
+			outcome = "failed"
+			errorText = err.Error()
+		}
+		log.Printf("model request %s: provider=minimax model=%s review_id=%q turn=%d http_status=%d retries=%d latency_ms=%d context_budget_ms=%d client_timeout_ms=%d timeout_source=%s input_tokens=%d output_tokens=%d error=%q", outcome, reply.Model, trace.ReviewID, trace.Turn, statusCode, retries, time.Since(started).Milliseconds(), deadlineBudgetMS, clientTimeout.Milliseconds(), timeoutSource, reply.InputTokens, reply.OutputTokens, errorText)
+	}()
 	if len(previous) > 0 {
 		results := make([]map[string]any, 0, len(previous))
 		for _, observation := range previous {
@@ -131,12 +158,16 @@ func (s *messagesSession) Next(ctx context.Context, previous []agent.Observation
 	if client == nil {
 		client = agent.DefaultHTTPClient()
 	}
-	response, retries, err := agent.DoModelRequest(client, request)
+	clientTimeout = client.Timeout
+	response, requestRetries, requestErr := agent.DoModelRequest(client, request)
+	retries = requestRetries
+	err = requestErr
 	reply.TransportRetries = retries
 	if err != nil {
 		return reply, fmt.Errorf("Messages model request: %w", err)
 	}
 	defer response.Body.Close()
+	statusCode = response.StatusCode
 	if response.StatusCode/100 != 2 {
 		var apiError miniMaxMessageResponse
 		_ = json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&apiError)

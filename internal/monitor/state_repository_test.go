@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -40,7 +39,7 @@ func TestSignalIdempotencyValidationAndArrivalSequence(t *testing.T) {
 	s := NewService(repo, nil)
 	calls := &testUnexpectedReviewer{decision: UnexpectedEventDecision{Action: "ignore", Category: "other", Confidence: .9}}
 	s.SetUnexpectedEventReviewer(calls, time.Nanosecond)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/test", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/test", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,82 +109,6 @@ func TestFileRepositoryPersistsRunInvestigationAndObservation(t *testing.T) {
 	}
 }
 
-func TestPostgresRepositoryContractWhenConfigured(t *testing.T) {
-	url := os.Getenv("LIVEGUARD_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("set LIVEGUARD_TEST_DATABASE_URL to run isolated PostgreSQL repository contract")
-	}
-	repo, err := OpenPostgres(context.Background(), url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = repo.Close() })
-	runRepositoryContract(t, repo)
-}
-
-func TestPostgresObservationAndPausedRunPersistAcrossReconnect(t *testing.T) {
-	url := os.Getenv("LIVEGUARD_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("set LIVEGUARD_TEST_DATABASE_URL to run isolated PostgreSQL persistence check")
-	}
-	ctx := context.Background()
-	repo, err := OpenPostgres(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := domain.NewID("persistence")
-	t.Cleanup(func() {
-		if reopened, openErr := OpenPostgres(context.Background(), url); openErr == nil {
-			_, _ = reopened.db.Exec(`DELETE FROM live_monitor_runs WHERE id=$1`, id)
-			_ = reopened.Close()
-		}
-	})
-	now := time.Now().UTC()
-	run := &Run{ID: id, Status: RunRunning, StartedAt: now, UpdatedAt: now, Rooms: []Room{}}
-	if err := repo.Create(ctx, run); err != nil {
-		t.Fatal(err)
-	}
-	archiveDir := t.TempDir()
-	sourceFrame := filepath.Join(t.TempDir(), "capture.png")
-	if err := os.WriteFile(sourceFrame, []byte("test screenshot bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	archiver := NewService(repo, nil)
-	archiver.SetFrameArchiveDir(archiveDir)
-	archiveID, err := archiver.archiveFrame(id, "observation-persisted", sourceFrame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	observation := SignalEvent{ID: "observation-persisted", Source: SignalOCR, Text: "persisted observation contract", Confidence: .9, ObservedAt: now, FrameArchiveID: archiveID}
-	if _, err := repo.Update(ctx, id, func(current *Run) error {
-		current.Events = append(current.Events, observation)
-		current.Status = RunPaused
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenPostgres(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	restored, err := reopened.Get(ctx, id)
-	if err != nil || restored.Status != RunPaused {
-		t.Fatalf("paused run did not survive reconnect: status=%v err=%v", restored.Status, err)
-	}
-	observations, err := reopened.SearchObservations(ctx, id, ObservationQuery{Text: "persisted observation contract", Limit: 3})
-	if err != nil || len(observations.Events) != 1 || observations.Events[0].FrameArchiveID != observation.FrameArchiveID {
-		t.Fatalf("observation or archive reference did not survive reconnect: %#v err=%v", observations, err)
-	}
-	archiver.SetFrameArchiveDir(archiveDir)
-	if _, err := archiver.archivedFramePath(id, observations.Events[0].FrameArchiveID); err != nil {
-		t.Fatalf("archived screenshot did not remain readable: %v", err)
-	}
-}
-
 func TestRecoverInterruptedStopsPersistedMonitors(t *testing.T) {
 	repo := NewMemoryRepository()
 	now := time.Now().UTC()
@@ -208,9 +131,6 @@ func runRepositoryContract(t *testing.T, repo Repository) {
 	run := &Run{ID: id, Status: RunRunning, Version: 1, StartedAt: time.Now().UTC(), Rooms: []Room{}, Events: []SignalEvent{}}
 	if err := repo.Create(context.Background(), run); err != nil {
 		t.Fatal(err)
-	}
-	if pg, ok := repo.(*PostgresRepository); ok {
-		t.Cleanup(func() { _, _ = pg.db.Exec(`DELETE FROM live_monitor_runs WHERE id=$1`, id) })
 	}
 	// Returned snapshots and the caller's original value never alias stored state.
 	run.Status = RunStopped

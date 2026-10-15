@@ -54,8 +54,8 @@ OCR 是“光学字符识别”：把截图里的字读出来。ASR 是“自动
 | **Alert（提醒）** | Go 验证后写入 Run 的提醒记录 | 网页标记已读不等于后端提醒被删除 |
 | **Pending（待处理）** | 当前进程内正在排队、判断或已处理的工作统计 | 不是可从数据库恢复的任务检查点 |
 | **GoalVersion（目标版本）** | 用户每次修改关注目标时递增的数字 | 用来阻止旧目标下的迟到结果污染新目标 |
-| **Repository（仓储）** | 读写 Run 和观测的存储接口 | Memory、JSON 文件和 PostgreSQL 是不同实现 |
-| **Harness（执行框架）** | 驱动模型多轮调用工具，并限制次数和时间的通用代码 | 它负责“怎样安全执行”，不负责“直播语义是什么” |
+| **Repository（仓储）** | 读写 Run 和观测的存储接口 | Memory 只在进程内存储；JSON 文件模式会写入本机 |
+| **Harness（执行框架）** | 把一次受限 Agent 调查串起来的几层代码；其中 `internal/agent/loop.go` 是通用轮次与工具执行内核 | 循环内核不理解直播语义；Monitor 层提供直播工具、异步调度和最终提交校验。见[Agent Harness 详解](AGENT-HARNESS.md) |
 
 Run 状态、采集健康和单次调查状态是三条独立状态线。例如 Run 仍是 `running`，Room 却可能是 `needs_login`；一条 Investigation 也可能是 `failed`，而监控继续接收后续信号。分开记录可以回答“任务是否还开着”“采集是否正常”“这一条判断是否完成”三个不同问题。
 
@@ -93,6 +93,71 @@ Context 是 Go 传递“还可以继续吗”的对象。用户暂停、停止�
 
 音频路径不同：只有用户从监控卡片主动分享音频后，浏览器音频片段才被上传；`MiniMaxTranscriber` 转写出文字后，文字与 OCR 一样进入信号接收路径。ASR 未接入 OCR worker，也不代表系统在后台监听所有设备音频。
 
+### 4.1 外部程序怎样和 LiveGuard 接起来
+
+第一次读这条链路时，可以先记住一个简单模型：**Go 是调度员；Chrome、Tesseract 和 FFmpeg 是各自独立的工具。** Go 不会把它们“变成 Go 代码”，而是按照约定启动它们，把文件路径或参数交过去，再读取它们的结果。这和你在 PowerShell 里输入一个命令启动另一个程序是同一件事，只是参数由 Go 自动填写。
+
+几个常见词：
+
+| 词 | 日常解释 | 在这里的作用 |
+|---|---|---|
+| 可执行文件（`.exe`） | Windows 上可以启动的程序文件 | `tesseract.exe`、Chrome、`ffmpeg.exe` 都是独立程序 |
+| 环境变量 | 启动程序时附带的一组配置文字 | `LIVEGUARD_TESSERACT_BIN` 告诉 Go 去哪里找 Tesseract |
+| `PATH` | Windows 查找命令名的一串目录 | 命令只写 `ffmpeg` 时，系统会到 `PATH` 目录里找 `ffmpeg.exe` |
+| 临时文件 | 程序短时间交换数据用的文件 | Chrome 截图先写成 PNG，Tesseract 读取它；用完后删除 |
+| 标准输出（stdout） | 子程序运行时输出给启动者的一条文字/字节通道 | Tesseract 把识别表格写到这条通道，Go 从中读取 |
+| CDP | Chrome DevTools Protocol，Chrome 提供的本机自动化控制接口 | Go 通过它让专用 Chrome 打开页面、截图 |
+
+在 Windows 快速启动脚本中，`scripts/run-mvp.ps1` 会检查 `C:\Program Files\Tesseract-OCR\tesseract.exe` 是否存在；如果存在，就把这个**完整文件路径**放进 `LIVEGUARD_TESSERACT_BIN`，然后启动 Go 服务。Go 入口 `cmd/liveguard/main.go` 读取该变量并创建 `TesseractRecognizer`。所以脚本做的是“告诉 Go 去哪里找工具”，不是安装 Tesseract，也不是把 Tesseract 编进 LiveGuard。你也可以直接设置这个变量指向其他安装位置；脚本使用完整路径时，不需要为了 Tesseract 修改 Windows `PATH`。如果变量没有设置，服务会明确记录本地 OCR 未启用。
+
+一张截图从网页到 OCR 的实际交接顺序是：
+
+```mermaid
+sequenceDiagram
+    participant PS as PowerShell 启动脚本
+    participant Go as LiveGuard Go 服务
+    participant Chrome as 专用 Chrome
+    participant T as Tesseract 程序
+    PS->>Go: 传入 Tesseract 路径和语言配置并启动服务
+    Go->>Chrome: 通过本机 CDP 打开直播页面
+    Go->>Chrome: 请求截取当前可见页面
+    Chrome-->>Go: 返回 PNG 图片数据
+    Go->>Go: 写入临时 PNG 文件
+    Go->>T: 启动 tesseract.exe，并传入 PNG 路径
+    T-->>Go: 将 TSV 识别结果写到 stdout
+    Go->>Go: 解析文字和置信度，去重后送入信号队列
+    Go->>Go: 删除临时 PNG
+```
+
+这里的“打开 Google 页面”如果指的是直播间所在的网页，**截图不是 Google 云端替 LiveGuard 截的**。LiveGuard 在本机启动一个专用 Chrome 窗口，打开经过校验的直播 URL，再通过仅绑定本机地址的 CDP 请求 Chrome 截图。截图范围是当前页面可见区域，不是整台电脑桌面，也不是直播视频的每一帧；默认按采样间隔截取。Chrome 返回图片数据后，Go 将它暂存在 PNG 文件里，再把路径交给 Tesseract。Tesseract 独立读取图片并识别文字，Go 收到识别结果后删除这张临时截图。没有被 Agent 明确保存为证据的采样图不会因为 OCR 而自动归档。
+
+音频同样是“一个程序把数据交给另一个程序”，但入口和截图不同：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant B as 浏览器页面
+    participant Go as LiveGuard Go 服务
+    participant F as FFmpeg 程序
+    participant M as MiniMax 语音识别接口
+    U->>B: 点击分享音频并在浏览器权限窗口选择来源
+    B->>B: 每约 6 秒录制一段已授权音轨
+    B->>Go: 通过本机 HTTP 上传 WebM 音频片段
+    Go->>Go: 暂存音频文件
+    Go->>F: 传入文件，要求转成单声道 16kHz WAV
+    F-->>Go: 经 stdout 返回 WAV 数据
+    Go->>M: 通过 HTTPS 上传音频和 API Key
+    M-->>Go: 返回识别出的文字
+    Go->>Go: 把转写文字作为普通信号送入同一判断队列
+    Go->>Go: 删除临时音频文件
+```
+
+用户点击“口播识别”后，浏览器会显示自己的屏幕/标签页分享权限窗口；必须由用户选择来源并允许分享音频。当前页面用 `MediaRecorder` 将获准的音轨切成约 6 秒的 WebM 小段，通过本机 HTTP 接口交给 Go。采集时只录制音轨；用于打开浏览器分享窗口的视频轨不会被上传。Go 暂存小段，调用本机 FFmpeg 将它规范成 MiniMax 接口接受的 WAV 格式，再经 HTTPS 发给 MiniMax ASR。返回的转写文字作为一条普通信号进入与 OCR 相同的后续判断队列。上传处理结束后，服务删除临时音频文件。停止分享或浏览器撤销权限后，后续片段就不会继续产生。
+
+因此，“共享音频”不是 LiveGuard 直接接管麦克风，也不是 Chrome 与 Go 自动共享整个电脑的声音。浏览器先向用户申请明确授权；获准的音轨由网页录成片段，再通过 HTTP 文件上传交给本机服务。当前识别服务是 MiniMax；音频转写需要已配置的 MiniMax ASR 凭证，FFmpeg 也必须能从配置路径或 `PATH` 找到。
+
+相关实现位置：[`run-mvp.ps1`](../scripts/run-mvp.ps1)、[`main.go`](../cmd/liveguard/main.go)、[`live_capture.go`](../internal/browser/live_capture.go)、[`capture_pipeline.go`](../internal/monitor/capture_pipeline.go)、[`perception.go`](../internal/monitor/perception.go)、[`monitor.js`](../internal/web/static/monitor.js)、[`server.go`](../internal/web/server.go)、[`minimax_transcriber.go`](../internal/monitor/minimax_transcriber.go)。
+
 ### 5. 信号先被接收，再等待判断
 
 `acceptSignal` 会检查来源、文字长度、置信度、观测时间、Room 归属和 Run 状态；没有 ID 时会生成 ID，并分配单调递增的序号。它会同时写入观测历史和短期接收回执。
@@ -112,7 +177,7 @@ Context 是 Go 传递“还可以继续吗”的对象。用户暂停、停止�
 - `request_user_input`：只有需要用户定义偏好时才询问。
 - `create_alert`：提出创建提醒的请求；不是绕开 Go 校验的后门。
 
-工具结果会回到同一次模型会话，模型可继续下一轮。一般调查最多 4 轮、8 次工具调用、总计 35 秒；每个工具最多 12 秒。Terminal tool（终止工具）必须单独调用：例如提醒已创建后，模型不能在同一批再提出其他副作用操作。
+工具结果会回到同一次模型会话，模型可继续下一轮。一般调查最多 6 轮、8 次工具调用、总计 90 秒；每个工具最多 12 秒。Terminal tool（终止工具）必须单独调用：例如提醒已创建后，模型不能在同一批再提出其他副作用操作。
 
 ### 7. Go 决定是否落库
 
@@ -165,7 +230,7 @@ Go 只允许这些 Run 状态转换：`running → paused/stopped/failed/complet
 | 多次模型失败 | 连续失败到阈值后熔断 30 秒；冷却后只允许一个恢复探测 |
 | 模型给出错误格式 | 同一次调查最多让模型修正一次；修正占用原有轮数预算 |
 | 工具调用 | 有单工具 12 秒限制；失败记录在调查轨迹，不会自动重放有副作用的工具 |
-| 截图/OCR | 短时错误退避；连续 3 次失败暂停输入并显示错误，用户处理页面后可暂停再继续 |
+| 截图/OCR | 临时错误指数退避至最多 30 秒后继续尝试，成功后自动恢复；登录/验证要求用户处理。超长内部 OCR 拆分保存，积压时替换等待画面并合并复核触发 |
 | 队列任务 | 有 deadline；过期丢弃调查工作，但不删掉已经保存的观测 |
 | 进程重启 | 持久模式将旧 `running` Run 标为 `paused`；不会自动重放旧队列或接续浏览器操作 |
 
@@ -179,16 +244,16 @@ Go 只允许这些 Run 状态转换：`running → paused/stopped/failed/complet
 
 ## 数据存在哪里
 
-| 数据 | `local` 默认模式 | `durable` PostgreSQL 模式 |
+| 数据 | `local` 默认文件模式 | `memory` 临时模式 |
 |---|---|---|
-| Run 快照 | `runtime/liveguard.json` 原子替换写入 | `live_monitor_runs.payload` JSONB |
-| 完整观测流水 | `runtime/liveguard.json.observations.jsonl` 追加写入 | `live_monitor_observations` 表 |
-| 队列和在途取消 | 仅进程内存 | 仍仅进程内存 |
-| Agent 选择保存的图片 | `runtime/frames/` | 仍由 `LIVEGUARD_FRAME_ARCHIVE_DIR` 指向的本机目录管理 |
-| Chrome 登录状态 | `runtime/live-profile/` | 仍由本机目录保存 |
+| Run 快照 | `runtime/liveguard.json` 原子替换写入 | 仅进程内存，退出后丢失 |
+| 完整观测流水 | `runtime/liveguard.json.observations.jsonl` 追加写入 | 仅进程内存，退出后丢失 |
+| 队列和在途取消 | 仅进程内存，重启不恢复 | 仅进程内存，退出后丢失 |
+| 当前调查查看的截图 | 系统临时目录 | `save_frame_evidence` 仅在调查期间保留；正常结束后删除。强制终止后的清理尚未专项验证 |
+| Chrome 登录状态 | `runtime/live-profile/` 本机目录 | 仍写入本机目录 |
 | 模型 API Key | 进程内存/环境变量 | 进程内存/环境变量 |
 
-Memory Repository 只在当前进程存储状态。`local` 是默认文件模式，不是纯内存。`durable` 需要用户提供的 PostgreSQL。即使 Run 和观测已经持久化，当前也没有持久任务队列，所以重启后恢复的是“可继续的监控卡片和历史”，不是中断调查的精确续跑。观测和图片没有自动清理策略，磁盘会随时间增长。
+Memory Repository 只在当前进程存储状态。`local` 是默认文件模式：Run 快照和完整观测流水都写到 `runtime/` 下的 JSON 文件；重启后会恢复监控卡片与历史，并将此前正在运行的监控暂停，等待用户继续。任务队列和正在执行的调查不会恢复。常规 OCR 图片和调查中选用的截图都用临时文件，正常处理结束后删除；强制终止后的清理尚未专项验证。可关联的 OCR 文字与文字结论写入监控记录。读取历史归档图的兼容入口仍存在，但当前路径不会新建图片归档。Chrome 登录资料另存在 `runtime/` 下。观测流水没有自动清理策略，磁盘会随时间增长。
 
 ## 评测与吞吐/延迟：现有证据能说明什么
 
@@ -198,15 +263,13 @@ Memory Repository 只在当前进程存储状态。`local` 是默认文件模式
 2. **文字模型评测**用固定的人工标注案例调用真实 Reviewer，统计提醒 precision/recall、误报率、单条调查 P95、token 和工具调用。仓库记录的 MiniMax 历史 holdout 是 2026-10-04 的 27/30；它不是当前代码的实时成绩，也不是 Chrome/OCR/ASR 端到端评测。
 3. **`cmd/monitor-load` 合成负载**每次提交 160 条（可配置），用 8 个 worker、8 个内存 Run 和 40ms mock Reviewer，输出接受数、吞吐、并发峰值、背压以及 P95 `Ingest` 耗时。它调用同步 `Ingest`，不测 `SubmitSignal` 的异步排队等待，也不含浏览器、OCR、ASR、网络、真实模型或 token 成本。
 
-因此，已有“某条同步服务路径的合成接收/判断负载测量”和“模型固定文字调查延迟”证据；还不能证明真实系统吞吐、异步队列 P95、端到端提醒延迟或真实直播漏采率。**若目标是把 Agent 工程能力讲扎实，建议补一组异步队列负载测量，而不是再加一份只 mock 单函数的数字。**至少记录：提交到接收的延迟、排队时长、提交到调查完成时长、提醒延迟、接受/拒绝/合并/过期数量、队列峰值、模型并发峰值；注明硬件、Go 版本、运行时长、每 Run 信号速率和 mock 延迟。之后再用真实录制或可复核直播做采集漏失测量。当前是否要新增压测取决于这次交付是否要求宣称异步吞吐；本仓库已有 harness 可以作为起点，已有测试不必为了“看起来完整”重复补。
-
-数据集分 dev 和 holdout。首次查看 holdout 并据此调整提示后，它就不再是未见测试集；后续应增加新版本独立样本。评测失败要能读出具体案例和原因，不只展示一次成功对话。
+因此，已有“某条同步服务路径的合成接收/判断负载测量”和“模型固定文字调查延迟”证据；还不能证明真实系统吞吐、异步队列 P95、端到端提醒延迟或真实直播漏采率。数据集分 dev 和 holdout；已查看并用于调整提示的 holdout 属于已打开的回归集，不能作为未见测试集结果解释。
 
 ## 推荐阅读顺序
 
 1. 看 `README.md`，获取产品范围、运行方式和文档索引。
 2. 看本页，再按一次调用路线阅读 `cmd/liveguard/main.go` → `internal/web/server.go` → `internal/monitor/service.go` → `internal/monitor/pending.go` → `internal/monitor/agent_reviewer.go` → `internal/monitor/review_tools.go`。
-3. 跟数据走时看 `internal/monitor/domain.go`、`repository.go`、`ledger.go`；跟持久化走时再看 `file_repository.go` 和 `postgres.go`。
+3. 跟数据走时看 `internal/monitor/domain.go`、`repository.go`、`ledger.go`；跟本机文件存储走时再看 `file_repository.go`。
 4. 看 `internal/agent/loop.go` 理解通用工具循环，再看 `messages_model.go`、`chat_completions_provider.go` 理解模型协议差异。
 5. 看 `internal/monitor/*_test.go` 找边界案例；最后看 `docs/EVALUATION.md` 了解如何运行评测和哪些结论不能外推。
 
@@ -215,4 +278,4 @@ Memory Repository 只在当前进程存储状态。`local` 是默认文件模式
 - [架构与 Agent 行为](ARCHITECTURE.md)：各个模块的接口、证据策略、调度、上下文和状态提交细节。
 - [运行、配置与故障处理](OPERATIONS.md)：启动参数、API、数据留存、安全边界和常见恢复方式。
 - [评测与验证](EVALUATION.md)：测试地图、固定集报告、负载 harness 与真实验收方法。
-- [仍存在的风险](PROJECT-REVIEW.md)：采集漏失、存储增长、事件统计和后续优先级。
+- [优化路线图](ROADMAP.md)：当前已知问题、候选改进方向和验收证据。

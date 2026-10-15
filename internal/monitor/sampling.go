@@ -65,7 +65,7 @@ func samplingAt(run *Run, now time.Time) SamplingState {
 		state.Reason = "候选加速已到期，恢复初始节奏"
 	}
 	if state.NextEventAt != nil && state.NextEventAt.Sub(now) <= 2*time.Minute && now.Sub(*state.NextEventAt) < 2*time.Minute {
-		state.Mode, state.CaptureIntervalSeconds, state.ReviewIntervalSeconds = SamplingCandidate, 6, 15
+		state.Mode, state.CaptureIntervalSeconds, state.ReviewIntervalSeconds = SamplingCandidate, run.Plan.CaptureIntervalSeconds, 15
 		state.VisionIntervalSeconds = 30
 		state.CandidateUntil = state.NextEventAt.Add(2 * time.Minute)
 		state.Reason = "临近已知事件时间，加快检查"
@@ -111,11 +111,8 @@ func applySamplingDecision(run *Run, decision UnexpectedEventDecision, now time.
 			state.Reason = "用户要求及时提醒，保持较快采样"
 			return
 		}
-		ceiling := 24
-		if periodicVision(run.Plan) {
-			ceiling = 12
-		}
-		state.CaptureIntervalSeconds = min(ceiling, max(6, state.CaptureIntervalSeconds*2))
+		// Local OCR stays at the user-visible capture cadence. Stable observations
+		// can slow Agent reviews and visual checks without reducing text coverage.
 		state.ReviewIntervalSeconds = 60
 		state.VisionIntervalSeconds = 60
 		state.Mode = SamplingWaiting
@@ -124,7 +121,7 @@ func applySamplingDecision(run *Run, decision UnexpectedEventDecision, now time.
 		state.StableReviews = 0
 		state.Mode = proposal.Mode
 		if proposal.Mode == SamplingCandidate {
-			state.CaptureIntervalSeconds, state.ReviewIntervalSeconds, state.VisionIntervalSeconds = 6, 15, 30
+			state.CaptureIntervalSeconds, state.ReviewIntervalSeconds, state.VisionIntervalSeconds = run.Plan.CaptureIntervalSeconds, 15, 30
 			state.CandidateUntil = now.Add(90 * time.Second)
 		} else {
 			base := initialSampling(run.Plan, now)
@@ -140,6 +137,13 @@ func (s *Service) effectiveSampling(run *Run, now time.Time) SamplingState {
 	effectiveRun := *run
 	effectiveRun.Plan = planForReviewer(run.Plan, run.Goal, reviewer)
 	state := samplingAt(&effectiveRun, now)
+	state.CaptureIntervalSeconds = 1
+	for _, room := range run.Rooms {
+		// Sample at the rate this host can actually consume. Keep at most one
+		// fresh waiting frame rather than accumulating OCR work at one Hz.
+		cost := time.Duration(max(room.CaptureDurationMS, room.PerceptionDurationMS)) * time.Millisecond
+		state.CaptureIntervalSeconds = max(state.CaptureIntervalSeconds, min(10, durationSecondsCeil(cost)))
+	}
 	if s.captureGap >= time.Second {
 		state.CaptureIntervalSeconds = max(state.CaptureIntervalSeconds, durationSecondsCeil(s.captureGap))
 	}

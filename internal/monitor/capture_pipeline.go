@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"log"
 	"os"
 	"time"
 
@@ -14,16 +15,17 @@ type capturedSample struct {
 	path  string
 }
 type perceptionResult struct {
-	version uint64
-	err     error
-	ack     chan error
+	version  uint64
+	err      error
+	ack      chan error
+	duration time.Duration
 }
 
 // Capture has its own cadence. Frames are temporary OCR input; persistent image
 // archives are created only from the Agent's inspect_live_frame tool.
 func (s *Service) captureLoop(ctx context.Context, runID, targetURL, roomID string) {
 	ctx, cancel := context.WithCancel(ctx)
-	jobs := make(chan capturedSample, 2)
+	jobs := make(chan capturedSample, 1)
 	results := make(chan perceptionResult, 1)
 	done := make(chan struct{})
 	go s.perceptionLoop(ctx, runID, jobs, results, done)
@@ -44,29 +46,45 @@ func (s *Service) captureLoop(ctx context.Context, runID, targetURL, roomID stri
 			}
 			if result.err == nil {
 				ocrFailures = 0
-				stateErr := s.clearCaptureError(ctx, runID, version)
+				stateErr := s.clearCaptureError(ctx, runID, version, result.duration)
 				result.ack <- stateErr
-				if stateErr != nil && !errors.Is(stateErr, ErrGoalChanged) {
+				if captureControlEnded(stateErr) {
 					return
+				}
+				if stateErr != nil {
+					log.Printf("live source state update failed: monitor=%q stage=health error=%q; retrying", runID, stateErr)
 				}
 				continue
 			}
 			ocrFailures++
-			paused, err := s.setCaptureError(ctx, runID, version, result.err, ocrFailures >= 3)
+			log.Printf("live source processing failed: monitor=%q stage=ocr consecutive_failures=%d retrying=true error=%q", runID, ocrFailures, result.err)
+			paused, err := s.setCaptureError(ctx, runID, version, result.err, false)
 			if paused && err == nil {
 				err = ErrInputPaused
 			}
 			result.ack <- err
 			if errors.Is(err, ErrGoalChanged) {
+				timer.Reset(0)
 				continue
 			}
-			if err != nil || paused {
+			if captureControlEnded(err) || paused {
 				s.closePending(runID)
 				return
 			}
+			if err != nil {
+				log.Printf("live source state update failed: monitor=%q stage=ocr error=%q; retrying", runID, err)
+			}
 		case <-timer.C:
 			run, err := s.repository.Get(ctx, runID)
-			if err != nil || run.Status != RunRunning {
+			if err != nil {
+				if errors.Is(err, ErrNotFound) || ctx.Err() != nil {
+					return
+				}
+				log.Printf("live source state read failed: monitor=%q error=%q; retrying", runID, err)
+				timer.Reset(time.Second)
+				continue
+			}
+			if run.Status != RunRunning {
 				return
 			}
 			if len(run.Rooms) > 0 && (run.Rooms[0].Health == SourceFailed || run.Rooms[0].Health == SourceNeedsLogin) {
@@ -90,12 +108,13 @@ func (s *Service) captureLoop(ctx context.Context, runID, targetURL, roomID stri
 					return
 				}
 				captureFailures++
-				paused, err := s.setCaptureError(ctx, runID, version, captureErr, captureFailures >= 3)
+				log.Printf("live source processing failed: monitor=%q stage=capture consecutive_failures=%d retrying=true error=%q", runID, captureFailures, captureErr)
+				paused, err := s.setCaptureError(ctx, runID, version, captureErr, false)
 				if errors.Is(err, ErrGoalChanged) {
 					timer.Reset(0)
 					continue
 				}
-				if err != nil || paused {
+				if captureControlEnded(err) || paused {
 					s.closePending(runID)
 					return
 				}
@@ -104,22 +123,30 @@ func (s *Service) captureLoop(ctx context.Context, runID, targetURL, roomID stri
 				select {
 				case jobs <- sample:
 				default:
-					_ = os.Remove(sample.path)
+					// Replace the waiting frame with the latest one. A slow OCR
+					// worker must not spend its next slot on an obsolete screenshot.
+					select {
+					case old := <-jobs:
+						_ = os.Remove(old.path)
+					default:
+					}
+					select {
+					case jobs <- sample:
+					default:
+						_ = os.Remove(sample.path)
+					}
 					s.recordPerceptionDrop(runID)
 				}
 			}
 			gap := time.Duration(s.effectiveSampling(run, time.Now().UTC()).CaptureIntervalSeconds) * time.Second
 			if gap <= 0 {
-				gap = 6 * time.Second
-			}
-			if goalNeedsChatRegion(run.Goal) || run.Plan.AlertScope == "chat" {
-				gap = min(gap, time.Second)
+				gap = time.Second
 			}
 			if s.captureGap > 0 && s.captureGap < time.Second {
 				gap = s.captureGap
 			}
-			if captureFailures > 0 {
-				gap *= time.Duration(1 << captureFailures)
+			if failures := max(captureFailures, ocrFailures); failures > 0 {
+				gap = min(30*time.Second, gap*time.Duration(1<<min(failures, 5)))
 			}
 			timer.Reset(max(0, gap-time.Since(started)))
 		}
@@ -145,6 +172,9 @@ func (s *Service) captureSample(ctx context.Context, runID, targetURL, roomID st
 		_ = os.Remove(path)
 		return capturedSample{}, duration, err
 	}
+	titleCtx, titleCancel := context.WithTimeout(captureCtx, 2*time.Second)
+	s.updatePageTitle(titleCtx, runID, roomID, targetURL)
+	titleCancel()
 	event := SignalEvent{ID: domain.NewID("frame"), RoomID: roomID, GoalVersion: version, Source: SignalFrame, Text: "临时画面采样，用于 OCR；原图识别后删除", ObservedAt: time.Now().UTC(), CaptureDurationMS: duration}
 	event.ValidUntil = signalDeadline(event)
 	return capturedSample{event: event, path: path}, duration, nil
@@ -181,10 +211,15 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 					deduper = OCRLineDeduper{}
 				}
 				started := time.Now()
+				select {
+				case s.ocrSlots <- struct{}{}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 				ocrCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-				focusChat := run.Plan.AlertScope == "chat" || goalNeedsChatRegion(run.Goal)
-				event, err := s.recognizer.Recognize(ocrCtx, VideoFrame{RoomID: sample.event.RoomID, Path: sample.path, FocusChat: focusChat})
+				event, err := s.recognizer.Recognize(ocrCtx, VideoFrame{RoomID: sample.event.RoomID, Path: sample.path})
 				cancel()
+				<-s.ocrSlots
 				if err != nil && !errors.Is(err, ErrNoText) {
 					return err
 				}
@@ -194,11 +229,20 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 					event.ParentEventID = sample.event.ID
 				}
 				event.RoomID, event.GoalVersion, event.ObservedAt = sample.event.RoomID, sample.event.GoalVersion, sample.event.ObservedAt
-				// The OCR input is deleted after recognition. If the Agent needs a
-				// picture, its tool captures and archives a fresh frame on demand.
+				// The first frame is temporarily available to the one-time baseline
+				// inspection. It is deleted below and never persisted as a baseline.
 				event.FramePath = ""
 				event.CaptureDurationMS, event.PerceptionDurationMS = sample.event.CaptureDurationMS, time.Since(started).Milliseconds()
-				if err = coordinatePerception(ctx, results, version, nil); err != nil {
+				if run.Baseline == nil || run.Baseline.Status == BaselinePending {
+					if err = s.runInitialBaseline(ctx, runID, event, sample.path); err != nil {
+						if errors.Is(err, ErrGoalChanged) {
+							_ = coordinatePerception(ctx, results, version, err, time.Since(started))
+							return err
+						}
+						log.Printf("initial live baseline could not be committed; continue OCR monitoring: monitor=%q error=%q", runID, err)
+					}
+				}
+				if err = coordinatePerception(ctx, results, version, nil, time.Duration(event.PerceptionDurationMS)*time.Millisecond); err != nil {
 					return err
 				}
 				err = s.submitCapturedFrame(ctx, runID, event, &deduper)
@@ -211,7 +255,7 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 				continue
 			}
 			if err != nil {
-				if coordinatePerception(ctx, results, sample.event.GoalVersion, err) != nil {
+				if coordinatePerception(ctx, results, sample.event.GoalVersion, err, 0) != nil {
 					continue
 				}
 			}
@@ -221,10 +265,14 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 
 // Source health is changed by the capture coordinator in result order. The
 // OCR worker waits for that decision before admitting a recovered observation.
-func coordinatePerception(ctx context.Context, results chan<- perceptionResult, version uint64, err error) error {
+func coordinatePerception(ctx context.Context, results chan<- perceptionResult, version uint64, err error, durations ...time.Duration) error {
 	ack := make(chan error, 1)
+	var duration time.Duration
+	if len(durations) > 0 {
+		duration = durations[0]
+	}
 	select {
-	case results <- perceptionResult{version: version, err: err, ack: ack}:
+	case results <- perceptionResult{version: version, err: err, ack: ack, duration: duration}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -234,6 +282,10 @@ func coordinatePerception(ctx context.Context, results chan<- perceptionResult, 
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func captureControlEnded(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, ErrInvalidTransition) || errors.Is(err, ErrInputPaused) || errors.Is(err, ErrNotFound)
 }
 
 func (s *Service) recordPerceptionDrop(runID string) {

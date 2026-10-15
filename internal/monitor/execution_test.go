@@ -79,7 +79,7 @@ func TestVisualGoalCannotAlertWithoutAnAvailableInspectedFrame(t *testing.T) {
 func TestChatMatchNeedsVisibleOCREvidence(t *testing.T) {
 	now := time.Now().UTC()
 	input := UnexpectedEventInput{RecentEvidence: []SignalEvent{{ID: "ocr-1", RoomID: "room-1", Source: SignalOCR, Text: "观众：你们最喜欢哪款？", Confidence: .9, ObservedAt: now, FrameArchiveID: "frame-archive"}}}
-	state := miniMaxReviewState{readEvidenceTurn: 0, searchAlertsTurn: 0, searchedCategory: "chat_match", frameInspected: true, frameObservedAt: now, frameArchiveID: "frame-archive"}
+	state := miniMaxReviewState{readEvidenceTurn: 0, searchAlertsTurn: 0, searchedCategory: "chat_match", frameInspected: true, frameSavedForReview: true, frameObservedAt: now, frameArchiveID: "frame-archive"}
 	valid := miniMaxContentBlock{ID: "create", Name: "create_alert", Input: json.RawMessage(`{"category":"chat_match","summary":"聊天区出现关注的商品型号","reason":"可见评论提到用户关注的型号","confidence":0.91,"visual_finding":"该内容位于画面右侧的聊天区域","evidence_ids":["ocr-1"],"evidence_basis":"live"}`)}
 	result, decision, terminal := (&MiniMaxUnexpectedEventReviewer{}).executeTool(context.Background(), valid, input, nil, &state, 1)
 	if result.IsError || !terminal || decision.Category != "chat_match" {
@@ -112,7 +112,7 @@ func TestStoppingMonitorCancelsAnHTTPIngestReviewAndPreventsLateAlerts(t *testin
 	s := NewService(repo, nil)
 	started := make(chan struct{})
 	s.SetUnexpectedEventReviewer(cancellingReviewer{started}, time.Second)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/test", Goal: "Go 垃圾回收开讲时提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/test", Goal: "Go 垃圾回收开讲时提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestConfiguredModelHandlesKeywordMatchesWithoutRulesBypassingConditions(t *
 	s := NewService(repo, nil)
 	r := &testUnexpectedReviewer{decision: UnexpectedEventDecision{Action: "ignore", Category: "other", Confidence: .9}}
 	s.SetUnexpectedEventReviewer(r, time.Second)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/test", Goal: "优惠券超过100元才提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/test", Goal: "优惠券超过100元才提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}

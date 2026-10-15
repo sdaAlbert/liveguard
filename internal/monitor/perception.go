@@ -5,8 +5,6 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"image"
-	"image/draw"
 	"image/png"
 	"io"
 	"os"
@@ -34,10 +32,9 @@ type AudioChunk struct {
 }
 
 type VideoFrame struct {
-	RoomID    string
-	Path      string
-	EventID   string
-	FocusChat bool
+	RoomID  string
+	Path    string
+	EventID string
 }
 
 type Transcriber interface {
@@ -75,16 +72,10 @@ func (r TesseractRecognizer) Recognize(ctx context.Context, frame VideoFrame) (S
 	}
 	ocrCtx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	ocrPath := frame.Path
-	xOffset := 0
-	cleanup := func() {}
-	if frame.FocusChat {
-		if croppedPath, offset, cropCleanup, cropErr := cropRightChatPanel(frame.Path); cropErr == nil {
-			ocrPath, xOffset, cleanup = croppedPath, offset, cropCleanup
-		}
-	}
-	defer cleanup()
-	cmd := exec.CommandContext(ocrCtx, binary, ocrPath, "stdout", "-l", language, "tsv")
+	cmd := exec.CommandContext(ocrCtx, binary, frame.Path, "stdout", "-l", language, "tsv")
+	// Bound CPU use per subprocess; several live rooms otherwise each launch
+	// Tesseract's own OpenMP pool and compete with Chrome for every core.
+	cmd.Env = append(os.Environ(), "OMP_THREAD_LIMIT=1")
 	out, err := cmd.Output()
 	if err != nil {
 		if errors.Is(ocrCtx.Err(), context.DeadlineExceeded) {
@@ -99,86 +90,51 @@ func (r TesseractRecognizer) Recognize(ctx context.Context, frame VideoFrame) (S
 	if text == "" {
 		return SignalEvent{}, ErrNoText
 	}
-	if frame.FocusChat && xOffset > 0 {
-		for i := range regions {
-			regions[i].X += xOffset
-			regions[i].Area = "chat"
-		}
-	} else if width := pngFrameWidth(frame.Path); width > 0 {
-		text, regions = prioritizeRightSideText(text, regions, width)
+	if width, height := pngFrameSize(frame.Path); width > 0 && height > 0 {
+		text, regions = labelOCRAreas(text, regions, width, height)
 	}
 	return SignalEvent{ID: frame.EventID, RoomID: frame.RoomID, Source: SignalOCR, Text: text, Confidence: confidence, TextRegions: regions, ObservedAt: time.Now().UTC()}, nil
 }
 
-func pngFrameWidth(path string) int {
+func pngFrameSize(path string) (int, int) {
 	file, err := os.Open(path)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
 	defer file.Close()
 	config, err := png.DecodeConfig(file)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
-	return config.Width
+	return config.Width, config.Height
 }
 
-func prioritizeRightSideText(text string, regions []TextRegion, frameWidth int) (string, []TextRegion) {
-	if frameWidth <= 0 || len(regions) == 0 {
-		return text, regions
-	}
+// labelOCRAreas keeps OCR from the whole frame and uses geometry only to mark
+// likely chat lines. The lower-right band is where scrolling comments appear;
+// fixed notices higher in the right rail remain main-screen evidence.
+func labelOCRAreas(text string, regions []TextRegion, frameWidth, frameHeight int) (string, []TextRegion) {
 	lines := strings.Split(text, "\n")
-	if len(lines) != len(regions) {
-		return text, regions
-	}
-	var right, rest []string
-	for i := range regions {
-		if regions[i].X+regions[i].Width/2 >= frameWidth*2/3 {
-			regions[i].Area = "right"
-			right = append(right, lines[i])
-		} else {
-			rest = append(rest, lines[i])
+	for i, line := range lines {
+		area := "main"
+		if i < len(regions) {
+			region := &regions[i]
+			centerX := region.X + region.Width/2
+			centerY := region.Y + region.Height/2
+			if centerX >= frameWidth*2/3 && centerY >= frameHeight*2/5 {
+				area = "chat"
+			}
+			region.Area = area
+		}
+		label := "《主屏幕》"
+		if area == "chat" {
+			label = "《聊天区》"
+		}
+		lines[i] = label + " " + line
+		if i < len(regions) {
+			regions[i].Text = lines[i]
 		}
 	}
-	return strings.Join(append(right, rest...), "\n"), regions
-}
-
-// cropRightChatPanel focuses OCR on Douyin's right-side chat column while the
-// archived source frame remains full-size for later visual confirmation.
-func cropRightChatPanel(path string) (string, int, func(), error) {
-	source, err := os.Open(path)
-	if err != nil {
-		return "", 0, func() {}, err
-	}
-	frame, err := png.Decode(source)
-	_ = source.Close()
-	if err != nil {
-		return "", 0, func() {}, err
-	}
-	bounds := frame.Bounds()
-	width := bounds.Dx()
-	if width < 480 {
-		return "", 0, func() {}, errors.New("frame is too narrow to isolate the chat column")
-	}
-	left := bounds.Min.X + width*2/3
-	cropBounds := image.Rect(left, bounds.Min.Y, bounds.Max.X, bounds.Max.Y)
-	cropped := image.NewRGBA(image.Rect(0, 0, cropBounds.Dx(), cropBounds.Dy()))
-	draw.Draw(cropped, cropped.Bounds(), frame, cropBounds.Min, draw.Src)
-	temporary, err := os.CreateTemp("", "liveguard-chat-ocr-*.png")
-	if err != nil {
-		return "", 0, func() {}, err
-	}
-	path = temporary.Name()
-	if err = png.Encode(temporary, cropped); err != nil {
-		_ = temporary.Close()
-		_ = os.Remove(path)
-		return "", 0, func() {}, err
-	}
-	if err = temporary.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", 0, func() {}, err
-	}
-	return path, left - bounds.Min.X, func() { _ = os.Remove(path) }, nil
+	return strings.Join(lines, "\n"), regions
 }
 
 func parseTesseractTSV(output []byte) (string, float64, error) {
@@ -190,6 +146,7 @@ func parseTesseractTSVWithRegions(output []byte) (string, float64, []TextRegion,
 	reader := csv.NewReader(strings.NewReader(string(output)))
 	reader.Comma = '\t'
 	reader.FieldsPerRecord = -1
+	reader.LazyQuotes = true
 	type regionBuilder struct {
 		words                    []string
 		left, top, right, bottom int
@@ -231,8 +188,6 @@ func parseTesseractTSVWithRegions(output []byte) (string, float64, []TextRegion,
 		}
 		confidence, err := strconv.ParseFloat(strings.TrimSpace(record[10]), 64)
 		if err == nil && confidence >= 0 {
-			totalConfidence += confidence
-			confidenceCount++
 			region.confidenceSum += confidence
 			region.confidenceCount++
 		}
@@ -241,15 +196,28 @@ func parseTesseractTSVWithRegions(output []byte) (string, float64, []TextRegion,
 	regions := make([]TextRegion, 0, min(len(lineOrder), 256))
 	for _, key := range lineOrder {
 		region := regionsByLine[key]
-		line := compactHanSpacing(strings.Join(region.words, " "))
-		if line != "" {
+		line, contentRunes, noisyRunes := filterOCRLine(strings.Join(region.words, " "))
+		line = compactHanSpacing(line)
+		if line != "" && hasOCRWordCharacter(line) {
+			confidence := .5
+			if region.confidenceCount > 0 {
+				confidence = region.confidenceSum / float64(region.confidenceCount) / 100
+			}
+			// OCR confidence is word-derived. Drop a line only when it is both
+			// dominated by unsupported glyphs or exceptionally low-confidence;
+			// short chat messages remain eligible because they can be meaningful.
+			if (noisyRunes > 0 && noisyRunes*2 >= contentRunes) || (confidence < .12 && runeCount(line) > 3) {
+				continue
+			}
 			lines = append(lines, line)
-			if region.right > region.left && region.bottom > region.top && len(regions) < 256 {
-				confidence := .5
-				if region.confidenceCount > 0 {
-					confidence = region.confidenceSum / float64(region.confidenceCount) / 100
+			totalConfidence += confidence
+			confidenceCount++
+			if len(regions) < 256 {
+				x, y, width, height := 0, 0, 0, 0
+				if region.right > region.left && region.bottom > region.top {
+					x, y, width, height = region.left, region.top, region.right-region.left, region.bottom-region.top
 				}
-				regions = append(regions, TextRegion{Text: line, X: region.left, Y: region.top, Width: region.right - region.left, Height: region.bottom - region.top, Confidence: confidence})
+				regions = append(regions, TextRegion{Text: line, X: x, Y: y, Width: width, Height: height, Confidence: confidence})
 			}
 		}
 	}
@@ -259,7 +227,39 @@ func parseTesseractTSVWithRegions(output []byte) (string, float64, []TextRegion,
 	if confidenceCount == 0 {
 		return strings.Join(lines, "\n"), 0.5, regions, nil
 	}
-	return strings.Join(lines, "\n"), totalConfidence / float64(confidenceCount) / 100, regions, nil
+	return strings.Join(lines, "\n"), totalConfidence / float64(confidenceCount), regions, nil
+}
+
+// filterOCRLine keeps Chinese/English text, digits and ordinary punctuation.
+// Other scripts and decorative symbols are removed; a line mostly made from
+// those characters is discarded by the caller. This intentionally does not
+// try to judge whether a sequence of valid Chinese/English letters is
+// semantically coherent, since usernames, names and product terms are open-ended.
+func filterOCRLine(text string) (clean string, contentRunes, noisyRunes int) {
+	var result strings.Builder
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			result.WriteRune(r)
+			continue
+		}
+		contentRunes++
+		supported := unicode.Is(unicode.Han, r) || unicode.Is(unicode.Latin, r) || unicode.IsDigit(r) || unicode.IsPunct(r)
+		if supported || strings.ContainsRune("￥¥€£$%‰+-−×÷=<>@#&*/\\_|~^°℃", r) {
+			result.WriteRune(r)
+			continue
+		}
+		noisyRunes++
+	}
+	return strings.TrimSpace(result.String()), contentRunes, noisyRunes
+}
+
+func hasOCRWordCharacter(text string) bool {
+	for _, r := range text {
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Latin, r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // Chinese OCR commonly emits one token per glyph. Compact only spaces between

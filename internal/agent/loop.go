@@ -64,7 +64,7 @@ type Loop struct {
 func (l Loop) Run(parent context.Context, next NextTurn) (result LoopResult, err error) {
 	limits := l.Limits
 	if limits.MaxTurns <= 0 {
-		limits.MaxTurns = 4
+		limits.MaxTurns = 6
 	}
 	if limits.MaxCalls <= 0 {
 		limits.MaxCalls = 8
@@ -73,7 +73,7 @@ func (l Loop) Run(parent context.Context, next NextTurn) (result LoopResult, err
 		limits.MaxRepeatedCalls = 2
 	}
 	if limits.TotalTimeout <= 0 {
-		limits.TotalTimeout = 35 * time.Second
+		limits.TotalTimeout = 90 * time.Second
 	}
 	if limits.ToolTimeout <= 0 {
 		limits.ToolTimeout = 12 * time.Second

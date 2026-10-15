@@ -34,6 +34,7 @@ type PendingStatus struct {
 }
 
 type pendingSignal struct {
+	live       bool
 	priority   int
 	enqueuedAt time.Time
 	event      SignalEvent
@@ -74,7 +75,6 @@ func (q *signalQueue) notify() {
 	case q.wake <- struct{}{}:
 	default:
 	}
-	q.changed()
 }
 func (q *signalQueue) stats() PendingStatus {
 	q.mu.Lock()
@@ -105,6 +105,7 @@ func (q *signalQueue) offer(item pendingSignal) error {
 		q.mu.Unlock()
 		disposeSignals([]pendingSignal{item})
 		q.notify()
+		q.changed()
 		return nil
 	}
 	if item.version > q.version {
@@ -114,10 +115,10 @@ func (q *signalQueue) offer(item pendingSignal) error {
 			q.activeCancel()
 		}
 	}
-	if numericRevision(q.activeEvent, item.event) {
+	if !item.live && numericRevision(q.activeEvent, item.event) {
 		item.priority = 2
 	}
-	if q.activeCancel != nil && !item.event.ObservedAt.Before(q.activeEvent.ObservedAt) && ((item.priority > pendingPriority(q.activeEvent) && item.priority > 0) || numericRevision(q.activeEvent, item.event)) {
+	if q.activeCancel != nil && !item.event.ObservedAt.Before(q.activeEvent.ObservedAt) && ((item.priority > pendingPriority(q.activeEvent) && item.priority > 0) || (!item.live && numericRevision(q.activeEvent, item.event))) {
 		q.activeCancel()
 	}
 	kept := q.items[:0]
@@ -125,8 +126,8 @@ func (q *signalQueue) offer(item pendingSignal) error {
 		if !q.now().Before(old.expires) {
 			discarded = append(discarded, old)
 			q.status.Expired++
-		} else if old.event.Source == SignalFrame || samePendingObservation(old.event, item.event) || numericRevision(old.event, item.event) {
-			if numericRevision(old.event, item.event) {
+		} else if old.event.Source == SignalFrame || samePendingObservation(old.event, item.event) || numericRevision(old.event, item.event) || (item.live && old.live && old.priority == 0 && item.priority == 0 && old.event.RoomID == item.event.RoomID && old.event.Source == SignalOCR && item.event.Source == SignalOCR) {
+			if !item.live && numericRevision(old.event, item.event) {
 				item.priority = 2
 			}
 			if samePendingObservation(old.event, item.event) && item.enqueuedAt.IsZero() {
@@ -170,6 +171,9 @@ func (q *signalQueue) offer(item pendingSignal) error {
 	q.mu.Unlock()
 	disposeSignals(discarded)
 	q.notify()
+	if err != nil {
+		q.changed()
+	}
 	return err
 }
 
@@ -194,6 +198,7 @@ func (q *signalQueue) invalidate(version uint64, closeQueue bool) {
 	q.mu.Unlock()
 	disposeSignals(items)
 	q.notify()
+	q.changed()
 }
 
 func (q *signalQueue) accepting() bool {
@@ -245,7 +250,9 @@ func (q *signalQueue) loop() {
 			q.changed()
 			continue
 		}
-		ctx, cancel := context.WithDeadline(q.ctx, item.expires)
+		// Cadence/global-slot waiting and model execution have separate
+		// deadlines, so a newer coalesced observation can replace the trigger.
+		ctx, cancel := context.WithCancel(q.ctx)
 		q.activeCancel = cancel
 		q.activeEvent = item.event
 		q.status.Reviewing = true
@@ -271,6 +278,21 @@ func (q *signalQueue) loop() {
 		q.mu.Unlock()
 		q.changed()
 	}
+}
+
+func (q *signalQueue) latestLiveTrigger(event SignalEvent, version uint64) (SignalEvent, func()) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := len(q.items) - 1; i >= 0; i-- {
+		item := q.items[i]
+		if item.live && item.version == version && item.priority == 0 && item.event.Source == SignalOCR && item.event.RoomID == event.RoomID && !item.event.ObservedAt.Before(event.ObservedAt) {
+			q.items = append(q.items[:i], q.items[i+1:]...)
+			q.activeEvent = item.event
+			q.status.Coalesced++
+			return item.event, item.cleanup
+		}
+	}
+	return event, nil
 }
 
 // SubmitSignal returns after admission, not model completion. Its accepted
@@ -334,7 +356,7 @@ func (s *Service) SubmitSignal(ctx context.Context, runID string, event SignalEv
 		return err
 	}
 	expires := signalDeadline(event)
-	if err = q.offer(pendingSignal{event: event, version: snapshot.GoalVersion, expires: expires, cleanup: cleanup}); err != nil {
+	if err = q.offer(pendingSignal{event: event, version: snapshot.GoalVersion, expires: expires, cleanup: cleanup, live: snapshot.SourceMode == "browser_ocr"}); err != nil {
 		cleanup()
 		s.rollbackSignal(runID, event)
 	}

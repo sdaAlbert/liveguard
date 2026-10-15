@@ -47,6 +47,11 @@ func (s *Service) reviewReleaseLocked(runID string) func() {
 			s.mu.Lock()
 			<-s.reviewSlots
 			delete(s.reviewInFlight, runID)
+			// A slow multi-turn investigation also needs a cooldown. Measuring
+			// only from its start otherwise keeps the model permanently busy.
+			if s.contexts[runID] != nil {
+				s.lastUnexpectedReview[runID] = time.Now().UTC()
+			}
 			s.dispatchReviewsLocked(time.Now().UTC())
 			s.mu.Unlock()
 		})

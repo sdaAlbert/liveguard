@@ -24,8 +24,21 @@ import (
 
 func main() {
 	loadEnvFiles(".env.local", filepath.Join("..", ".env.local"))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	closeRuntimeLog := configureRuntimeLogging()
+	defer closeRuntimeLog()
+	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
+	exitSignals := make(chan os.Signal, 1)
+	signal.Notify(exitSignals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(exitSignals)
+	go func() {
+		select {
+		case received := <-exitSignals:
+			log.Printf("LiveGuard shutdown requested: source=os_signal signal=%q", received.String())
+			stop()
+		case <-ctx.Done():
+		}
+	}()
 	shutdownTrace := func(context.Context) error { return nil }
 	if endpoint := strings.TrimSpace(os.Getenv("LIVEGUARD_OTEL_ENDPOINT")); endpoint != "" && !strings.EqualFold(endpoint, "off") && !strings.EqualFold(endpoint, "disabled") {
 		var err error
@@ -42,23 +55,16 @@ func main() {
 		_ = shutdownTrace(shutdownCtx)
 	}()
 	infraMode := strings.ToLower(envOr("LIVEGUARD_INFRA_MODE", "local"))
-	databaseURL := envOr("LIVEGUARD_DATABASE_URL", "postgres://liveguard:liveguard_local@127.0.0.1:5433/liveguard?sslmode=disable")
 	chromePath := envOr("LIVEGUARD_CHROME_PATH", defaultChromePath())
 	webServer := webapp.New("artifacts")
-	webServer.SetShutdownHandler(stop)
+	webServer.SetShutdownHandler(func() {
+		log.Print("LiveGuard shutdown requested: source=local_shutdown_api")
+		stop()
+	})
 	var monitorRepository monitor.Repository
-	if infraMode == "durable" {
-		monitorCtx, cancelMonitor := context.WithTimeout(ctx, 10*time.Second)
-		postgresMonitors, monitorErr := monitor.OpenPostgres(monitorCtx, databaseURL)
-		cancelMonitor()
-		if monitorErr != nil {
-			log.Fatalf("durable monitor store: %v", monitorErr)
-		}
-		defer postgresMonitors.Close()
-		monitorRepository = postgresMonitors
-	} else if infraMode == "memory" {
+	if infraMode == "memory" {
 		monitorRepository = monitor.NewMemoryRepository()
-	} else {
+	} else if infraMode == "local" {
 		localPath := envOr("LIVEGUARD_LOCAL_STATE_PATH", filepath.Join("runtime", "liveguard.json"))
 		localRepository, err := monitor.OpenFileRepository(localPath)
 		if err != nil {
@@ -71,6 +77,8 @@ func main() {
 		}()
 		monitorRepository = localRepository
 		log.Printf("local monitor state persisted to %s", localPath)
+	} else {
+		log.Fatalf("unsupported LIVEGUARD_INFRA_MODE %q; use local or memory", infraMode)
 	}
 	monitorService := monitor.NewService(monitorRepository, func() {
 		webServer.Publish(domain.Event{ID: domain.NewID("event"), Type: "monitor_update", Message: "monitor state updated", At: time.Now().UTC()})
@@ -157,7 +165,9 @@ func main() {
 }
 
 func allowedHosts() map[string]bool {
-	raw := envOr("LIVEGUARD_ALLOWED_HOSTS", "douyin.com,www.douyin.com,localhost,127.0.0.1")
+	// Empty means any valid HTTP(S) target. Deployments that need a tighter
+	// browser navigation boundary can provide a comma-separated host allowlist.
+	raw := strings.TrimSpace(os.Getenv("LIVEGUARD_ALLOWED_HOSTS"))
 	result := map[string]bool{}
 	for _, host := range strings.Split(raw, ",") {
 		if host = strings.TrimSpace(strings.ToLower(host)); host != "" {

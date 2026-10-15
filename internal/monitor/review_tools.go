@@ -27,20 +27,22 @@ type reviewToolResult struct {
 }
 
 type reviewState struct {
-	readEvidenceTurn int
-	historyEvidence  []SignalEvent
-	historySearches  int
-	searchedHistory  bool
-	searchedCategory string
-	searchAlertsTurn int
-	duplicateFound   bool
-	frameInspected   bool
-	frameInspectTurn int
-	frameObservedAt  time.Time
-	frameEventID     string
-	frameArchiveID   string
-	frameAsset       *FrameAsset
-	frameAssetOwned  bool
+	readEvidenceTurn    int
+	historyEvidence     []SignalEvent
+	historySearches     int
+	contextBudget       *reviewContextBudget
+	searchedHistory     bool
+	searchedCategory    string
+	searchAlertsTurn    int
+	duplicateFound      bool
+	frameInspected      bool
+	frameSavedForReview bool
+	frameInspectTurn    int
+	frameObservedAt     time.Time
+	frameEventID        string
+	frameArchiveID      string
+	frameAsset          *FrameAsset
+	frameAssetOwned     bool
 }
 
 const maxObservationSearchPages = 6
@@ -71,7 +73,7 @@ func reviewToolsForPlan(plan MonitoringPlan) []map[string]any {
 		{"name": "search_observations", "description": "Search this monitor's persisted OCR, ASR, frame and visual observations. scope=recent reads live context; scope=all searches history. text_any is an OR-list of up to 8 phrases, so related wording can be searched in one request. total_matches is the exact number of matching observation records for the filters (not distinct real-world events), independent of the page cursor. Each page returns at most 12 records and provides a cursor when older matches remain; pass all cursor fields back to continue.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"scope": map[string]any{"type": "string", "enum": []string{"recent", "all"}}, "text": map[string]any{"type": "string", "maxLength": 120}, "text_any": map[string]any{"type": "array", "maxItems": 8, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 120}}, "source": map[string]any{"type": "string", "enum": []string{"ocr", "asr", "frame", "vision"}}, "room_id": map[string]any{"type": "string", "maxLength": 80}, "from": map[string]any{"type": "string", "format": "date-time"}, "until": map[string]any{"type": "string", "format": "date-time"}, "before": map[string]any{"type": "string", "format": "date-time"}, "before_sequence": map[string]any{"type": "integer"}, "before_id": map[string]any{"type": "string", "maxLength": 128}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 12}}, "additionalProperties": false}},
 		{"name": "search_recent_alerts", "description": "Check whether this monitor has already alerted on the same event category.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"category": categorySchema}, "required": []string{"category"}, "additionalProperties": false}},
 		{"name": "inspect_live_frame", "description": "Inspect the current screenshot, or set observation_id to inspect an archived screenshot returned by search_observations. Use only when image evidence can resolve an important question.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"observation_id": map[string]any{"type": "string", "maxLength": 128}}, "additionalProperties": false}},
-		{"name": "save_frame_evidence", "description": "Save the exact current screenshot you just inspected as durable evidence. Call only when the image materially supports a user alert or an important conclusion that should be auditable. This is separate from inspecting: screenshots are not saved unless this tool succeeds.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}},
+		{"name": "save_frame_evidence", "description": "Keep the exact screenshot you just inspected available only for this investigation. Call only when the image materially supports an alert or conclusion. The image stays in a temporary file and is deleted when this investigation ends; it is never copied to runtime or persisted. When selected, only its OCR text and your text finding may be recorded.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}},
 		{"name": "create_alert", "description": "Request a user alert after evidence review and duplicate check. For chat_match, inspect the current image and confirm the target text is located in the visible chat area; OCR alone is insufficient. If you inspected the image, include only visible, relevant details in visual_finding. The server validates confidence and deduplication before writing it.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"category": categorySchema, "summary": map[string]any{"type": "string"}, "reason": map[string]any{"type": "string"}, "confidence": map[string]any{"type": "number"}, "visual_finding": map[string]any{"type": "string"}}, "required": []string{"category", "summary", "reason", "confidence", "visual_finding"}, "additionalProperties": false}},
 	}
 	return tools
@@ -151,6 +153,10 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 		}
 	}
 	if block.Name == "search_observations" {
+		if state.contextBudget != nil && state.contextBudget.exhausted {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"investigation evidence context budget exhausted; stop searching and decide from evidence already returned"}`, "本次调查的历史证据上下文已满，停止继续检索"
+			return result, UnexpectedEventDecision{}, false
+		}
 		if state.historySearches >= maxObservationSearchPages {
 			result.IsError, result.Content, result.Outcome = true, `{"error":"history search budget exhausted"}`, "本次调查的全程证据查询次数已达上限"
 			return result, UnexpectedEventDecision{}, false
@@ -224,17 +230,21 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 		if args.Scope == "all" {
 			state.searchedHistory = true
 		}
-		for i := range page.Events {
-			page.Events[i].Text = boundedReviewText(page.Events[i].Text, 400)
-			page.Events[i].TextRegions = boundedTextRegions(page.Events[i].TextRegions)
-		}
-		state.historyEvidence = append(state.historyEvidence, page.Events...)
+		modelEvents, acceptedEvents, contextTruncated := state.contextBudget.compactObservationPage(page.Events)
+		contextTruncated = contextTruncated || state.contextBudget.exhausted && page.HasMore
+		state.historyEvidence = append(state.historyEvidence, acceptedEvents...)
 		var nextBefore, nextBeforeSequence, nextBeforeID any
-		if page.HasMore {
+		if page.HasMore && !contextTruncated {
 			nextBefore, nextBeforeSequence, nextBeforeID = page.NextBefore, page.NextBeforeSequence, page.NextBeforeEventID
 		}
-		encoded, _ := json.Marshal(map[string]any{"observations": page.Events, "count_returned": len(page.Events), "total_matches": page.TotalMatches, "count_semantics": "matching observation records, not distinct real-world events", "has_more": page.HasMore, "next_before": nextBefore, "next_before_sequence": nextBeforeSequence, "next_before_id": nextBeforeID, "limit": query.Limit})
-		result.Content, result.Outcome = string(encoded), fmt.Sprintf("从%s观测记录中找到 %d 条%s", map[bool]string{true: "整场", false: "近期"}[args.Scope == "all"], len(page.Events), map[bool]string{true: "，仍有更早结果", false: ""}[page.HasMore])
+		encoded, _ := json.Marshal(map[string]any{"observations": modelEvents, "count_returned": len(modelEvents), "total_matches": page.TotalMatches, "count_semantics": "matching observation records, not distinct real-world events", "has_more": page.HasMore || contextTruncated, "context_budget_exhausted": contextTruncated, "next_before": nextBefore, "next_before_sequence": nextBeforeSequence, "next_before_id": nextBeforeID, "limit": query.Limit})
+		outcome := fmt.Sprintf("从%s观测记录中找到 %d 条", map[bool]string{true: "整场", false: "近期"}[args.Scope == "all"], len(modelEvents))
+		if contextTruncated {
+			outcome += "；本次调查上下文已满，停止继续检索"
+		} else if page.HasMore {
+			outcome += "，仍有更早结果"
+		}
+		result.Content, result.Outcome = string(encoded), outcome
 		return result, UnexpectedEventDecision{}, false
 	}
 	if block.Name == "inspect_live_frame" {
@@ -339,19 +349,6 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 			result.IsError, result.Content, result.Outcome = true, `{"error":"question must be 4-240 characters, with at most four short options"}`, "求助内容不符合长度限制"
 			return result, UnexpectedEventDecision{}, false
 		}
-		if state.frameInspected && state.frameArchiveID == "" && input.SaveFrame != nil && state.frameAsset != nil {
-			saved, err := input.SaveFrame(ctx, *state.frameAsset)
-			if err != nil {
-				result.IsError, result.Content, result.Outcome = true, `{"error":"evidence frame could not be saved for the clarification"}`, "无法保存本次求助关联的画面证据"
-				return result, UnexpectedEventDecision{}, false
-			}
-			state.frameAsset, state.frameArchiveID = &saved, saved.ArchiveID
-			for i := range state.historyEvidence {
-				if saved.OCR != nil && state.historyEvidence[i].ID == saved.OCR.ID {
-					state.historyEvidence[i].FrameArchiveID = saved.ArchiveID
-				}
-			}
-		}
 		decision.VisualEvidenceID, decision.VisualArchiveID, decision.VisualObservedAt = state.frameEventID, state.frameArchiveID, state.frameObservedAt
 		result.Content, result.Outcome = map[string]any{"question": decision.UserQuestion, "options": decision.UserOptions, "monitoring_continues": true}, "已向用户提出问题；本次调查等待回复，监控继续运行"
 		return result, decision, true
@@ -361,28 +358,27 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 			result.IsError, result.Content, result.Outcome = true, `{"error":"inspect the frame and receive the model result before saving it"}`, "必须先看图并接收判断结果，才能保存图片"
 			return result, UnexpectedEventDecision{}, false
 		}
-		if state.frameArchiveID != "" {
-			result.Content, result.Outcome = `{"saved":true,"already_archived":true}`, "这张截图已有归档证据"
+		if state.frameSavedForReview {
+			result.Content, result.Outcome = `{"saved_temporarily":true,"persisted":false}`, "图片仅临时保留到本次调查结束；不会写入项目目录"
 			return result, UnexpectedEventDecision{}, false
 		}
-		if input.SaveFrame == nil || state.frameAsset == nil {
-			result.IsError, result.Content, result.Outcome = true, `{"error":"durable screenshot saving is unavailable"}`, "当前存储未提供截图归档能力"
+		if !state.frameInspected || state.frameAsset == nil {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"inspect the current frame before selecting it"}`, "请先查看当前画面，再选择是否保留作本次判断依据"
 			return result, UnexpectedEventDecision{}, false
 		}
-		saved, err := input.SaveFrame(ctx, *state.frameAsset)
-		if err != nil {
-			result.IsError, result.Content, result.Outcome = true, `{"error":"screenshot evidence could not be saved"}`, "截图证据保存失败"
+		if state.frameInspectTurn >= turn {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"wait for the image result before selecting it"}`, "必须先收到看图结果，才能选择这张图片"
 			return result, UnexpectedEventDecision{}, false
 		}
-		state.frameAsset = &saved
-		state.frameArchiveID = saved.ArchiveID
-		for i := range state.historyEvidence {
-			if saved.OCR != nil && state.historyEvidence[i].ID == saved.OCR.ID {
-				state.historyEvidence[i].FrameArchiveID = saved.ArchiveID
+		if input.RecordFrameEvidence != nil {
+			if err := input.RecordFrameEvidence(ctx, *state.frameAsset); err != nil {
+				result.IsError, result.Content, result.Outcome = true, `{"error":"text evidence could not be recorded"}`, "无法记录这张截图对应的文字证据"
+				return result, UnexpectedEventDecision{}, false
 			}
 		}
-		encoded, _ := json.Marshal(map[string]any{"saved": true, "observation_id": saved.ObservationID, "frame_archive_id": saved.ArchiveID, "observed_at": saved.ObservedAt})
-		result.Content, result.Outcome = string(encoded), "已保存这张截图，可作为提醒的图片依据"
+		state.frameSavedForReview = true
+		encoded, _ := json.Marshal(map[string]any{"saved_temporarily": true, "persisted": false, "observation_id": state.frameEventID, "observed_at": state.frameObservedAt})
+		result.Content, result.Outcome = string(encoded), "图片只在本次调查中临时保留；调查结束后删除，文字结论会随调查记录保存"
 		return result, UnexpectedEventDecision{}, false
 	}
 	return runReviewTool(block, input, evidence, state, turn)
@@ -489,8 +485,8 @@ func runReviewTool(block agent.ToolCall, input UnexpectedEventInput, evidence []
 			result.Outcome = "看图结果未形成可核验的文字结论，服务端拒绝提醒"
 			return result, UnexpectedEventDecision{}, false
 		}
-		if state.frameInspected && strings.TrimSpace(args.VisualFinding) != "" && state.frameArchiveID == "" {
-			result.IsError, result.Content, result.Outcome = true, `{"error":"save the inspected screenshot with save_frame_evidence before using visual findings in an alert"}`, "提醒引用了看图结论；请先调用保存画面证据工具"
+		if state.frameInspected && strings.TrimSpace(args.VisualFinding) != "" && !state.frameSavedForReview {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"select the inspected screenshot with save_frame_evidence before using visual findings in an alert"}`, "提醒引用了看图结论；请先选择将该图作为本次判断依据"
 			return result, UnexpectedEventDecision{}, false
 		}
 		if !state.frameInspected && strings.TrimSpace(args.VisualFinding) != "" {
@@ -527,12 +523,20 @@ func runReviewTool(block agent.ToolCall, input UnexpectedEventInput, evidence []
 		if args.Category == "chat_match" || input.Plan.AlertScope == "chat" || goalNeedsChatRegion(input.Goal) {
 			matched := false
 			for _, item := range cited {
-				if item.Source == string(SignalOCR) && item.FrameArchiveID != "" && item.FrameArchiveID == state.frameArchiveID {
+				if item.Source != string(SignalOCR) {
+					continue
+				}
+				if state.frameArchiveID != "" && item.FrameArchiveID == state.frameArchiveID {
 					matched = true
+				}
+				for _, observed := range state.historyEvidence {
+					if observed.ID == item.EventID && observed.ParentEventID == state.frameEventID {
+						matched = true
+					}
 				}
 			}
 			if !matched {
-				result.IsError, result.Content, result.Outcome = true, `{"error":"cite OCR from the same archived screenshot that was inspected"}`, "聊天文字与所看截图没有匹配的原图引用"
+				result.IsError, result.Content, result.Outcome = true, `{"error":"cite OCR from the same screenshot that was inspected"}`, "聊天文字与本次查看的画面没有匹配的 OCR 引用"
 				return result, UnexpectedEventDecision{}, false
 			}
 		}
@@ -601,8 +605,9 @@ func boundedEvidence(events []SignalEvent) []map[string]any {
 		if runes := []rune(text); len(runes) > 600 {
 			text = string(runes[:600])
 		}
-		regions := boundedTextRegions(event.TextRegions)
-		result = append(result, map[string]any{"id": event.ID, "source": event.Source, "text": text, "text_regions": regions, "confidence": event.Confidence, "observed_at": event.ObservedAt})
+		// OCR area labels are already included in event text. Repeating all line
+		// boxes here wastes prompt space without adding evidence for the model.
+		result = append(result, map[string]any{"id": event.ID, "source": event.Source, "text": text, "confidence": event.Confidence, "observed_at": event.ObservedAt})
 	}
 	return result
 }

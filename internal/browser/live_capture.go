@@ -28,6 +28,8 @@ type LiveCapturer struct {
 	ProfileDir   string
 	AllowedHosts map[string]bool
 	Warmup       time.Duration
+	// Headless is used by unattended browser/OCR stability fixtures.
+	Headless bool
 
 	mu          sync.Mutex
 	cmd         *exec.Cmd
@@ -57,7 +59,7 @@ type devtoolsResponse struct {
 	} `json:"error"`
 }
 
-// OpenLoginWindow launches the dedicated monitoring Chrome and opens Douyin.
+// OpenLoginWindow launches the dedicated monitoring Chrome and opens a platform URL.
 // The first monitor reuses this authenticated tab and navigates it to the
 // requested live URL; later monitors get their own tabs in the same profile.
 func (c *LiveCapturer) OpenLoginWindow(targetURL string) error {
@@ -133,7 +135,7 @@ func (c *LiveCapturer) Capture(ctx context.Context, monitorID, targetURL, destin
 	}
 	result, err := page.call(ctx, "Page.captureScreenshot", map[string]any{"format": "png", "captureBeyondViewport": false})
 	if err != nil {
-		if isDevToolsDisconnected(err) {
+		if ctx.Err() != nil || isDevToolsDisconnected(err) {
 			c.discardPage(monitorID, page)
 		}
 		return fmt.Errorf("capture Chrome tab: %w", err)
@@ -155,6 +157,37 @@ func (c *LiveCapturer) Capture(ctx context.Context, monitorID, targetURL, destin
 		return err
 	}
 	return nil
+}
+
+// PageTitle reads the loaded page title using the same dedicated Chrome tab
+// used for capture. It does not inspect the user's everyday browser profile.
+func (c *LiveCapturer) PageTitle(ctx context.Context, monitorID, targetURL string) (string, error) {
+	if err := validateLiveURL(targetURL, c.AllowedHosts); err != nil {
+		return "", err
+	}
+	page, _, err := c.page(ctx, monitorID, targetURL)
+	if err != nil {
+		return "", err
+	}
+	result, err := page.call(ctx, "Runtime.evaluate", map[string]any{
+		"expression":    "document.querySelector('meta[property=\"og:title\"]')?.content || document.title || ''",
+		"returnByValue": true,
+	})
+	if err != nil {
+		if ctx.Err() != nil || isDevToolsDisconnected(err) {
+			c.discardPage(monitorID, page)
+		}
+		return "", err
+	}
+	var payload struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return "", fmt.Errorf("read Chrome page title: %w", err)
+	}
+	return payload.Result.Value, nil
 }
 
 // Close releases one monitor tab while keeping the shared login browser open.
@@ -193,8 +226,15 @@ func (c *LiveCapturer) CloseAll() {
 }
 
 func (c *LiveCapturer) page(ctx context.Context, monitorID, targetURL string) (*livePage, bool, error) {
-	c.mu.Lock()
+	for !c.mu.TryLock() {
+		if err := waitContext(ctx, 5*time.Millisecond); err != nil {
+			return nil, false, err
+		}
+	}
 	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if c.pages == nil {
 		c.pages = map[string]*livePage{}
 	}
@@ -239,7 +279,7 @@ func (c *LiveCapturer) page(ctx context.Context, monitorID, targetURL string) (*
 	if err != nil {
 		return nil, false, err
 	}
-	connection, err := websocket.DialConfig(config)
+	connection, err := config.DialContext(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("connect to Chrome tab: %w", err)
 	}
@@ -276,6 +316,10 @@ func (c *LiveCapturer) discardPage(monitorID string, page *livePage) {
 func isDevToolsDisconnected(err error) bool {
 	if err == nil {
 		return false
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return true
 	}
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{"connection was aborted", "use of closed network connection", "wsasend", "wsarecv", "unexpected eof", "broken pipe"} {
@@ -316,13 +360,18 @@ func (c *LiveCapturer) startBrowser(ctx context.Context) error {
 	if binary == "" {
 		binary = "chrome"
 	}
-	command := exec.Command(binary,
+	arguments := []string{
 		"--new-window", "--no-first-run", "--no-default-browser-check",
-		"--remote-debugging-address=127.0.0.1", "--remote-debugging-port="+strconv.Itoa(port),
+		"--remote-debugging-address=127.0.0.1", "--remote-debugging-port=" + strconv.Itoa(port),
 		"--remote-allow-origins=*",
-		"--user-data-dir="+profile, "--autoplay-policy=no-user-gesture-required",
+		"--user-data-dir=" + profile, "--autoplay-policy=no-user-gesture-required",
 		"--window-size=1440,1000", "about:blank",
-	)
+		"--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+	}
+	if c.Headless {
+		arguments = append(arguments, "--headless=new")
+	}
+	command := exec.Command(binary, arguments...)
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start dedicated Chrome: %w", err)
 	}
@@ -363,15 +412,38 @@ func (c *LiveCapturer) httpClient() *http.Client {
 }
 
 func (p *livePage) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	p.mu.Lock()
+	// A visual tool can share this page with sampling. Waiting for that call
+	// must consume the caller's budget rather than block behind a stale socket.
+	for !p.mu.TryLock() {
+		if err := waitContext(ctx, 5*time.Millisecond); err != nil {
+			return nil, err
+		}
+	}
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	p.nextID++
 	request := struct {
 		ID     int    `json:"id"`
 		Method string `json:"method"`
 		Params any    `json:"params"`
 	}{ID: p.nextID, Method: method, Params: params}
-	_ = p.conn.SetDeadline(time.Now().Add(30 * time.Second))
+	deadline := time.Now().Add(30 * time.Second)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	_ = p.conn.SetDeadline(deadline)
+	cancelled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = p.conn.SetDeadline(time.Now())
+		close(cancelled)
+	})
+	defer func() {
+		if !stop() {
+			<-cancelled
+		}
+	}()
 	if err := websocket.JSON.Send(p.conn, request); err != nil {
 		return nil, err
 	}

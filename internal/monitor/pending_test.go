@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -291,6 +290,33 @@ func TestPendingBoundsExpiryBackgroundCoalescingAndGoalInvalidation(t *testing.T
 	}
 }
 
+func TestAcceptedSignalDoesNotInvalidateUIUntilQueueStateChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var changed atomic.Int32
+	q := &signalQueue{ctx: ctx, cancel: cancel, version: 1, wake: make(chan struct{}, 1), now: time.Now, changed: func() { changed.Add(1) }}
+	item := func(id string) pendingSignal {
+		return pendingSignal{event: SignalEvent{ID: id, Source: SignalOCR, Text: "文字" + id}, version: 1, expires: time.Now().Add(time.Minute)}
+	}
+	if err := q.offer(item("one")); err != nil {
+		t.Fatal(err)
+	}
+	if changed.Load() != 0 {
+		t.Fatal("accepted OCR signal should wake the worker without refreshing the UI")
+	}
+	q.mu.Lock()
+	for i := 1; i < maxPendingSignals; i++ {
+		q.items = append(q.items, item(fmt.Sprint(i)))
+	}
+	q.mu.Unlock()
+	if err := q.offer(item("overflow")); !errors.Is(err, ErrPendingFull) {
+		t.Fatalf("expected bounded queue rejection, got %v", err)
+	}
+	if changed.Load() != 1 {
+		t.Fatalf("visible backpressure should invalidate UI once; got %d", changed.Load())
+	}
+}
+
 func TestGoalChangeCancelsQueuedReviewAndClearsWaitingMessages(t *testing.T) {
 	s := NewService(NewMemoryRepository(), nil)
 	defer s.StopAll()
@@ -397,7 +423,7 @@ func TestQueuedMonitorsRespectGlobalLimitAndResumeAfterSlotRelease(t *testing.T)
 	}
 }
 
-func TestCaptureFailurePausesWithVisibleReasonAndRemainsStoppable(t *testing.T) {
+func TestCaptureFailureRetriesAndLoginWaitsForUser(t *testing.T) {
 	for _, login := range []bool{false, true} {
 		t.Run(fmt.Sprint(login), func(t *testing.T) {
 			repo := NewMemoryRepository()
@@ -407,7 +433,7 @@ func TestCaptureFailurePausesWithVisibleReasonAndRemainsStoppable(t *testing.T) 
 				runs, _ := repo.List(context.Background())
 				if len(runs) > 0 && len(runs[0].Rooms) > 0 {
 					room := runs[0].Rooms[0]
-					if (login && room.Health == SourceNeedsLogin) || (!login && strings.Contains(room.LastError, "已暂停")) {
+					if (login && room.Health == SourceNeedsLogin) || (!login && room.Health == SourceDelayed) {
 						once.Do(func() { close(ready) })
 					}
 				}
@@ -434,8 +460,8 @@ func TestCaptureFailurePausesWithVisibleReasonAndRemainsStoppable(t *testing.T) 
 			if current.Rooms[0].LastError == "" || (login && current.Rooms[0].Health != SourceNeedsLogin) {
 				t.Fatal("fault shown as healthy")
 			}
-			if !login && c.count.Load() != 3 {
-				t.Fatalf("capture should pause after three failures, got %d", c.count.Load())
+			if !login && current.Rooms[0].Health != SourceDelayed {
+				t.Fatalf("temporary failure should retry, got %#v", current.Rooms[0])
 			}
 			if _, err = s.Stop(context.Background(), run.ID); err != nil {
 				t.Fatal(err)

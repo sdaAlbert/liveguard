@@ -32,6 +32,8 @@ type ModelSettingsStatus struct {
 // selected in the UI. Runtime configuration and UI defaults share this source.
 type ModelProviderOption struct {
 	Model        string            `json:"model"`
+	Models       []string          `json:"models"`
+	VisionModels []string          `json:"vision_models"`
 	Endpoint     string            `json:"endpoint"`
 	Capabilities ModelCapabilities `json:"capabilities"`
 }
@@ -39,8 +41,15 @@ type ModelProviderOption struct {
 func modelProviderOptions() map[string]ModelProviderOption {
 	options := make(map[string]ModelProviderOption, len(providerDefaults)+1)
 	for provider, defaults := range providerDefaults {
+		visionModels := make([]string, 0, len(defaults.Models))
+		for _, model := range defaults.Models {
+			if defaultVisionCapability(provider, model) {
+				visionModels = append(visionModels, model)
+			}
+		}
 		options[provider] = ModelProviderOption{
 			Model: defaults.Model, Endpoint: defaults.Endpoint,
+			Models: append([]string(nil), defaults.Models...), VisionModels: visionModels,
 			Capabilities: ModelCapabilities{
 				ToolCalling: true,
 				Vision:      defaultVisionCapability(provider, defaults.Model),
@@ -87,10 +96,14 @@ func (s *Service) ConfigureModel(input ModelSettingsInput) (ModelSettingsStatus,
 	}
 	var planner GoalPlanner = ruleGoalPlanner{}
 	var reviewer UnexpectedEventReviewer
+	var baseline BaselineAnalyzer
 	if config.Provider != "rules" {
 		model := configuredToolModel(config)
 		planner = &AgentGoalPlanner{Model: model}
 		reviewer = &AgentReviewer{Model: model, Breaker: agent.NewCircuitBreaker(2, 30*time.Second)}
+		if config.Capabilities.Vision {
+			baseline = &AgentBaselineAnalyzer{Model: model}
+		}
 	}
 	status := ModelSettingsStatus{
 		Provider: config.Provider, Model: config.Model, Endpoint: config.Endpoint,
@@ -99,6 +112,7 @@ func (s *Service) ConfigureModel(input ModelSettingsInput) (ModelSettingsStatus,
 	}
 	s.modelMu.Lock()
 	s.goalPlanner, s.reviewer, s.modelAPIKey, s.modelConfig = planner, reviewer, config.APIKey, status
+	s.baselineAnalyzer = baseline
 	s.modelMu.Unlock()
 	s.onUpdate()
 	return status, nil

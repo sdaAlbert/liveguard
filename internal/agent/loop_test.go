@@ -26,6 +26,19 @@ func TestLoopExecutesRegisteredToolAndFeedsObservationBack(t *testing.T) {
 	}
 }
 
+func TestLoopDefaultTurnBudgetAllowsSixTurns(t *testing.T) {
+	result, err := (Loop{}).Run(context.Background(), func(_ context.Context, _ []Observation, turn int) (ModelTurn, error) {
+		if turn < 5 {
+			args, _ := json.Marshal(map[string]int{"turn": turn})
+			return ModelTurn{Calls: []ToolCall{{ID: string(rune('a' + turn)), Name: "read", Arguments: args}}}, nil
+		}
+		return ModelTurn{Final: "finished on sixth turn"}, nil
+	})
+	if err != nil || result.Value != "finished on sixth turn" || result.Turns != 6 || result.StopReason != "finished" {
+		t.Fatalf("default turn budget stopped too early: %#v %v", result, err)
+	}
+}
+
 func TestLoopStopsRepeatedCallsWithEquivalentJSONArguments(t *testing.T) {
 	count := 0
 	loop := Loop{Tools: map[string]ToolHandler{"read": func(context.Context, ToolCall, int) ToolOutput { count++; return ToolOutput{} }}}

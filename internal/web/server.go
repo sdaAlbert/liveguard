@@ -42,6 +42,7 @@ type MonitorService interface {
 	List(context.Context) ([]monitor.Summary, error)
 	Get(context.Context, string) (*monitor.Run, error)
 	UpdateGoal(context.Context, string, string) (*monitor.Run, error)
+	SubmitInstruction(context.Context, string, string) (*monitor.Run, error)
 	AnswerInvestigation(context.Context, string, string, string) (*monitor.Run, error)
 	Pause(context.Context, string) (*monitor.Run, error)
 	Resume(context.Context, string) (*monitor.Run, error)
@@ -277,6 +278,64 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, run)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "instruction" && r.Method == http.MethodPost {
+		var input struct {
+			Instruction string `json:"instruction"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&input); err != nil {
+			writeError(w, http.StatusBadRequest, "请输入给 Agent 的指令")
+			return
+		}
+		instruction := strings.TrimSpace(input.Instruction)
+		if strings.HasPrefix(instruction, "目标：") || strings.HasPrefix(instruction, "目标:") {
+			goal := strings.TrimSpace(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(instruction, "目标："), "目标:"), " \t\r\n"))
+			if length := len([]rune(goal)); length < 2 || length > 240 {
+				writeError(w, http.StatusBadRequest, "目标应为 2-240 个字符")
+				return
+			}
+			run, err := s.monitorService.UpdateGoal(r.Context(), id, goal)
+			if err != nil {
+				if errors.Is(err, monitor.ErrNotFound) {
+					http.NotFound(w, r)
+					return
+				}
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			if run.Status == monitor.RunPaused {
+				run, err = s.monitorService.Resume(r.Context(), id)
+				if err != nil {
+					if errors.Is(err, monitor.ErrCapacity) {
+						writeError(w, http.StatusTooManyRequests, "目标已更新，但同时运行的监控已达上限；可稍后点击继续")
+						return
+					}
+					writeError(w, http.StatusConflict, err.Error())
+					return
+				}
+			}
+			writeJSON(w, http.StatusOK, run)
+			return
+		}
+		run, err := s.monitorService.SubmitInstruction(r.Context(), id, instruction)
+		if err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			if errors.Is(err, monitor.ErrInvalidTransition) {
+				writeError(w, http.StatusConflict, "监控已结束，不能继续下达指令")
+				return
+			}
+			if errors.Is(err, monitor.ErrCapacity) {
+				writeError(w, http.StatusTooManyRequests, "同时运行的监控已达上限")
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, run)
 		return
 	}
 	if len(parts) == 4 && parts[1] == "investigations" && parts[3] == "reply" && r.Method == http.MethodPost {
@@ -543,7 +602,8 @@ func (s *Server) browserSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if input.URL = strings.TrimSpace(input.URL); input.URL == "" {
-			input.URL = "https://www.douyin.com/"
+			writeError(w, http.StatusBadRequest, "请输入直播平台 URL")
+			return
 		}
 		if err := s.openBrowserSession(input.URL); err != nil {
 			writeError(w, http.StatusConflict, err.Error())

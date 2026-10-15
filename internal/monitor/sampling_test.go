@@ -21,18 +21,18 @@ func TestSamplingFootballWaitApproachAndCandidateExpiry(t *testing.T) {
 	decision := samplingDecision(SamplingWaiting)
 	for _, offset := range []time.Duration{20, 40} {
 		applySamplingDecision(run, decision, now.Add(offset*time.Second))
-		if run.Sampling.Mode != SamplingObserving || run.Sampling.CaptureIntervalSeconds != 6 {
+		if run.Sampling.Mode != SamplingObserving || run.Sampling.CaptureIntervalSeconds != 1 {
 			t.Fatalf("slowed down before three reviews: %+v", run.Sampling)
 		}
 	}
 	eventAt := now.Add(10 * time.Minute)
 	decision.Sampling.NextEventAt = &eventAt
 	applySamplingDecision(run, decision, now.Add(65*time.Second))
-	if run.Sampling.Mode != SamplingWaiting || run.Sampling.CaptureIntervalSeconds != 12 {
+	if run.Sampling.Mode != SamplingWaiting || run.Sampling.CaptureIntervalSeconds != 1 {
 		t.Fatalf("stable waiting not applied: %+v", run.Sampling)
 	}
 	approach := samplingAt(run, eventAt.Add(-time.Minute))
-	if approach.Mode != SamplingCandidate || approach.CaptureIntervalSeconds != 6 || approach.ReviewIntervalSeconds != 15 {
+	if approach.Mode != SamplingCandidate || approach.CaptureIntervalSeconds != 1 || approach.ReviewIntervalSeconds != 15 {
 		t.Fatalf("did not accelerate near event: %+v", approach)
 	}
 	run.Sampling = approach
@@ -41,7 +41,7 @@ func TestSamplingFootballWaitApproachAndCandidateExpiry(t *testing.T) {
 		t.Fatalf("scheduled candidate never expired: %+v", afterEvent)
 	}
 	applySamplingDecision(run, samplingDecision(SamplingCandidate), now.Add(66*time.Second))
-	if run.Sampling.Mode != SamplingCandidate || run.Sampling.CaptureIntervalSeconds != 6 {
+	if run.Sampling.Mode != SamplingCandidate || run.Sampling.CaptureIntervalSeconds != 1 {
 		t.Fatalf("candidate should override cooldown: %+v", run.Sampling)
 	}
 	expired := samplingAt(run, now.Add(160*time.Second))
@@ -66,13 +66,7 @@ func TestSamplingBoundsCooldownAndExplicitUrgency(t *testing.T) {
 		for i := 2; i < 7; i++ {
 			applySamplingDecision(run, samplingDecision(SamplingWaiting), now.Add(time.Duration(i)*65*time.Second))
 		}
-		want := 24
-		if periodicVision(plan) {
-			want = 12
-		}
-		if goalNeedsFastPlan(goal) {
-			want = 6
-		}
+		want := 1
 		if run.Sampling.CaptureIntervalSeconds != want {
 			t.Fatalf("goal %q sampling=%+v want=%d", goal, run.Sampling, want)
 		}
@@ -123,7 +117,7 @@ func TestFishingOnlyNovelOCRTriggersAgentFromCapturedFrames(t *testing.T) {
 			s := NewService(NewMemoryRepository(), nil)
 			r := &frameCheckReviewer{}
 			s.SetUnexpectedEventReviewer(r, time.Nanosecond)
-			run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/fish", Goal: "鱼出水时提醒我", SourceMode: "ocr_upload"})
+			run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/fish", Goal: "鱼出水时提醒我", SourceMode: "ocr_upload"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -193,7 +187,7 @@ func TestUserGoalUpdateDiscardsLateReviewAndResetsSampling(t *testing.T) {
 	s := NewService(NewMemoryRepository(), nil)
 	r := lateGoalReviewer{make(chan struct{}), make(chan struct{})}
 	s.SetUnexpectedEventReviewer(r, time.Nanosecond)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/test", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/test", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +217,7 @@ func TestUserGoalUpdateDiscardsLateReviewAndResetsSampling(t *testing.T) {
 
 func TestFrameMarkerIsNotPublicEvidenceAndCannotAlertWithoutVision(t *testing.T) {
 	s := NewService(NewMemoryRepository(), nil)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/test", Goal: "钓鱼提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/test", Goal: "钓鱼提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}

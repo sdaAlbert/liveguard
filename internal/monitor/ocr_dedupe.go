@@ -143,6 +143,8 @@ func ocrSensitiveSignature(text string) string {
 }
 
 func normalizeOCRLine(line string) string {
+	line = strings.TrimPrefix(line, "《主屏幕》")
+	line = strings.TrimPrefix(line, "《聊天区》")
 	var normalized strings.Builder
 	for _, r := range strings.ToLower(line) {
 		if unicode.IsSpace(r) || unicode.IsPunct(r) {

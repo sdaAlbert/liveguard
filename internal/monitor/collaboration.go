@@ -38,6 +38,21 @@ func (s *Service) AnswerInvestigation(ctx context.Context, runID, investigationI
 			}
 			inv.Conclusion = "已收到补充，Agent 正在结合证据重新判断"
 			inv.UpdatedAt = time.Now().UTC()
+			// A monitor has one user-input wait at a time. Older runs may already
+			// contain multiple waiting questions, so fold their evidence into the
+			// answered investigation and resolve the extra prompts together.
+			for j := range run.Investigations {
+				other := &run.Investigations[j]
+				if j == i || other.Status != InvestigationWaitingUser || other.GoalVersion != inv.GoalVersion {
+					continue
+				}
+				mergeInvestigationEvidence(inv, other.Evidence)
+				if err := TransitionInvestigation(other, InvestigationSuppressed); err != nil {
+					return err
+				}
+				other.Conclusion = "已并入当前待复核事项；你的补充会一并用于判断"
+				other.UpdatedAt = inv.UpdatedAt
+			}
 			return nil
 		}
 		return ErrNotFound
@@ -48,6 +63,20 @@ func (s *Service) AnswerInvestigation(ctx context.Context, runID, investigationI
 	s.onUpdate()
 	go s.resumeClarifiedInvestigation(runID, investigationID)
 	return updated, nil
+}
+
+func mergeInvestigationEvidence(target *Investigation, evidence []Evidence) {
+	seen := make(map[string]struct{}, len(target.Evidence))
+	for _, item := range target.Evidence {
+		seen[item.EventID] = struct{}{}
+	}
+	for _, item := range evidence {
+		if _, ok := seen[item.EventID]; ok {
+			continue
+		}
+		target.Evidence = append(target.Evidence, item)
+		seen[item.EventID] = struct{}{}
+	}
 }
 
 func (s *Service) resumeClarifiedInvestigation(runID, investigationID string) {
@@ -92,7 +121,7 @@ func (s *Service) resumeClarifiedInvestigation(runID, investigationID string) {
 	}
 	input := UnexpectedEventInput{
 		EvidenceAt: time.Now().UTC(), GoalVersion: run.GoalVersion, GoalUpdatedAt: run.GoalUpdatedAt,
-		Goal: run.Goal, UserClarification: inv.UserAnswer, Plan: planForReviewer(run.Plan, run.Goal, reviewer),
+		Goal: run.Goal, UserClarification: inv.UserAnswer, UserInstructions: append([]string(nil), run.UserInstructions...), Plan: planForReviewer(run.Plan, run.Goal, reviewer),
 		RecentEvidence: recent, RecentAlerts: run.Alerts, TriggerFrameObservedAt: event.ObservedAt,
 		SearchObservations: func(queryCtx context.Context, query ObservationQuery) (ObservationPage, error) {
 			ledger, ok := s.repository.(RunLedger)

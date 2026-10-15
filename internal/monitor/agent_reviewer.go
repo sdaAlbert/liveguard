@@ -32,6 +32,8 @@ func (r *AgentReviewer) QuotaExhausted() bool { return r.quotaUnavailable.Load()
 
 const reviewFormatCorrection = "Server format correction: return a JSON decision with action wait or ignore, category, reason and confidence when no alert is warranted. To alert, satisfy evidence/duplicate prerequisites then call create_alert alone. If and only if the user must define a preference or rule, call request_user_input alone; do not return ask_user as JSON. Never create an alert through a final response. This repair uses the existing turn budget."
 
+const reviewMaxOutputTokens = 4096
+
 func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) (decision UnexpectedEventDecision, err error) {
 	started := time.Now()
 	if r.Model == nil {
@@ -52,6 +54,8 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	}
 	if r.Breaker != nil {
 		if err := r.Breaker.BeforeRequest(); err != nil {
+			decision.StopReason = "circuit_open"
+			setReviewMetadata(&decision, r.Model.ModelID(), 0, 0, started)
 			return decision, err
 		}
 	}
@@ -62,8 +66,10 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		"user_goal":          input.Goal,
 		"user_goal_role":     "preference, not an exclusive filter on important unexpected events",
 		"user_clarification": strings.TrimSpace(input.UserClarification),
+		"user_instructions":  input.UserInstructions,
 		"monitor_plan":       input.Plan, "sampling_state": input.Sampling,
-		"frame_check": input.FrameCheck, "server_time": time.Now().UTC(),
+		"live_baseline": input.Baseline,
+		"frame_check":   input.FrameCheck, "server_time": time.Now().UTC(),
 		"frame_available": frameAvailable, "model_capabilities": caps,
 		"triggering_signal": evidence[0],
 	})
@@ -79,9 +85,9 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	}
 	session := r.Model.NewSession(ModelSessionConfig{
 		System:  reviewInstructions(),
-		Initial: string(initial), Tools: toolDefinitions(definitions), MaxOutputTokens: 512, EnsureRequiredTool: true,
+		Initial: string(initial), Tools: toolDefinitions(definitions), MaxOutputTokens: reviewMaxOutputTokens, EnsureRequiredTool: true,
 	})
-	state := reviewState{readEvidenceTurn: -1, searchAlertsTurn: -1, frameInspectTurn: -1}
+	state := reviewState{readEvidenceTurn: -1, searchAlertsTurn: -1, frameInspectTurn: -1, contextBudget: newReviewContextBudget()}
 	defer func() {
 		if state.frameAssetOwned && state.frameAsset != nil {
 			_ = os.Remove(state.frameAsset.Path)
@@ -99,8 +105,11 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	var inTokens, outTokens int64
 	var retries int
 	model := r.Model.ModelID()
+	reviewID := input.RecentEvidence[0].ID
 	feedback := ""
+	ctx = withModelCallTrace(ctx, reviewID, -1)
 	result, loopErr := loop.Run(ctx, func(turnCtx context.Context, previous []agent.Observation, turn int) (agent.ModelTurn, error) {
+		turnCtx = withModelCallTrace(turnCtx, reviewID, turn+1)
 		requiredTool := ""
 		if turn == 0 && frameAvailable && reviewRequiresVision(input) {
 			requiredTool = "inspect_live_frame"
@@ -134,6 +143,9 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	if state.frameInspected {
 		decision.VisualObservedAt = state.frameObservedAt
 		decision.VisualEvidenceID, decision.VisualArchiveID = state.frameEventID, state.frameArchiveID
+		if state.frameAsset != nil && state.frameAsset.OCR != nil {
+			decision.VisualOCREvidenceID = state.frameAsset.OCR.ID
+		}
 	}
 	for _, observation := range result.Observations {
 		decision.ToolCalls = append(decision.ToolCalls, ReviewToolCall{
@@ -161,7 +173,10 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		r.quotaUnavailable.Store(true)
 	}
 	if r.Breaker != nil {
-		if loopErr != nil && !errors.Is(loopErr, context.Canceled) {
+		// An expired or cancelled queued signal is not evidence that the model
+		// provider is unhealthy. Count provider/model failures, but leave the
+		// breaker unchanged when the caller's investigation context ended first.
+		if loopErr != nil && result.StopReason == "model_error" && !errors.Is(loopErr, ErrModelQuotaExhausted) && !errors.Is(loopErr, context.Canceled) {
 			r.Breaker.Failure()
 		} else if loopErr == nil {
 			r.Breaker.Success()
@@ -185,6 +200,20 @@ func boundedReviewInput(input UnexpectedEventInput) UnexpectedEventInput {
 	input.RecentEvidence = append([]SignalEvent(nil), input.RecentEvidence[:min(len(input.RecentEvidence), 6)]...)
 	for i := range input.RecentEvidence {
 		input.RecentEvidence[i].Text = boundedReviewText(input.RecentEvidence[i].Text, 600)
+	}
+	if len(input.UserInstructions) > 10 {
+		input.UserInstructions = input.UserInstructions[len(input.UserInstructions)-10:]
+	}
+	for i := range input.UserInstructions {
+		input.UserInstructions[i] = boundedReviewText(input.UserInstructions[i], 1000)
+	}
+	if input.Baseline != nil {
+		baseline := *input.Baseline
+		baseline.StreamType = boundedReviewText(baseline.StreamType, 40)
+		baseline.Summary = boundedReviewText(baseline.Summary, 280)
+		baseline.Reason = boundedReviewText(baseline.Reason, 160)
+		baseline.VisibleRegions = boundBaselineList(baseline.VisibleRegions)
+		input.Baseline = &baseline
 	}
 	// RecentAlerts remains local Go state. Only search_recent_alerts can
 	// expose at most five summaries; no protocol receives the full history.

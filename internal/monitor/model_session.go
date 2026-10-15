@@ -24,6 +24,7 @@ type ModelCapabilities struct {
 type ModelSessionConfig struct {
 	System             string
 	Initial            string
+	InitialContent     []ModelContent
 	Tools              []ToolDefinition
 	MaxOutputTokens    int
 	RequireToolCall    bool

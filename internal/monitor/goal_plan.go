@@ -21,9 +21,9 @@ func defaultGoalPlan(goal, planner string) MonitoringPlan {
 	visual := goalRequiresFrameInspection(goal)
 	asr := goalNeedsSpeechSignals(goal)
 	fast := goalNeedsFastPlan(goal)
-	captureSeconds, reviewSeconds := 6, 60
+	captureSeconds, reviewSeconds := 1, 60
 	if fast {
-		captureSeconds, reviewSeconds = 6, 15
+		captureSeconds, reviewSeconds = 1, 15
 	}
 	if visual && !fast {
 		reviewSeconds = 30
@@ -70,9 +70,10 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 	if runes := []rune(plan.Summary); len(runes) > 280 {
 		plan.Summary = string(runes[:280])
 	}
-	if plan.CaptureIntervalSeconds != 6 && plan.CaptureIntervalSeconds != 12 && plan.CaptureIntervalSeconds != 24 {
-		plan.CaptureIntervalSeconds = 6
-	}
+	// OCR coverage is intentionally independent from Agent review cadence.
+	// The local text pass runs at one-second intervals unless deployment config
+	// explicitly imposes a slower minimum.
+	plan.CaptureIntervalSeconds = 1
 	if plan.ReviewIntervalSeconds != 15 && plan.ReviewIntervalSeconds != 30 && plan.ReviewIntervalSeconds != 60 {
 		plan.ReviewIntervalSeconds = 60
 	}
@@ -81,7 +82,7 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 		plan.RecommendASR = true
 	}
 	if goalNeedsFastPlan(goal) {
-		plan.CaptureIntervalSeconds = 6
+		plan.CaptureIntervalSeconds = 1
 		plan.ReviewIntervalSeconds = 15
 	}
 	if plan.VisionPolicy != "goal_required" && plan.VisionPolicy != "agent_decides" {
@@ -143,7 +144,7 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 
 func summarizeMonitoringPlan(plan MonitoringPlan) string {
 	parts := []string{fmt.Sprintf("本地 OCR 每 %d 秒采样", plan.CaptureIntervalSeconds)}
-	parts = append(parts, fmt.Sprintf("信号最短每 %d 秒交给 Agent 复核", plan.ReviewIntervalSeconds))
+	parts = append(parts, fmt.Sprintf("有新信号时最短每 %d 秒交给 Agent 复核", plan.ReviewIntervalSeconds))
 	if plan.RecommendASR {
 		parts = append(parts, "建议你授权开启口播识别")
 	} else {

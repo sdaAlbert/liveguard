@@ -10,36 +10,38 @@ import (
 )
 
 type UnexpectedEventDecision struct {
-	EvidenceIDs      []string          `json:"evidence_ids,omitempty"`
-	EvidenceBasis    string            `json:"evidence_basis,omitempty"`
-	UserQuestion     string            `json:"user_question,omitempty"`
-	UserOptions      []string          `json:"user_options,omitempty"`
-	VisualEvidenceID string            `json:"-"`
-	VisualArchiveID  string            `json:"-"`
-	TransportRetries int               `json:"-"`
-	Sampling         *SamplingProposal `json:"sampling,omitempty"`
-	Action           string            `json:"action"`
-	Category         string            `json:"category"`
-	Summary          string            `json:"summary"`
-	Reason           string            `json:"reason"`
-	Confidence       float64           `json:"confidence"`
-	Model            string            `json:"-"`
-	InputTokens      int64             `json:"-"`
-	OutputTokens     int64             `json:"-"`
-	LatencyMS        int64             `json:"-"`
-	ToolCalls        []ReviewToolCall  `json:"-"`
-	Failure          string            `json:"-"`
-	VisualFinding    string            `json:"visual_finding,omitempty"`
-	VisualObservedAt time.Time         `json:"-"`
-	StopReason       string            `json:"-"`
-	Turns            int               `json:"-"`
-	UsedEvidence     []Evidence        `json:"-"`
-	FormatRejected   bool              `json:"-"`
-	Repairs          int               `json:"-"`
+	EvidenceIDs         []string          `json:"evidence_ids,omitempty"`
+	EvidenceBasis       string            `json:"evidence_basis,omitempty"`
+	UserQuestion        string            `json:"user_question,omitempty"`
+	UserOptions         []string          `json:"user_options,omitempty"`
+	VisualEvidenceID    string            `json:"-"`
+	VisualOCREvidenceID string            `json:"-"`
+	VisualArchiveID     string            `json:"-"`
+	TransportRetries    int               `json:"-"`
+	Sampling            *SamplingProposal `json:"sampling,omitempty"`
+	Action              string            `json:"action"`
+	Category            string            `json:"category"`
+	Summary             string            `json:"summary"`
+	Reason              string            `json:"reason"`
+	Confidence          float64           `json:"confidence"`
+	Model               string            `json:"-"`
+	InputTokens         int64             `json:"-"`
+	OutputTokens        int64             `json:"-"`
+	LatencyMS           int64             `json:"-"`
+	ToolCalls           []ReviewToolCall  `json:"-"`
+	Failure             string            `json:"-"`
+	VisualFinding       string            `json:"visual_finding,omitempty"`
+	VisualObservedAt    time.Time         `json:"-"`
+	StopReason          string            `json:"-"`
+	Turns               int               `json:"-"`
+	UsedEvidence        []Evidence        `json:"-"`
+	FormatRejected      bool              `json:"-"`
+	Repairs             int               `json:"-"`
 }
 
 type UnexpectedEventInput struct {
 	UserClarification      string
+	UserInstructions       []string
 	EvidenceAt             time.Time
 	GoalVersion            uint64
 	GoalUpdatedAt          time.Time
@@ -48,13 +50,14 @@ type UnexpectedEventInput struct {
 	TriggerFrameObservedAt time.Time
 	Goal                   string
 	Plan                   MonitoringPlan
+	Baseline               *LiveBaseline
 	RecentEvidence         []SignalEvent
 	RecentAlerts           []Alert
 	SearchObservations     func(context.Context, ObservationQuery) (ObservationPage, error)
 	ArchivedFrame          func(context.Context, string) (FrameAsset, error)
 	TriggerFrame           string
 	CaptureFrame           func(context.Context) (FrameAsset, error)
-	SaveFrame              func(context.Context, FrameAsset) (FrameAsset, error)
+	RecordFrameEvidence    func(context.Context, FrameAsset) error
 }
 
 type FrameAsset struct {

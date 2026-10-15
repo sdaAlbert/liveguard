@@ -90,11 +90,11 @@ func TestPersonalMonitorsRunIndependentlyWithDifferentGoals(t *testing.T) {
 	repository := NewMemoryRepository()
 	service := NewService(repository, nil)
 	service.SetReplayGap(time.Millisecond)
-	coupon, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/1001", Goal: "出现 50 元以上优惠券时提醒我"})
+	coupon, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/1001", Goal: "出现 50 元以上优惠券时提醒我"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	game, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/2002", Goal: "游戏进入决胜局或关键团战时提醒我"})
+	game, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/2002", Goal: "游戏进入决胜局或关键团战时提醒我"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestPersonalMonitorsRunIndependentlyWithDifferentGoals(t *testing.T) {
 
 func TestUserCanUpdateGoalAndPlanWhileMonitorRuns(t *testing.T) {
 	service := NewService(NewMemoryRepository(), nil)
-	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/change-goal", Goal: "看到重要消息时提醒我"})
+	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/change-goal", Goal: "看到重要消息时提醒我"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestConcurrentSignalsForOneMonitorUseSingleFlightAndStopCancels(t *testing.
 	s := NewService(repo, nil)
 	reviewer := &blockingReviewer{started: make(chan struct{}), release: make(chan struct{})}
 	s.SetUnexpectedEventReviewer(reviewer, time.Nanosecond)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/single-flight", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/single-flight", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestStopCancelsAudioTranscription(t *testing.T) {
 	s := NewService(repo, nil)
 	transcriber := blockingTranscriber{started: make(chan struct{})}
 	s.SetTranscriber(transcriber)
-	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/asr-cancel", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
+	run, err := s.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/asr-cancel", Goal: "重要消息提醒", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestNoSpeechAudioChunkIsNormalAndDoesNotCreateAnEvent(t *testing.T) {
 	repo := NewMemoryRepository()
 	service := NewService(repo, nil)
 	service.SetTranscriber(noSpeechTranscriber{})
-	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/silent-room", Goal: "主播说重要消息时提醒我", SourceMode: "ocr_upload"})
+	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/silent-room", Goal: "主播说重要消息时提醒我", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestStartPersistsNormalizedGoalPlan(t *testing.T) {
 		RecommendASR: true, VisionPolicy: "agent_decides", Tools: []string{"search_observations"}, Planner: "MiniMax-M3",
 	}})
 	run, err := service.Start(context.Background(), StartInput{
-		TargetURL: "https://live.douyin.com/room-plan", Goal: "主播说出重要消息时实时提醒", SourceMode: "ocr_upload",
+		TargetURL: "https://live.example.com/room-plan", Goal: "主播说出重要消息时实时提醒", SourceMode: "ocr_upload",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -316,7 +316,7 @@ func TestStartPersistsNormalizedGoalPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Plan.Planner != "MiniMax-M3" || stored.Plan.CaptureIntervalSeconds != 6 || !stored.Plan.RecommendASR {
+	if stored.Plan.Planner != "MiniMax-M3" || stored.Plan.CaptureIntervalSeconds != 1 || !stored.Plan.RecommendASR {
 		t.Fatalf("monitor should persist the model-generated normalized plan: %#v", stored.Plan)
 	}
 	if !containsString(stored.Plan.Tools, "search_recent_alerts") || len(stored.Plan.UserConsent) == 0 {
@@ -384,7 +384,7 @@ func TestUnexpectedImportantEventCanAlertOutsideUserGoal(t *testing.T) {
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
 	run, err := service.Start(context.Background(), StartInput{
-		TargetURL: "https://live.douyin.com/room-3", Goal: "抽奖开始时提醒我", SourceMode: "ocr_upload",
+		TargetURL: "https://live.example.com/room-3", Goal: "抽奖开始时提醒我", SourceMode: "ocr_upload",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -428,7 +428,7 @@ func TestChatGoalMatchCreatesOCRBackedAlert(t *testing.T) {
 		},
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
-	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/chat-room", Goal: "提醒我有适合参与的直播聊天", SourceMode: "ocr_upload"})
+	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/chat-room", Goal: "提醒我有适合参与的直播聊天", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +456,7 @@ func TestChatGoalMatchRequiresVisibleOCREvidence(t *testing.T) {
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
 	run, err := service.Start(context.Background(), StartInput{
-		TargetURL: "https://live.douyin.com/chat-room", Goal: "提醒我能参与的聊天", SourceMode: "ocr_upload",
+		TargetURL: "https://live.example.com/chat-room", Goal: "提醒我能参与的聊天", SourceMode: "ocr_upload",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -488,7 +488,7 @@ func TestChatGoalMatchRequiresVisualRegionConfirmation(t *testing.T) {
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
 	run, err := service.Start(context.Background(), StartInput{
-		TargetURL: "https://live.douyin.com/chat-room", Goal: "聊天区出现目标词时提醒我", SourceMode: "ocr_upload",
+		TargetURL: "https://live.example.com/chat-room", Goal: "聊天区出现目标词时提醒我", SourceMode: "ocr_upload",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -515,7 +515,7 @@ func TestUnexpectedReviewIgnoresRoutineSignalsAndThrottlesCalls(t *testing.T) {
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
 	run, err := service.Start(context.Background(), StartInput{
-		TargetURL: "https://live.douyin.com/room-4", Goal: "抽奖开始时提醒我", SourceMode: "ocr_upload",
+		TargetURL: "https://live.example.com/room-4", Goal: "抽奖开始时提醒我", SourceMode: "ocr_upload",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -550,7 +550,7 @@ func TestUnexpectedReviewFailureIsVisibleAndDoesNotStopMonitoring(t *testing.T) 
 		ToolCalls: []ReviewToolCall{{Tool: "search_observations", Outcome: "已读取 1 条近期字幕证据", Succeeded: true}},
 	}}
 	service.SetUnexpectedEventReviewer(reviewer, time.Minute)
-	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.douyin.com/room-fail", Goal: "抽奖时提醒我", SourceMode: "ocr_upload"})
+	run, err := service.Start(context.Background(), StartInput{TargetURL: "https://live.example.com/room-fail", Goal: "抽奖时提醒我", SourceMode: "ocr_upload"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +578,7 @@ func TestBrowserCaptureLoopFeedsOCRIntoAgentAndStops(t *testing.T) {
 	service.SetTextRecognizer(StaticTextRecognizer{Text: "抽奖倒计时 00:30", Confidence: .93})
 	service.SetCaptureInterval(5 * time.Millisecond)
 	run, err := service.Start(context.Background(), StartInput{
-		TargetURL: "https://live.douyin.com/room-1", Goal: "抽奖开始前提醒我", SourceMode: "browser_ocr",
+		TargetURL: "https://live.example.com/room-1", Goal: "抽奖开始前提醒我", SourceMode: "browser_ocr",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -610,5 +610,54 @@ func TestBrowserCaptureLoopFeedsOCRIntoAgentAndStops(t *testing.T) {
 	service.StopAll()
 	if capturer.closedAll.Load() != 1 {
 		t.Fatal("service shutdown should close retained monitor tabs")
+	}
+}
+
+func TestBrowserCaptureRunsForTwoMonitorsIndependently(t *testing.T) {
+	repository := NewMemoryRepository()
+	service := NewService(repository, nil)
+	capturer := &testFrameCapturer{}
+	service.SetFrameCapturer(capturer)
+	service.SetTextRecognizer(StaticTextRecognizer{Text: "画面持续更新", Confidence: .9})
+	service.SetCaptureInterval(5 * time.Millisecond)
+	defer service.StopAll()
+
+	first, err := service.Start(context.Background(), StartInput{
+		TargetURL: "https://live.example.com/room-1", Goal: "抽奖开始时提醒我", SourceMode: "browser_ocr",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Start(context.Background(), StartInput{
+		TargetURL: "https://live.example.com/room-2", Goal: "商品下架时提醒我", SourceMode: "browser_ocr",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && capturer.captured.Load() < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	firstState, firstErr := service.Get(context.Background(), first.ID)
+	secondState, secondErr := service.Get(context.Background(), second.ID)
+	if firstErr != nil || secondErr != nil {
+		t.Fatalf("get concurrent monitors: first=%v second=%v", firstErr, secondErr)
+	}
+	if capturer.captured.Load() < 2 || firstState.Status != RunRunning || secondState.Status != RunRunning {
+		t.Fatalf("starting a second live monitor must leave both capture loops running: captures=%d first=%s second=%s", capturer.captured.Load(), firstState.Status, secondState.Status)
+	}
+}
+
+func TestTurnBudgetMeansInvestigationIncompleteNotNoMatch(t *testing.T) {
+	if !reviewExecutionIncomplete("turn_budget") {
+		t.Fatal("turn budget must be represented as an incomplete investigation")
+	}
+	message := reviewIncompleteMessage("turn_budget")
+	if !strings.Contains(message, "未判断目标是否出现") || !strings.Contains(message, "规则是否需要澄清") {
+		t.Fatalf("incomplete message made a semantic claim: %q", message)
+	}
+	if reviewExecutionIncomplete("finished") || reviewExecutionIncomplete("model_error") {
+		t.Fatal("completed decisions and provider failures must not be classified as budget interruptions")
 	}
 }

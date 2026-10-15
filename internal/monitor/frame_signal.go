@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -65,11 +66,56 @@ func (s *Service) handleCapturedFrame(ctx context.Context, runID string, event S
 			}
 		}
 		event.TextRegions = regions
-		if err := submit(ctx, runID, event); err != nil {
-			return err
+		for _, part := range splitCapturedOCR(event) {
+			if err := submit(ctx, runID, part); err != nil {
+				return err
+			}
 		}
 		commitDedupe()
 		return nil
 	}
 	return recordFrame("归档截图：OCR 与近期文字重复")
+}
+
+// OCR is an internal observation, not a user request. Preserve long frames as
+// independently addressable ledger entries instead of rejecting the source.
+func splitCapturedOCR(event SignalEvent) []SignalEvent {
+	remaining := []rune(event.Text)
+	if len(remaining) <= maxSignalTextRunes {
+		return []SignalEvent{event}
+	}
+	var parts []SignalEvent
+	for len(remaining) > 0 {
+		n := min(len(remaining), maxSignalTextRunes)
+		if n < len(remaining) {
+			for i := n - 1; i > n/2; i-- {
+				if remaining[i] == '\n' {
+					n = i + 1
+					break
+				}
+			}
+		}
+		part := event
+		part.ID = fmt.Sprintf("%s:part:%d", event.ID, len(parts)+1)
+		if part.ParentEventID == "" {
+			part.ParentEventID = event.ID
+		}
+		part.Text = strings.TrimSpace(string(remaining[:n]))
+		part.TextRegions = nil
+		for _, region := range event.TextRegions {
+			for _, line := range strings.Split(part.Text, "\n") {
+				if line != "" && (strings.Contains(region.Text, line) || strings.Contains(line, region.Text)) {
+					copy := region
+					copy.Text = line
+					part.TextRegions = append(part.TextRegions, copy)
+					break
+				}
+			}
+		}
+		if part.Text != "" {
+			parts = append(parts, part)
+		}
+		remaining = remaining[n:]
+	}
+	return parts
 }

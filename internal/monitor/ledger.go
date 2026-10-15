@@ -34,8 +34,8 @@ type ObservationPage struct {
 }
 
 // RunLedger stores the complete history separately from the bounded Run view.
-// Postgres persists it across process restarts; MemoryRepository keeps it for
-// the lifetime of the process.
+// FileRepository persists it across process restarts; MemoryRepository keeps
+// it for the lifetime of the process.
 type RunLedger interface {
 	RecordObservation(context.Context, string, SignalEvent) error
 	SearchObservations(context.Context, string, ObservationQuery) (ObservationPage, error)

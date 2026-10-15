@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"syscall"
+	"time"
 )
 
 // FileRepository keeps bounded monitor state in an atomic JSON snapshot and
@@ -181,7 +184,24 @@ func (r *FileRepository) persistLocked() error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, r.path)
+	return replaceSnapshot(temporaryPath, r.path, os.Rename)
+}
+
+// Windows readers and virus scanners can briefly deny replacing an existing
+// file. Keep the previous snapshot intact and retry this completed temp file.
+func replaceSnapshot(source, target string, rename func(string, string) error) error {
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		err = rename(source, target)
+		retry := os.IsPermission(err) || (runtime.GOOS == "windows" && (errors.Is(err, syscall.Errno(32)) || errors.Is(err, syscall.Errno(33))))
+		if err == nil || !retry {
+			return err
+		}
+		if attempt < 5 {
+			time.Sleep(time.Duration(10<<attempt) * time.Millisecond)
+		}
+	}
+	return err
 }
 
 func (r *FileRepository) loadObservationLog() error {

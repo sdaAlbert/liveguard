@@ -5,60 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
 const maxArchivedFrameBytes = 12 << 20
-
-func (s *Service) archiveFrame(runID, eventID, source string) (string, error) {
-	if runID == "" || eventID == "" || source == "" {
-		return "", errors.New("run, observation and source frame are required for archive")
-	}
-	idBytes := sha256.Sum256([]byte(runID + "\x00" + eventID))
-	archiveID := hex.EncodeToString(idBytes[:])
-	runBytes := sha256.Sum256([]byte(runID))
-	directory := filepath.Join(s.frameArchiveDir, hex.EncodeToString(runBytes[:]))
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return "", err
-	}
-	input, err := os.Open(source)
-	if err != nil {
-		return "", err
-	}
-	defer input.Close()
-	info, err := input.Stat()
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxArchivedFrameBytes {
-		return "", ErrFrameBudget
-	}
-	destination := filepath.Join(directory, archiveID+".png")
-	if _, err := os.Stat(destination); err == nil {
-		return archiveID, nil
-	}
-	temporary, err := os.CreateTemp(directory, ".frame-*.tmp")
-	if err != nil {
-		return "", err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	written, copyErr := io.Copy(temporary, io.LimitReader(input, maxArchivedFrameBytes+1))
-	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil || written != info.Size() || written > maxArchivedFrameBytes {
-		return "", ErrFrameBudget
-	}
-	if err := os.Rename(temporaryPath, destination); err != nil {
-		if _, statErr := os.Stat(destination); statErr == nil {
-			return archiveID, nil
-		}
-		return "", err
-	}
-	return archiveID, nil
-}
 
 func (s *Service) archivedFramePath(runID, archiveID string) (string, error) {
 	if len(archiveID) != 64 {

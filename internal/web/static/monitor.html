@@ -17,7 +17,7 @@
     <div class="sidebar-footer"><span id="connectionDot" class="status-dot yellow" aria-hidden="true"></span><span id="connectionLabel" role="status">正在连接</span></div>
   </aside>
   <div class="workspace">
-  <header class="topbar"><span class="breadcrumb">LiveGuard <span>/</span> 监控室</span><div class="topbar-actions"><button id="modelSettingsOpen" class="login-button" type="button">模型设置</button><button id="douyinLogin" class="login-button" type="button">登录抖音 <span aria-hidden="true">↗</span></button><button id="shutdownApp" class="shutdown-button" type="button">退出程序</button></div></header>
+  <header class="topbar"><span class="breadcrumb">LiveGuard <span>/</span> 监控室</span><div class="topbar-actions"><button id="modelSettingsOpen" class="login-button" type="button">模型设置</button><button id="platformLogin" class="login-button" type="button">打开平台登录页 <span aria-hidden="true">↗</span></button><button id="shutdownApp" class="shutdown-button" type="button">退出程序</button></div></header>
   <main>
     <div class="page-heading"><h1>监控室</h1><div class="status-legend" aria-label="状态说明"><span><i class="status-dot green" aria-hidden="true"></i>运行</span><span><i class="status-dot red" aria-hidden="true"></i>新提醒</span><span><i class="status-dot yellow" aria-hidden="true"></i>待确认 / 异常</span></div></div>
     <form id="monitorForm" class="monitor-form">
@@ -38,7 +38,7 @@
     <form id="modelSettingsForm" class="settings-form">
       <div class="settings-heading"><div><h2 id="modelSettingsTitle">模型设置</h2><p>模型只处理监控目标和直播信号，不会控制浏览器。</p></div><button id="modelSettingsClose" class="dialog-close" type="button" aria-label="关闭">×</button></div>
       <label>模型提供方<select id="modelProvider"><option value="minimax">MiniMax</option><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="rules">本地规则（不调用模型）</option></select></label>
-      <label id="modelNameLabel">模型名称<input id="modelName" type="text" maxlength="100" autocomplete="off" placeholder="MiniMax-M3"></label>
+      <label id="modelNameLabel">模型型号<select id="modelPreset"></select><input id="modelName" class="hidden" type="text" maxlength="100" autocomplete="off" placeholder="输入模型 ID"><span class="settings-help">可以选择预设型号，或选择“自定义”输入其他兼容模型 ID。</span></label>
       <label id="modelEndpointLabel">API 地址<input id="modelEndpoint" type="url" maxlength="500" autocomplete="url" placeholder="使用默认地址"></label>
 	  <label id="modelVisionLabel" class="settings-checkbox"><input id="modelSupportsVision" type="checkbox">所选模型支持图片理解</label>
       <label id="modelKeyLabel">API Key<input id="modelApiKey" type="password" maxlength="500" autocomplete="new-password" spellcheck="false" placeholder="仅本次设置时输入；留空可保留当前密钥"></label>
@@ -58,7 +58,7 @@
       <button class="card-open-detail" type="button">
         <span class="card-lamp"><i class="status-dot" aria-hidden="true"></i></span>
         <span class="card-copy">
-          <b class="room-name"></b>
+          <span class="room-title-row"><b class="room-name"></b><small class="room-platform"></small></span>
           <span class="goal-summary"></span>
           <span class="feedback-row"><span class="feedback-mark">动态</span><span class="card-feedback"></span></span>
         </span>
