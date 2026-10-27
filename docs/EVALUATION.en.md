@@ -15,7 +15,7 @@ go build ./...
 node --check internal/web/static/monitor.js
 ```
 
-The tests cover agent tool permissions and budgets, retries and timeouts, monitor-state changes, queues and idempotency, failure recovery, JSON file-repository restart recovery, SQLite Pending recovery across pause/reopen/resume, browser-capture cancellation, OCR upload, and web APIs. The SQLite recovery case uses a temporary database and mock Reviewer. These tests verify program rules, not real-model quality or real-livestream end-to-end recovery.
+The tests cover agent tool permissions and budgets, retries and timeouts, monitor-state changes, queues and idempotency, failure recovery, SQLite state and observation recovery, Pending recovery across pause/restart/resume, transaction rollback, browser-capture cancellation, OCR upload, and web APIs. SQLite recovery cases use a temporary database and mock Reviewer. They verify program rules, not real-model quality or real-livestream end-to-end recovery. JSON export format is also checked; JSON is no longer a runtime repository.
 
 ## Latency from real runtime records
 

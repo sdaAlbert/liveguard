@@ -15,7 +15,7 @@ go build ./...
 node --check internal/web/static/monitor.js
 ```
 
-测试覆盖 Agent 工具权限与预算、重试和超时、监控状态变化、队列和幂等、故障恢复、JSON 文件仓储恢复、SQLite Pending 关停/重启/继续恢复、浏览器采集取消、OCR 上传及网页接口。SQLite 恢复用例使用临时数据库和 mock Reviewer；它们验证程序规则，不验证真实模型判断质量或真实直播端到端恢复。
+测试覆盖 Agent 工具权限与预算、重试和超时、监控状态变化、队列和幂等、故障恢复、SQLite 状态与观测恢复、Pending 关停/重启/继续恢复、事务回滚、浏览器采集取消、OCR 上传及网页接口。SQLite 恢复用例使用临时数据库和 mock Reviewer；它们验证程序规则，不验证真实模型判断质量或真实直播端到端恢复。JSON 导出也有格式检查；JSON 不再作为运行仓储。
 
 ## 真实运行中的耗时
 
