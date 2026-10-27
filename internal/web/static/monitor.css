@@ -26,6 +26,7 @@ button:focus-visible,a:focus-visible,summary:focus-visible { outline:2px solid #
 .breadcrumb span { margin:0 12px; color:#b2b2b2; }
 .login-button { padding:7px 11px; border:1px solid #ddd; border-radius:7px; color:#414141; background:#fff; font-size:11px; }
 .login-button:hover { background:#f4f4f3; }
+.language-toggle { min-width:42px; font-weight:650; letter-spacing:.02em; }
 .login-button span { margin-left:10px; }
 .topbar-actions { display:flex; align-items:center; gap:8px; }
 .shutdown-button { padding:7px 11px; border:1px solid #e7c3c0; border-radius:7px; color:#a13b35; background:#fff; font-size:11px; }

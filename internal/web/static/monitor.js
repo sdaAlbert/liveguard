@@ -1,4 +1,96 @@
 const $ = selector => document.querySelector(selector);
+const languageStorageKey = "liveguard-ui-language-v1";
+let uiLanguage = "zh";
+try { uiLanguage = localStorage.getItem(languageStorageKey) === "en" ? "en" : "zh"; } catch (_) {}
+const englishCopy = {
+  "LiveGuard 首页":"LiveGuard home", "监控室":"Control Room", "直播窗口":"Live rooms", "全部监控":"All monitors", "正在连接":"Connecting",
+  "模型设置":"Model settings", "打开平台登录页":"Open platform login", "退出程序":"Quit", "状态说明":"Status legend", "运行":"Running", "新提醒":"New alert", "待确认 / 异常":"Needs attention / issue",
+  "新建监控":"New monitor", "直播链接":"Live stream URL", "粘贴直播间 URL":"Paste a live room URL", "关注内容":"What to watch for", "例如：聊天区提到抽奖，或主播宣布开始活动":"e.g. a giveaway in chat or the host announcing an event", "开始监控":"Start monitoring", "全部直播":"All streams", "还没有监控中的直播":"No active monitors", "粘贴直播链接，告诉 Agent 你想关注什么。":"Paste a stream link and tell the Agent what to watch for.",
+  "模型只处理监控目标和直播信号，不会控制浏览器。":"The model analyzes your monitoring goal and live signals. It does not control the browser.", "模型提供方":"Provider", "本地规则（不调用模型）":"Local rules (no model calls)", "模型型号":"Model", "输入模型 ID":"Enter a model ID", "可以选择预设型号，或选择“自定义”输入其他兼容模型 ID。":"Choose a preset or select Custom to enter another compatible model ID.", "API 地址":"API endpoint", "使用默认地址":"Use the default endpoint", "所选模型支持图片理解":"The selected model supports image understanding", "API Key":"API key", "仅本次设置时输入；留空可保留当前密钥":"Enter only when changing settings; leave blank to keep the current key", "取消":"Cancel", "保存设置":"Save settings", "自定义模型 ID…":"Custom model ID…",
+  "保存设置不会调用模型。设置用于后续信号判断；目标计划会在新建监控或更新目标时重新生成。密钥只保存在本机服务进程内，重启后需重新填写。":"Saving does not call the model. Settings apply to future signal reviews; plans are regenerated when a monitor starts or its goal changes. The API key is kept in the local service process and must be re-entered after restart.",
+  "LiveGuard / 监控详情":"LiveGuard / Monitor details", "返回监控室":"Back to Control Room", "暂停":"Pause", "继续":"Resume", "结束":"Stop", "结束监控":"Stop monitor", "关注目标":"Monitoring goal", "Agent 状态":"Agent activity", "最近判断":"Recent decisions", "用户提醒":"Alerts", "提醒记录":"Alert history", "与 Agent 协作":"Work with the Agent", "下达指令":"Send a message", "补充条件、反馈页面已处理或提出新问题。Agent 会判断这些内容是否改变后续关注方向。":"Add context, say when a page issue is handled, or ask a question. The Agent will decide whether this changes the ongoing monitoring goal.", "例如：验证码已处理，请继续；或者：后面只关注主播正式公布的新品价格":"e.g. The verification is done; continue. Or: Only watch for the host's official product launch price.", "发送给 Agent":"Send to Agent", "采集状态":"Capture status", "直播来源":"Stream source", "可选输入":"Optional input", "口播识别":"Speech transcription", "只共享并处理你在浏览器弹窗中选择的直播音频。":"Only audio you choose to share in the browser dialog will be processed.", "监控运行时可以开启口播识别。":"Speech transcription can be enabled while monitoring is running.", "模型配置对所有监控生效。":"Model settings apply to all monitors.", "管理全局模型设置":"Manage global model settings", "全局配置":"Global settings", "目标":"Goal", "修改后会重新生成后续判断策略":"The monitoring plan is regenerated after changes.", "保存目标":"Save goal", "全部标为已读":"Mark all as read", "暂时没有提醒。LiveGuard 会在检测到与关注目标有关的内容时显示在这里。":"No alerts yet. LiveGuard will show alerts related to your goal here.", "等待新信号触发调查。":"Waiting for a new signal to trigger an investigation.", "尚未配置模型，暂时不能开始 Agent 调查。":"No model is configured, so the Agent cannot investigate yet.",
+  "返回":"Back", "状态":"Status", "最近采集":"Last capture", "截图尝试":"Capture attempts", "实际间隔":"Actual interval", "采集耗时":"Capture time", "下次信号":"Next signal", "OCR积压跳过":"OCR backlog skipped", "时间未知":"Time unknown", "正在监听 · 等待新的直播信号":"Monitoring · Waiting for a new live signal", "页面要求完成登录或安全验证":"The page requires sign-in or verification", "页面要求登录或完成安全验证":"The page requires sign-in or verification", "监控会继续运行":"Monitoring will continue", "LiveGuard 已关闭":"LiveGuard is closed", "LiveGuard 正在关闭":"LiveGuard is shutting down",
+  "动态":"LIVE", "未设置关注目标":"No monitoring goal set", "尚未形成当前关注方向":"No current monitoring direction yet", "检查":"Check", "画面判断":"Visual finding", "口播证据":"Speech evidence", "文字证据":"Text evidence", "判断":"Decision", "判断中":"Reviewing", "完成":"Completed", "未完成":"Incomplete", "失败":"Failed", "已核验":"Verified", "已检查":"Checked", "无同类提醒":"No similar alert", "仅本次判断使用":"Used for this review only", "已提交":"Submitted", "未通过校验":"Validation failed", "等待回复":"Waiting for reply", "查整场记录":"Search all records", "查近期记录":"Search recent records", "看直播画面":"Inspect live frame", "查重复提醒":"Check for duplicate alerts", "选用画面证据":"Select visual evidence", "发送提醒":"Send alert", "向你提问":"Ask you", "更新关注方向":"Update monitoring focus",
+  "本地规则":"Local rules", "未配置":"Not configured", "正常":"Healthy", "采集延迟":"Capture delayed", "需要登录":"Sign-in required", "采集失败":"Capture failed", "等待信号":"Waiting for signal", "等待新信号":"Waiting for a new signal", "已暂停":"Paused", "已结束":"Ended", "监听中":"Monitoring", "继续观察":"Keep watching", "需要你补充":"Your input is needed", "需要处理":"Action needed", "判断异常":"Review issue", "单次调查未完成":"Investigation incomplete", "等待 Agent 处理":"Waiting for the Agent", "Agent 正在判断":"Agent is reviewing", "Agent 正在初看":"Agent is checking the stream", "Agent 正在结合补充判断":"Agent is considering your reply", "Agent 正在结合补充判断中":"Agent is considering your reply", "等待你补充":"Waiting for your reply", "需要你处理":"Your action is needed", "上次调查未完成":"Previous investigation incomplete", "上次判断异常":"Previous review failed", "等待登录或验证":"Waiting for sign-in or verification", "证据不足，继续观察":"Not enough evidence; keep watching", "等待 Agent 调度":"Waiting for the Agent", "正常监听":"Monitoring normally", "监控已结束":"Monitoring ended", "监控已暂停":"Monitoring paused", "等待你完成验证":"Waiting for you to complete verification", "需要你完成验证":"Verification required", "等待登录或验证":"Waiting for sign-in or verification", "API 额度已耗尽":"API quota exhausted", "模型额度不可用":"Model quota unavailable", "连接恢复中":"Reconnecting", "状态同步中":"Syncing status", "更新策略中":"Updating plan", "正在更新目标":"Updating goal", "采集重试中":"Retrying capture", "采集异常":"Capture issue", "新提醒":"New alert", "正在停止":"Stopping", "正在继续":"Resuming", "正在暂停":"Pausing",
+  "优惠活动":"Promotion", "抽奖活动":"Giveaway", "重要消息":"Important announcement", "游戏关键时刻":"Key game moment", "聊天命中":"Chat match", "关注内容":"Goal match", "安全验证":"Security check", "口播转写":"Speech transcription", "画面采样":"Frame capture", "视觉判断":"Visual analysis", "右侧聊天室重点 OCR":"Prioritize chat OCR",
+  "本地规则 · 未配置大模型":"Local rules · No model configured", "模型额度不可用":"Model quota unavailable", "已配置 MiniMax · 独立 ASR":"MiniMax configured · Separate speech transcription", "视频号":"WeChat Channels", "哔哩哔哩":"Bilibili", "抖音":"Douyin", "快手":"Kuaishou", "淘宝":"Taobao",
+  "直播窗口":"Live room", "直播监控":"Live monitor", "直播来源":"Stream source", "识别中…":"Transcribing…", "停止口播识别":"Stop transcription", "开启口播识别":"Start transcription", "开启口播识别（建议）":"Enable speech transcription (recommended)", "停止监控":"Stop monitoring", "继续监控":"Resume monitoring", "暂停监控":"Pause monitoring", "查看监控详情":"View monitor details", "已结束":"Ended", "继续中…":"Resuming…", "暂停中…":"Pausing…", "结束中…":"Stopping…", "已结束":"Ended", "关闭":"Close", "应用":"Apply", "保存":"Save", "更新监控策略…":"Updating monitoring plan…", "正在读取当前设置…":"Loading current settings…", "正在应用设置…":"Applying settings…", "保存中…":"Saving…", "处理中…":"Working…", "正在连接…":"Connecting…", "正在退出…":"Quitting…", "登录窗口已打开 ↗":"Login window opened ↗",
+  "目标规划和事件判断改用本地规则。已单独配置的 MiniMax ASR 不受影响。":"Goal planning and event reviews will use local rules. Separately configured MiniMax speech transcription is unchanged.", "各提供方使用同一套调查工具与记忆策略，所选模型需支持工具调用。请按模型实际能力设置图片理解；不支持看图时，画面及聊天区目标会等待确认。ASR 配置独立。":"Providers use the same investigation tools and memory policy. The selected model must support tool calling. Set image understanding according to its actual capabilities; visual and chat goals require confirmation without it. Speech transcription is configured separately.", "当前使用本地规则，未配置大模型":"Using local rules; no model configured", "额度不可用，恢复后请重新保存配置":"Quota unavailable; save settings again after it is restored", "密钥已保存在当前进程":"API key is stored in the current process", "已配置":"Configured", "恢复后请重新保存配置":"Save settings again after service is restored", "仅本次设置时输入；留空可保留当前密钥":"Enter only when changing settings; leave blank to keep the current key", "使用默认地址":"Use the default endpoint",
+  "点开查看 Agent 的问题":"Open to see the Agent's question", "继续监控后可回复 Agent":"Resume monitoring to reply to the Agent", "你的回答只用于这次判断；监控会继续运行":"Your answer applies to this review; monitoring will continue", "补充这次判断需要的条件…":"Add context for this review…", "回复 Agent":"Reply to Agent", "提交中…":"Submitting…", "Agent 需要你补充判断规则":"The Agent needs a rule clarified", "Agent 正在结合你的补充重新判断。":"The Agent is reconsidering with your reply.", "提交":"Submit", "已发送；Agent 正在结合近期信号处理":"Sent; the Agent is reviewing recent signals", "已记录；Agent 会结合后续信号处理":"Saved; the Agent will use it with the next signal", "已发送；Agent 正在结合近期信号处理":"Sent; the Agent is reviewing recent signals", "请输入 1-1000 个字符":"Enter 1–1000 characters", "请输入 2-240 个字符":"Enter 2–240 characters", "正在发送给 Agent…":"Sending to Agent…", "需求已更新":"Goal updated", "正在更新监控策略…":"Updating monitoring plan…", "提交中…":"Submitting…", "已保存":"Saved",
+  "当前浏览器不支持直播音频共享，请使用新版 Chrome。":"This browser cannot share live audio. Use a recent version of Chrome.", "没有共享到声音。请重新选择直播标签，并勾选“共享标签页音频”或系统音频。":"No audio was shared. Select the live tab again and enable tab audio or system audio sharing.", "口播识别暂停":"Speech transcription paused", "口播识别已停止：Chrome 的共享音频轨道结束了。请重新共享直播标签页音频。":"Speech transcription stopped because Chrome ended the shared audio track. Share the live tab audio again.", "没有获得直播音频共享权限。":"Live audio sharing permission was not granted.", "浏览器录制音频片段失败":"The browser failed to record an audio segment", "本段口播识别失败，仍在继续监听":"Transcription failed for this segment; monitoring continues", "正在直播页完成验证，再告诉 Agent 已处理以继续监控":"Complete verification on the stream page, then tell the Agent to continue", "请先在直播页完成验证，再告诉 Agent 已处理以继续监控":"Complete verification on the stream page, then tell the Agent to continue", "请重新选择直播标签，并勾选“共享标签页音频”或系统音频。":"Select the live tab again and enable tab audio or system audio sharing.", "输入要登录的直播平台首页或直播间 URL":"Enter the platform home page or live room URL to sign in", "在专用浏览器中完成登录，随后可监控该平台的直播间":"Sign in using the dedicated browser, then monitor a room on this platform", "退出 LiveGuard 会停止所有监控并关闭本地服务，确定继续吗？":"Quitting LiveGuard stops all monitors and shuts down the local service. Continue?",
+  "请求失败":"Request failed", "没有可用监控":"No monitors available", "监控已暂停 · 点击继续恢复采集":"Monitoring is paused · Select Resume to restart capture", "等待 Agent 判断":"Waiting for the Agent to review", "等待处理":"Waiting for review", "信号":"Signal", "直播画面":"Live frame", "文字信号":"Text signal", "口播信号":"Speech signal", "安全验证":"Security verification", "已判断，无需提醒":"Reviewed; no alert needed", "已提醒":"Alerted", "已忽略":"Dismissed", "需要你补充：":"Your input is needed: ", "发现：":"Found: ", "待确认：":"Needs confirmation: ", "已判断：":"Reviewed: ", "需要处理：":"Action needed: ", "Agent 判断：":"Agent review: ", "新提醒 · ":"New alert · ", "Agent 正在判断最新信号 · 监听中":"Agent is reviewing the latest signal · Monitoring", "Agent 正在结合你的补充重新判断 · 监听中":"Agent is reconsidering with your reply · Monitoring", "检测到文字信号 · 等待 Agent 判断 · 监听中":"Text signal detected · Waiting for Agent review · Monitoring", "文字信号已记录 · 等待下一次 Agent 判断":"Text signal recorded · Waiting for the next Agent review", "口播信号已记录 · 等待下一次 Agent 判断":"Speech signal recorded · Waiting for the next Agent review", "等待直播画面或文字信号":"Waiting for a live frame or text signal", "正在初看直播画面，随后开始持续监控":"Checking the live stream before continuous monitoring starts", "初看不可用 · 继续使用 OCR 监控":"Initial review unavailable · Continuing with OCR", "需要登录或完成验证 · 请处理后重新监控":"Sign in or complete verification, then resume monitoring", "本次调查未判断目标是否出现 · 继续监听":"This review did not determine whether the goal appeared · Monitoring continues", "判断未完成 · 监听中":"Review incomplete · Monitoring", "信号已收录 · 等待 Agent 判断 · 监听中":"Signal recorded · Waiting for Agent review · Monitoring", "正在监听 · 等待新的直播信号":"Monitoring · Waiting for a new signal", "AI 暂时无法完成判断，监控会继续运行":"The AI could not complete this review; monitoring continues", "Agent 本次未形成完整结论，监控会继续运行":"The Agent did not reach a conclusion; monitoring continues", "本次调查未完成，未判断目标是否出现。":"This review did not determine whether the goal appeared.", "当前还没有调查记录。模型已配置，但这不代表本次监控已发起模型调用；有调用后会在这里显示模型、判断和工具步骤。":"No investigations yet. A configured model is not called until a signal triggers a review. Model decisions and tool steps will appear here.", "等待新信号触发调查。":"Waiting for a new signal to trigger an investigation.",
+};
+Object.assign(englishCopy, {
+  "已停止":"Stopped", "异常":"Issue", "监控异常":"Monitor issue", "结合补充判断中":"Reviewing your reply", "调查未完成·继续监听":"Investigation incomplete · Monitoring", "判断失败·继续监听":"Review failed · Monitoring", "需要登录 / 验证":"Sign-in / verification required", "已连接 · 实时更新":"Connected · Live updates",
+  "判断关注目标与重要内容":"Review the goal and important events", "读取证据窗口":"Read the evidence window", "读取相关文字":"Search related text", "复核字幕和画面":"Recheck captions and frames", "复核证据":"Recheck evidence", "请求用户处理":"Ask you to take action", "点击继续恢复采集":"Select Resume to restart capture", "正在连接":"Connecting", "直播监控":"Live monitor", "未设置关注目标":"No monitoring goal set", "直播窗口":"Live room", "结束中…":"Stopping…", "暂停中…":"Pausing…", "继续中…":"Resuming…", "正在应用设置…":"Applying settings…", "正在读取当前设置…":"Loading current settings…", "已配置":"Configured", "已启用":"Enabled", "密钥已保存在当前进程":"API key is stored in the current process", "额度不可用，恢复后请重新保存配置":"Quota unavailable; save settings again after it is restored",
+  "符合提醒条件":"Alert criteria met", "继续收集信号":"Collecting more signals", "当前无需提醒":"No alert needed", "Agent 需要你确认":"The Agent needs your confirmation", "处理中":"Working", "处理中…":"Working…", "发现":"Found", "持续观察":"Monitoring continuously", "未知":"Unknown", "正在检查":"Checking", "已就绪":"Ready", "已记录":"Recorded", "已忽略":"Dismissed", "监控停止":"Monitor stopped",
+  "信号 · 等待处理":"Signal · Waiting for review", "口播证据":"Speech evidence", "文字证据":"Text evidence", "没有新信号":"No new signals", "上传 OCR 图片":"Upload OCR image", "上传中…":"Uploading…", "登录窗口已打开 ↗":"Login window opened ↗", "在专用浏览器中完成登录，随后可监控该平台的直播间":"Sign in using the dedicated browser, then monitor a room on this platform",
+  "截图尝试":"Capture attempts", "实际间隔":"Actual interval", "采集耗时":"Capture duration", "下次信号":"Next signal", "OCR积压跳过":"OCR backlog skipped", "采集状态":"Capture status", "直播来源":"Stream source", "口播积压":"Speech backlog", "口播识别异常":"Transcription issue", "口播识别暂停":"Speech transcription paused", "停止口播识别":"Stop transcription", "开启口播识别":"Start transcription", "开启口播识别（建议）":"Enable speech transcription (recommended)", "当前使用本地规则，未配置大模型":"Using local rules; no model configured", "已切换到本地规则模式；独立配置的 ASR 不受影响。":"Switched to local rules; separately configured speech transcription is unchanged.",
+  "监控已暂停 · 点击继续恢复采集":"Monitoring is paused · Select Resume to restart capture", "模型额度不可用 · 监控已结束":"Model quota unavailable · Monitoring ended", "需要登录或完成验证 · 请处理后重新监控":"Sign in or complete verification, then resume monitoring", "信号已收录 · 等待 Agent 判断 · 监听中":"Signal recorded · Waiting for Agent review · Monitoring", "文字信号已收录 · 等待 Agent 判断 · 监听中":"Text signal recorded · Waiting for Agent review · Monitoring", "口播信号 · 等待处理":"Speech signal · Waiting for review", "画面采样 · 等待处理":"Frame capture · Waiting for review", "视觉判断 · 等待处理":"Visual analysis · Waiting for review", "需要登录 / 验证":"Sign-in / verification required", "模型额度不可用":"Model quota unavailable", "状态同步中":"Syncing status", "等待 Agent 调度":"Waiting for the Agent", "采集异常":"Capture issue", "采集重试中":"Retrying capture", "更新策略中":"Updating plan", "正在更新目标":"Updating goal", "连接恢复中":"Reconnecting", "没有提供直播链接":"No stream URL provided",
+  "请填写 1-1000 个字符的补充说明":"Enter a message of 1–1000 characters", "目标已更新":"Goal updated", "目标已保存":"Goal saved", "已启用":"Enabled", "独立配置的 ASR 不受影响":"Separately configured speech transcription is unchanged", "密钥只保存在当前服务进程中。":"The API key is stored only in the current service process.", "正在初看直播画面，随后开始持续监控":"Checking the live stream before continuous monitoring starts", "初看不可用 · 继续使用 OCR 监控":"Initial review unavailable · Continuing with OCR", "本次调查未判断目标是否出现 · 继续监听":"This review did not determine whether the goal appeared · Monitoring continues", "判断未完成 · 监听中":"Review incomplete · Monitoring", "未提供直播链接":"No stream URL provided", "持续观察":"Continue monitoring", "段处理中":"segments processing"
+});
+const textLocaleState = new WeakMap();
+const attributeLocaleState = new WeakMap();
+function englishText(value) {
+  const leading = value.match(/^\s*/)?.[0] || "";
+  const trailing = value.match(/\s*$/)?.[0] || "";
+  const core = value.slice(leading.length, value.length - trailing.length || undefined);
+  if (englishCopy[core]) return leading + englishCopy[core] + trailing;
+  let match = core.match(/^(\d+) 条新提醒$/); if (match) return `${leading}${match[1]} new alert${match[1] === "1" ? "" : "s"}${trailing}`;
+  match = core.match(/^(\d+) 个待处理$/); if (match) return `${leading}${match[1]} need attention${trailing}`;
+  match = core.match(/^(\d+) 秒$/); if (match) return `${leading}${match[1]} sec${trailing}`;
+  match = core.match(/^(\d+) 条$/); if (match) return `${leading}${match[1]} items${trailing}`;
+  match = core.match(/^(\d+) ms$/); if (match) return `${leading}${match[1]} ms${trailing}`;
+  match = core.match(/^停止口播识别 · (\d+) 段处理中$/); if (match) return `${leading}Stop transcription · ${match[1]} segments processing${trailing}`;
+  match = core.match(/^(口播转写|画面采样|视觉判断|信号) · 等待处理$/); if (match) return `${leading}${englishText(match[1])} · Waiting for review${trailing}`;
+  match = core.match(/^口播识别暂停：(.*)$/); if (match) return `${leading}Speech transcription paused: ${match[1]}${trailing}`;
+  match = core.match(/^本段口播识别失败，仍在继续监听：(.*)$/); if (match) return `${leading}Transcription failed for this segment; monitoring continues: ${match[1]}${trailing}`;
+  match = core.match(/^口播积压，累计跳过 (\d+) 段$/); if (match) return `${leading}Speech backlog; skipped ${match[1]} segments${trailing}`;
+  match = core.match(/^查看监控详情：(.+)，(.+)$/); if (match) return `${leading}View monitor details: ${match[1]}, ${englishText(match[2])}${trailing}`;
+  match = core.match(/^(.+) · (监听中|已暂停|已结束|异常|需要你补充|需要处理|连接恢复中|需要你完成验证)$/); if (match) return `${leading}${match[1]} · ${englishText(match[2])}${trailing}`;
+  match = core.match(/^已启用 (.+) · (.+)；密钥只保存在当前服务进程中。$/); if (match) return `${leading}Enabled ${match[1]} · ${match[2]}; the API key is stored only in the current service process.${trailing}`;
+  match = core.match(/^(.+) · (.+) · 已配置(?:（密钥已保存在当前进程）)?(?: · 额度不可用，恢复后请重新保存配置)?$/); if (match) return `${leading}${match[1]} · ${match[2]} · Configured${core.includes("密钥已保存在当前进程") ? " (API key stored in this process)" : ""}${core.includes("额度不可用") ? " · Quota unavailable; save settings again after it is restored" : ""}${trailing}`;
+  match = core.match(/^请先在直播页完成验证，再告诉 Agent 已处理以继续监控$/); if (match) return `${leading}Complete verification on the stream page, then tell the Agent to continue${trailing}`;
+  const dynamicPrefixes = [["需要你补充：", "Your input is needed: "], ["发现：", "Found: "], ["待确认：", "Needs confirmation: "], ["已判断：", "Reviewed: "], ["需要处理：", "Action needed: "], ["Agent 判断：", "Agent review: "], ["新提醒 · ", "New alert · "]];
+  for (const [from, to] of dynamicPrefixes) if (core.startsWith(from)) return leading + to + core.slice(from.length).replace(/ · 监听中$/, " · Monitoring") + trailing;
+  return value;
+}
+function isUserContentNode(node) {
+  const parent = node.parentElement;
+  return !parent || Boolean(parent.closest("script,style,textarea,[contenteditable=true],.goal-summary,.investigation-conclusion,.key-evidence,.alert-summary,.clarification-prompt,.clarification-answer,.room-name,.room-title,.tab-name")) || parent.matches(".detail-goal-hero:not(span)");
+}
+function applyLanguage(root = document.body) {
+  document.documentElement.lang = uiLanguage === "en" ? "en" : "zh-CN";
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (!node.nodeValue.trim() || isUserContentNode(node)) continue;
+    const state = textLocaleState.get(node);
+    const source = state && node.nodeValue === state.rendered ? state.source : node.nodeValue;
+    const rendered = uiLanguage === "en" ? englishText(source) : source;
+    textLocaleState.set(node, {source, rendered});
+    if (node.nodeValue !== rendered) node.nodeValue = rendered;
+  }
+  const attrs = ["aria-label", "title", "placeholder"];
+  for (const element of root.querySelectorAll("*")) {
+    if (element.matches("[contenteditable=true]")) continue;
+    let states = attributeLocaleState.get(element);
+    if (!states) { states = new Map(); attributeLocaleState.set(element, states); }
+    for (const attr of attrs) {
+      if (!element.hasAttribute(attr)) continue;
+      const current = element.getAttribute(attr);
+      const state = states.get(attr);
+      const source = state && current === state.rendered ? state.source : current;
+      const rendered = uiLanguage === "en" ? englishText(source) : source;
+      states.set(attr, {source, rendered});
+      if (current !== rendered) element.setAttribute(attr, rendered);
+    }
+  }
+  const toggle = $("#languageToggle");
+  if (toggle) { toggle.textContent = uiLanguage === "en" ? "中文" : "EN"; toggle.setAttribute("aria-label", uiLanguage === "en" ? "Switch to Chinese" : "切换界面语言"); }
+}
+const languageObserver = new MutationObserver(() => applyLanguage());
+languageObserver.observe(document.body, {subtree:true, childList:true, characterData:true, attributes:true, attributeFilter:["aria-label","title","placeholder"]});
 const monitorRuns = new Map();
 const audioCaptures = new Map();
 const goalDrafts = new Map();
@@ -58,7 +150,7 @@ async function request(url, options = {}) {
 
 function timeLabel(value) {
   if (!value) return "--:--:--";
-  return new Date(value).toLocaleTimeString("zh-CN", {hour12:false});
+  return new Date(value).toLocaleTimeString(uiLanguage === "en" ? "en-US" : "zh-CN", {hour12:false});
 }
 
 function alertKey(alert) {
@@ -341,8 +433,8 @@ $("#monitorDetailDialog").addEventListener("click", event => {
 });
 
 function eventTime(value) {
-  if (!value) return "时间未知";
-  return new Date(value).toLocaleString("zh-CN", {hour12:false, month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"});
+  if (!value) return uiLanguage === "en" ? "Time unknown" : "时间未知";
+  return new Date(value).toLocaleString(uiLanguage === "en" ? "en-US" : "zh-CN", {hour12:false, month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"});
 }
 
 function confidenceLabel(value) {
@@ -403,7 +495,7 @@ function compactAgentActions(steps = []) {
 
 function renderAlert(alert) {
   const unread = unreadAlerts(monitorRuns.get(detailRunID) || {}).some(item => alertKey(item) === alertKey(alert));
-  return `<article class="detail-alert ${unread ? "unread" : ""}"><div class="detail-item-meta"><span>${escapeHTML(displayEventLabel(alert.event_type))}</span><time>${eventTime(alert.created_at)}</time></div><h3>${escapeHTML(alert.summary)}</h3>${keyEvidenceMarkup(alert.evidence)}</article>`;
+  return `<article class="detail-alert ${unread ? "unread" : ""}"><div class="detail-item-meta"><span>${escapeHTML(displayEventLabel(alert.event_type))}</span><time>${eventTime(alert.created_at)}</time></div><h3 class="alert-summary">${escapeHTML(alert.summary)}</h3>${keyEvidenceMarkup(alert.evidence)}</article>`;
 }
 
 function displayEventLabel(type) {
@@ -463,7 +555,7 @@ function renderMonitorDetail() {
   const openDetails = [...content.querySelectorAll("details")].map(item => item.open);
   content.innerHTML = `
     <header class="detail-topbar"><button id="detailBack" class="detail-back" type="button"><span aria-hidden="true">←</span> 返回监控室</button><div class="detail-live-state" role="status" aria-live="polite"><i class="status-dot ${state.tone}" aria-hidden="true"></i><span class="agent-status-label">${escapeHTML(state.label)}</span></div><div class="detail-top-actions">${canControl ? `<button id="detailPause" class="detail-control" type="button" ${pausing.has(run.id) || stopping.has(run.id) ? "disabled" : ""}>${pausing.has(run.id) ? "处理中…" : run.status === "paused" ? "继续" : "暂停"}</button><button id="detailStop" class="detail-control danger" type="button" ${stopping.has(run.id) ? "disabled" : ""}>${stopping.has(run.id) ? "结束中…" : "结束监控"}</button>` : ""}</div></header>
-    <div id="detailScroll" class="detail-scroll"><section class="detail-hero"><div class="detail-kicker">LIVEGUARD / 监控详情</div><h1>${escapeHTML(room.name || run.name || "直播监控")}</h1><a class="detail-room-link" href="${escapeAttribute(run.target_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHTML(run.target_url || "未提供直播链接")} <span aria-hidden="true">↗</span></a><p class="detail-goal-hero"><span>关注目标</span>${escapeHTML(run.goal || "尚未形成当前关注方向")}</p></section>
+    <div id="detailScroll" class="detail-scroll"><section class="detail-hero"><div class="detail-kicker">LIVEGUARD / 监控详情</div><h1 class="room-title">${escapeHTML(room.name || run.name || "直播监控")}</h1><a class="detail-room-link" href="${escapeAttribute(run.target_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHTML(run.target_url || "未提供直播链接")} <span aria-hidden="true">↗</span></a><p class="detail-goal-hero"><span>关注目标</span>${escapeHTML(run.goal || "尚未形成当前关注方向")}</p></section>
       <div class="detail-layout"><div class="detail-main-column">
         <section class="detail-section"><div class="detail-section-heading"><div><span class="detail-section-label">Agent 状态</span><h2>最近判断</h2></div></div><div class="detail-list">${investigations.length ? investigations.slice(0, 10).map(renderInvestigation).join("") : `<p class="detail-empty">${globalModelSettings?.configured ? "等待新信号触发调查。" : "尚未配置模型，暂时不能开始 Agent 调查。"}</p>`}</div></section>
         <section class="detail-section"><div class="detail-section-heading"><div><span class="detail-section-label">用户提醒</span><h2>提醒记录</h2></div>${unreadAlerts(run).length ? `<button id="detailAcknowledge" class="text-action" type="button">全部标为已读</button>` : ""}</div><div class="detail-list">${alerts.length ? alerts.map(renderAlert).join("") : `<p class="detail-empty">暂时没有提醒。LiveGuard 会在检测到与关注目标有关的内容时显示在这里。</p>`}</div></section>
@@ -966,7 +1058,7 @@ $("#modelSettingsForm").addEventListener("submit", async event => {
 });
 
 async function openPlatformLogin(button) {
-  const url = window.prompt("输入要登录的直播平台首页或直播间 URL");
+  const url = window.prompt(uiLanguage === "en" ? englishText("输入要登录的直播平台首页或直播间 URL") : "输入要登录的直播平台首页或直播间 URL");
   if (!url) return;
   button.disabled = true;
   try {
@@ -1012,6 +1104,14 @@ $("#monitorForm").addEventListener("submit", async event => {
   }
 });
 
+$("#languageToggle").addEventListener("click", () => {
+  uiLanguage = uiLanguage === "en" ? "zh" : "en";
+  try { localStorage.setItem(languageStorageKey, uiLanguage); } catch (_) {}
+  applyLanguage();
+  renderAll();
+});
+applyLanguage();
+
 const updates = new EventSource("/api/events");
 document.addEventListener("focusout", event => {
   const content = $("#monitorDetailContent");
@@ -1043,7 +1143,7 @@ refreshRuns().catch(error => { $("#formError").textContent = error.message; });
 
 $("#shutdownApp")?.addEventListener("click", async event => {
   const button = event.currentTarget;
-  if (!window.confirm("退出 LiveGuard 会停止所有监控并关闭本地服务，确定继续吗？")) return;
+  if (!window.confirm(uiLanguage === "en" ? englishText("退出 LiveGuard 会停止所有监控并关闭本地服务，确定继续吗？") : "退出 LiveGuard 会停止所有监控并关闭本地服务，确定继续吗？")) return;
   button.disabled = true;
   button.textContent = "正在退出…";
   try {

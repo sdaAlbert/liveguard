@@ -14,6 +14,7 @@ It supports livestream pages from Douyin, Bilibili, Kuaishou, and similar platfo
 - Optionally transcribes browser audio that you explicitly share; the current ASR integration uses MiniMax.
 - Uses an agent to investigate signals, search recorded observations, and inspect a frame when needed.
 - Stores monitor state, observations, and recoverable pending signals in local SQLite. JSON is available for inspection and archiving through an export command.
+- The web interface can switch between English and Simplified Chinese using the language button in the monitoring room; the selection is remembered in the browser. Stream names, monitoring goals, evidence, and agent-generated findings remain in their original language.
 
 ## Screenshots
 
@@ -36,6 +37,8 @@ powershell -ExecutionPolicy Bypass -File ./scripts/run-mvp.ps1
 ```
 
 Open <http://127.0.0.1:8080>, sign in to the livestream platform in the dedicated Chrome window, and create a monitor. To use an LLM, open **Model settings** and configure a provider and API key. Saving settings does not send a probe request.
+
+Use the **EN / 中文** button in the top-right corner of the monitoring room to change the interface language. The choice is saved in the current browser.
 
 ## Project boundaries
 
