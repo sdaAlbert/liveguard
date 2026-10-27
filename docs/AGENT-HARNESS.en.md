@@ -76,7 +76,7 @@ An alert tool call is a proposal. The service rechecks the current run and goal 
 
 ## 5. State and lifecycle
 
-A single `Run` can contain many `SignalEvent` records, `Investigation` attempts, and accepted `Alert` records. `Pending` describes in-process queued or executing work; a pending investigation failing does not automatically stop the whole run.
+A single `Run` can contain many `SignalEvent` records, `Investigation` attempts, and accepted `Alert` records. SQLite persists unfinished Pending signals; after restart, still-valid signals start a new investigation, but the previous model session and tool turn are not resumed. A pending investigation failing does not automatically stop the whole run.
 
 The detailed fields, storage limits, observation log, and image-retention rules are described in [Architecture: cross-investigation context and persistence](ARCHITECTURE.en.md#cross-investigation-context-and-persistence).
 

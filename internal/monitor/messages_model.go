@@ -109,7 +109,7 @@ func (s *messagesSession) Next(ctx context.Context, previous []agent.Observation
 			outcome = "failed"
 			errorText = err.Error()
 		}
-		log.Printf("model request %s: provider=minimax model=%s review_id=%q turn=%d http_status=%d retries=%d latency_ms=%d context_budget_ms=%d client_timeout_ms=%d timeout_source=%s input_tokens=%d output_tokens=%d error=%q", outcome, reply.Model, trace.ReviewID, trace.Turn, statusCode, retries, time.Since(started).Milliseconds(), deadlineBudgetMS, clientTimeout.Milliseconds(), timeoutSource, reply.InputTokens, reply.OutputTokens, errorText)
+		log.Printf("model request %s: provider=minimax model=%s review_id=%q attempt_id=%q turn=%d http_status=%d retries=%d latency_ms=%d context_budget_ms=%d client_timeout_ms=%d timeout_source=%s input_tokens=%d output_tokens=%d error=%q", outcome, reply.Model, trace.ReviewID, trace.AttemptID, trace.Turn, statusCode, retries, time.Since(started).Milliseconds(), deadlineBudgetMS, clientTimeout.Milliseconds(), timeoutSource, reply.InputTokens, reply.OutputTokens, errorText)
 	}()
 	if len(previous) > 0 {
 		results := make([]map[string]any, 0, len(previous))

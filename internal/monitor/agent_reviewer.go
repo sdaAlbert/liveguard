@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"liveguard/internal/agent"
+	"liveguard/internal/domain"
 )
 
 // AgentReviewer runs one investigation identically for every ToolModel.
@@ -42,6 +44,11 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	if len(input.RecentEvidence) == 0 {
 		return decision, errors.New("review requires a triggering signal")
 	}
+	eventID := input.RecentEvidence[0].ID
+	attemptID := strings.TrimSpace(input.AttemptID)
+	if attemptID == "" {
+		attemptID = domain.NewID("review")
+	}
 	if r.QuotaExhausted() {
 		return UnexpectedEventDecision{Model: r.Model.ModelID()}, ErrModelQuotaExhausted
 	}
@@ -59,6 +66,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 			return decision, err
 		}
 	}
+	log.Printf("agent review started: review_id=%q attempt_id=%q event_id=%q model=%q goal_version=%d", eventID, attemptID, eventID, r.Model.ModelID(), input.GoalVersion)
 	input = boundedReviewInput(input)
 	evidence := boundedEvidence(input.RecentEvidence)
 	frameAvailable := caps.Vision && (input.TriggerFrame != "" || input.CaptureFrame != nil)
@@ -74,6 +82,15 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		"triggering_signal": evidence[0],
 	})
 	definitions := r.toolsForPlan(input.Plan)
+	if len(input.UserInstructions) == 0 && strings.TrimSpace(input.UserClarification) == "" {
+		filtered := definitions[:0]
+		for _, definition := range definitions {
+			if definition["name"] != "update_monitoring_goal" {
+				filtered = append(filtered, definition)
+			}
+		}
+		definitions = filtered
+	}
 	if !userClarificationAllowed(input) {
 		filtered := definitions[:0]
 		for _, definition := range definitions {
@@ -97,23 +114,26 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	for _, definition := range definitions {
 		name := definition["name"].(string)
 		tools[name] = func(toolCtx context.Context, call agent.ToolCall, turn int) agent.ToolOutput {
+			toolStarted := time.Now()
+			log.Printf("agent tool started: review_id=%q attempt_id=%q event_id=%q turn=%d tool=%q call_id=%q", eventID, attemptID, eventID, turn+1, call.Name, call.ID)
 			result, value, terminal := r.executeTool(toolCtx, call, input, evidence, &state, turn)
+			log.Printf("agent tool completed: review_id=%q attempt_id=%q event_id=%q turn=%d tool=%q call_id=%q succeeded=%t duration_ms=%d terminal=%t", eventID, attemptID, eventID, turn+1, call.Name, call.ID, !result.IsError, time.Since(toolStarted).Milliseconds(), terminal && !result.IsError)
 			return agent.ToolOutput{Content: result.Content, Outcome: result.Outcome, Failed: result.IsError, Terminal: terminal, Value: value}
 		}
 	}
-	loop := agent.Loop{Limits: r.Limits, Tools: tools, TerminalTools: map[string]bool{"create_alert": true, "request_user_input": true}}
+	loop := agent.Loop{Limits: r.Limits, Tools: tools, TerminalTools: map[string]bool{"create_alert": true, "request_user_input": true, "update_monitoring_goal": true}}
 	var inTokens, outTokens int64
 	var retries int
 	model := r.Model.ModelID()
-	reviewID := input.RecentEvidence[0].ID
 	feedback := ""
-	ctx = withModelCallTrace(ctx, reviewID, -1)
+	ctx = withModelCallTrace(ctx, eventID, attemptID, -1)
 	result, loopErr := loop.Run(ctx, func(turnCtx context.Context, previous []agent.Observation, turn int) (agent.ModelTurn, error) {
-		turnCtx = withModelCallTrace(turnCtx, reviewID, turn+1)
+		turnCtx = withModelCallTrace(turnCtx, eventID, attemptID, turn+1)
 		requiredTool := ""
 		if turn == 0 && frameAvailable && reviewRequiresVision(input) {
 			requiredTool = "inspect_live_frame"
 		}
+		log.Printf("agent model turn started: review_id=%q attempt_id=%q event_id=%q turn=%d previous_tool_results=%d required_tool=%q context_budget_ms=%d", eventID, attemptID, eventID, turn+1, len(previous), requiredTool, deadlineBudget(turnCtx))
 		reply, err := session.Next(turnCtx, previous, requiredTool, feedback)
 		feedback = ""
 		retries += reply.TransportRetries
@@ -168,6 +188,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		}
 	}
 	decision.TransportRetries = retries
+	decision.AttemptID = attemptID
 	setReviewMetadata(&decision, model, inTokens, outTokens, started)
 	if errors.Is(loopErr, ErrModelQuotaExhausted) {
 		r.quotaUnavailable.Store(true)
@@ -182,7 +203,15 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 			r.Breaker.Success()
 		}
 	}
+	log.Printf("agent review finished: review_id=%q attempt_id=%q event_id=%q model=%q stop_reason=%s turns=%d tools=%d input_tokens=%d output_tokens=%d latency_ms=%d error=%q", eventID, attemptID, eventID, model, decision.StopReason, decision.Turns, len(result.Observations), decision.InputTokens, decision.OutputTokens, decision.LatencyMS, loopErr)
 	return decision, loopErr
+}
+
+func deadlineBudget(ctx context.Context) int64 {
+	if deadline, ok := ctx.Deadline(); ok {
+		return max(0, time.Until(deadline).Milliseconds())
+	}
+	return 0
 }
 
 func userClarificationAllowed(input UnexpectedEventInput) bool {

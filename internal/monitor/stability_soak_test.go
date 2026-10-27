@@ -41,7 +41,7 @@ func (r *soakReviewer) Review(ctx context.Context, input UnexpectedEventInput) (
 	}
 }
 
-// Opt-in: real Chrome screenshots, real Tesseract and local file storage,
+// Opt-in: real Chrome screenshots, real Tesseract and local SQLite storage,
 // with eight changing source pages and a deliberately slow model substitute.
 // No platform login, user profile or paid API is used.
 func TestEightBrowserMonitorsSustained(t *testing.T) {
@@ -65,7 +65,7 @@ func TestEightBrowserMonitorsSustained(t *testing.T) {
 		fmt.Fprintf(w, `<!doctype html><html><head><title>Stability room %s</title></head><body style="font:20px Arial;background:white;color:black"><h1>Live monitor room %s 直播监控</h1><div style="display:grid;grid-template-columns:65%% 35%%;line-height:1.7"><section>MAIN SCREEN 主屏幕<div id="main"></div></section><section>CHAT AREA 聊天区<div id="messages"></div></section></div><script>let n=0;function tick(){n++;document.getElementById('main').innerText=Array.from({length:18},(_,i)=>'节目正常进行 CURRENT '+n+' ITEM '+i+' 商品展示 价格 '+(100+i)).join('\n');document.getElementById('messages').innerText=Array.from({length:18},(_,i)=>'用户 '+i+' MESSAGE '+n+' 新的评论正在出现').join('\n');}setInterval(tick,2000);tick();</script></body></html>`, r.URL.Path, r.URL.Path)
 	}))
 	defer server.Close()
-	repo, err := OpenFileRepository(filepath.Join(output, "state.json"))
+	repo, err := OpenSQLiteRepository(filepath.Join(output, "state.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}

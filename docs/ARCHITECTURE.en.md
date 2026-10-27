@@ -31,7 +31,7 @@ The Agent does not run continuously, control the browser directly, or write aler
 | New signals arrive while the model is working | Per-monitor bounded queue, priority aging, deadlines, limited coalescing, global concurrency gate | A full queue can reject work or evict a lower-priority item; retaining an observation does not mean it was investigated. |
 | Avoid repeated reviews when nothing changes | OCR line deduplication, review cooldown, on-demand vision and history search, slower cadence in stable states | Deduplication happens after OCR; UI changes may still produce new text. There is no daily currency or token cap. |
 | Multiple investigations need continuity | Persisted observation ledger; each investigation can search history and recent alerts | There is no separate event-state ledger; links between “announced,” “started,” “delayed,” and “cancelled” are interpreted during investigation. |
-| Long-running monitors can pause, fail, or change goals | Separate Run status, capture health, and investigation state; cancellation and goal-version checks protect submission | Queues and in-flight investigations are in process memory and do not resume at the same position after restart. Observation and archived-image cleanup is not automatic. |
+| Long-running monitors can pause, fail, or change goals | Separate Run status, capture health, and investigation state; SQLite persists Pending work while cancellation and goal-version checks protect submission | Valid Pending signals are investigated again after restart; model turns and browser positions do not resume. Observation cleanup is not automatic. |
 
 The main trade-off is to let the model interpret while Go enforces boundaries. Model output can affect a conclusion or sampling proposal, but must pass tool preconditions, evidence checks, and state rules before it can create an alert or change sampling.
 
@@ -78,7 +78,7 @@ This reduces platform coupling but has clear limits. The system sees only what t
 | `Service` | [service.go](../internal/monitor/service.go), [pending.go](../internal/monitor/pending.go) | Run lifecycle, signal admission, Pending queues, investigation permits, cancellation, and pre-submission checks. |
 | `UnexpectedEventReviewer` | [agent_reviewer.go](../internal/monitor/agent_reviewer.go), [review_tools.go](../internal/monitor/review_tools.go) | Run a bounded tool loop for one investigation and produce a conclusion and evidence references; it does not write to the Repository. |
 | `ToolModel` / `ModelSession` | [model_session.go](../internal/monitor/model_session.go) | Convert shared turns, tool calls, and image content into provider-specific messages. |
-| `Repository` | [repository.go](../internal/monitor/repository.go), [file_repository.go](../internal/monitor/file_repository.go) | Atomic reads and bounded state changes for one Run; implementations use memory or local files. |
+| `Repository` | [repository.go](../internal/monitor/repository.go), [sqlite_repository.go](../internal/monitor/sqlite_repository.go) | Atomic reads and bounded state changes for one Run; SQLite is used at runtime, while the in-memory implementation is for temporary runs and tests. |
 | `RunLedger` | [ledger.go](../internal/monitor/ledger.go) and repository implementations | Store and paginate the complete observation history separately from the bounded Run snapshot shown in the console. |
 
 Interfaces provide clear replacement points for recognizers, model protocols, and repositories, and tests inject fakes through the same seams. Investigation rules remain in AgentReviewer and Go submission checks instead of being copied into each model adapter. See the [Agent Harness guide](AGENT-HARNESS.en.md) for the full execution boundary and budgets.
@@ -135,7 +135,7 @@ Capture and OCR run in separate workers. Each livestream keeps at most one frame
 
 Synchronous `Ingest` is kept for compatibility, tests, and synchronous load. It may record an event without queuing a review when cooldown or slot availability prevents immediate work. `SubmitSignal` waits for background execution permission after successful admission until review completes, is cancelled, or expires. Synchronous admission throughput therefore does not represent asynchronous completion throughput or queue latency.
 
-`Waiting/Reviewing/Processed/Failed/Dropped/Expired/Coalesced` are in-process queue states, not a recoverable job ledger. Pause, stop, or goal change clears the old queue and cancels in-flight contexts. Restart does not resume unfinished work at its exact Pending position.
+`Waiting/Reviewing/Processed/Failed/Dropped/Expired/Coalesced` are runtime counters. The recoverable work ledger is `pending_signals`: pause and process restart preserve waiting items, and a processing item is reclaimed at startup if it is still current and unexpired. Goal change and stop remove queued work. The exact model request, tool call, and turn are not resumable; recovery restarts investigation from the signal evidence.
 
 ## Evidence rules and alert submission
 
@@ -174,7 +174,9 @@ Model calls and tool execution happen outside Repository update transactions. Th
 
 When the goal changes, Service prepares a new plan, atomically updates the goal, plan, sampling state, and `GoalVersion`, then clears old queue items and cancels old investigations. Even if an old model request does not stop promptly, its result cannot be submitted under the new goal. Pause retains the Run and history while cancelling runtime work. Resume rebuilds capture and investigation loops for the same Run. Stop ends the Run.
 
-A Repository `Update` callback must make only bounded in-memory changes; it must not call a model, browser, or network while holding the lock. Memory Repository uses a mutex and copies. The file adapter persists snapshots and an append-only observation ledger on top of the in-memory repository logic. This gives consistency inside the Repository, not a cross-process queue or exactly-once external side effects.
+A Repository `Update` callback must make only bounded in-memory changes; it must not call a model, browser, or network while holding the lock. The default SQLite adapter stores Run snapshots, the complete observation ledger, and Pending signals. On admission, a transaction commits the Run event, observation, and queue item together; rejected admission rolls the whole transaction back. Queue capacity is 8 items per Run, with staged images limited to 4 MiB each and 64 MiB total. A worker claims an item by changing `pending` to `processing` in a transaction and deletes it after normal completion. Pause or process interruption leaves it persisted; startup recovery changes still-valid `processing` items back to `pending`, so Resume starts a new investigation from the saved evidence. Expired items and items from an old GoalVersion are deleted; changing the goal removes old-version items in the same transaction.
+
+SQLite makes local state updates and queue admission consistent, but it cannot restore a model session after a request, a tool-call position, or the browser's internal execution position. If the process exits after an external model result but before its local commit, recovery may call the model again; processing is at-least-once. Runtime JSON storage has been removed. `cmd/monitor-store-export` exports a consistent JSON snapshot and JSONL observation ledger for inspection and archiving; the export does not include Pending items and cannot be loaded back into LiveGuard.
 
 ## Cross-investigation context and persistence
 
@@ -183,8 +185,8 @@ Continuity comes from searchable observations and structured business state, not
 | State / record | Lifetime and purpose |
 |---|---|
 | `Run` | Stores goal, `GoalVersion`, MonitoringPlan, sampling policy, rooms, recent records, investigations, and alerts. Snapshot history is bounded; `HistoryTruncated` is set after truncation. |
-| `RunLedger` | Stores complete OCR/ASR/frame/vision observations and supports paginated search. File mode persists across restarts; Memory Repository keeps data only in process. |
-| `Pending` | In-process waiting and execution status; not durable task state. Queue position is not restored on restart. |
+| `RunLedger` | Stores complete OCR/ASR/frame/vision observations and supports paginated search. SQLite and JSON file modes persist it; Memory Repository keeps data only in process. |
+| `Pending` | SQLite persists waiting signals and reclaims valid in-flight work after restart; JSON and memory modes keep queue state in process only. |
 | `Investigation` | One investigation's state, reason, evidence, tool trace, and token/time metrics. It can wait if evidence is insufficient; a later investigation can search history again. |
 | `Alert` | An alert accepted by the backend. Whether a browser user has read it is maintained separately by the frontend; it is not a third-party delivery receipt. |
 
@@ -213,5 +215,5 @@ See [sampling.go](../internal/monitor/sampling.go), [capture_pipeline.go](../int
 | ReAct loop and tool protocol | [internal/agent/loop.go](../internal/agent/loop.go), [agent_reviewer.go](../internal/monitor/agent_reviewer.go), [review_tools.go](../internal/monitor/review_tools.go), [review_context.go](../internal/monitor/review_context.go) |
 | Queue, freshness, and fair concurrency | [pending.go](../internal/monitor/pending.go), [signal_policy.go](../internal/monitor/signal_policy.go), [review_gate.go](../internal/monitor/review_gate.go) |
 | Evidence sources and submission checks | [evidence.go](../internal/monitor/evidence.go), [service.go](../internal/monitor/service.go), [repository.go](../internal/monitor/repository.go) |
-| Observation ledger and history search | [ledger.go](../internal/monitor/ledger.go), [file_repository.go](../internal/monitor/file_repository.go) |
+| Observation ledger and history search | [ledger.go](../internal/monitor/ledger.go), [sqlite_repository.go](../internal/monitor/sqlite_repository.go) |
 | Provider adapters and retries | [model_session.go](../internal/monitor/model_session.go), [messages_model.go](../internal/monitor/messages_model.go), [chat_completions_provider.go](../internal/monitor/chat_completions_provider.go), [retry.go](../internal/agent/retry.go) |

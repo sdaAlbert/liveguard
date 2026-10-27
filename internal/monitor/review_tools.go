@@ -69,6 +69,7 @@ func goalRequiresFrameInspection(goal string) bool {
 func reviewToolsForPlan(plan MonitoringPlan) []map[string]any {
 	categorySchema := map[string]any{"type": "string", "enum": []string{"major_announcement", "giveaway", "product_event", "game_moment", "urgent_notice", "chat_match", "custom_goal", "other"}}
 	tools := []map[string]any{
+		{"name": "update_monitoring_goal", "description": "Use only after evaluating the user's natural-language collaboration messages and concluding they clearly changed the durable monitoring target. Do not require a special prefix. Do not change the target for transient status updates, page handling, questions, or evidence from the livestream. The new goal must preserve the user's intent and describe the ongoing target concisely. This applies the goal and replans monitoring immediately; it ends the current investigation.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"goal": map[string]any{"type": "string", "minLength": 2, "maxLength": 240}}, "required": []string{"goal"}, "additionalProperties": false}},
 		{"name": "request_user_input", "description": "Ask the user one concise question only when the answer depends on a preference or rule that cannot be inferred from evidence. Do not use this for ordinary missing evidence; keep monitoring and wait. Never use it for a clear time-sensitive opportunity. This ends only the current investigation, not the monitor. Provide up to four short suggested answers; the user can also type a custom answer.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"question": map[string]any{"type": "string", "minLength": 4, "maxLength": 240}, "options": map[string]any{"type": "array", "maxItems": 4, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 60}}}, "required": []string{"question"}, "additionalProperties": false}},
 		{"name": "search_observations", "description": "Search this monitor's persisted OCR, ASR, frame and visual observations. scope=recent reads live context; scope=all searches history. text_any is an OR-list of up to 8 phrases, so related wording can be searched in one request. total_matches is the exact number of matching observation records for the filters (not distinct real-world events), independent of the page cursor. Each page returns at most 12 records and provides a cursor when older matches remain; pass all cursor fields back to continue.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"scope": map[string]any{"type": "string", "enum": []string{"recent", "all"}}, "text": map[string]any{"type": "string", "maxLength": 120}, "text_any": map[string]any{"type": "array", "maxItems": 8, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 120}}, "source": map[string]any{"type": "string", "enum": []string{"ocr", "asr", "frame", "vision"}}, "room_id": map[string]any{"type": "string", "maxLength": 80}, "from": map[string]any{"type": "string", "format": "date-time"}, "until": map[string]any{"type": "string", "format": "date-time"}, "before": map[string]any{"type": "string", "format": "date-time"}, "before_sequence": map[string]any{"type": "integer"}, "before_id": map[string]any{"type": "string", "maxLength": 128}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 12}}, "additionalProperties": false}},
 		{"name": "search_recent_alerts", "description": "Check whether this monitor has already alerted on the same event category.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"category": categorySchema}, "required": []string{"category"}, "additionalProperties": false}},
@@ -127,6 +128,8 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 	case "save_frame_evidence":
 	case "request_user_input":
 		allowed["question"], allowed["options"] = true, true
+	case "update_monitoring_goal":
+		allowed["goal"] = true
 	case "create_alert":
 		for _, key := range []string{"category", "summary", "reason", "confidence", "visual_finding", "sampling", "evidence_ids", "evidence_basis"} {
 			allowed[key] = true
@@ -351,6 +354,28 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 		}
 		decision.VisualEvidenceID, decision.VisualArchiveID, decision.VisualObservedAt = state.frameEventID, state.frameArchiveID, state.frameObservedAt
 		result.Content, result.Outcome = map[string]any{"question": decision.UserQuestion, "options": decision.UserOptions, "monitoring_continues": true}, "已向用户提出问题；本次调查等待回复，监控继续运行"
+		return result, decision, true
+	}
+	if block.Name == "update_monitoring_goal" {
+		var args struct {
+			Goal string `json:"goal"`
+		}
+		if json.Unmarshal(block.Arguments, &args) != nil || utf8.RuneCountInString(strings.TrimSpace(args.Goal)) < 2 || utf8.RuneCountInString(strings.TrimSpace(args.Goal)) > 240 {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"goal must contain 2-240 characters"}`, "新关注目标长度无效"
+			return result, UnexpectedEventDecision{}, false
+		}
+		if len(input.UserInstructions) == 0 && strings.TrimSpace(input.UserClarification) == "" || input.UpdateGoal == nil {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"a recent user collaboration message is required before changing the goal"}`, "当前调查没有可依据的用户协作消息"
+			return result, UnexpectedEventDecision{}, false
+		}
+		updated, err := input.UpdateGoal(ctx, strings.TrimSpace(args.Goal))
+		if err != nil {
+			result.IsError, result.Content, result.Outcome = true, `{"error":"could not update monitoring goal"}`, "更新关注目标失败"
+			return result, UnexpectedEventDecision{}, false
+		}
+		decision := UnexpectedEventDecision{Action: "wait", Category: "other", Confidence: 1, Reason: "Agent 根据用户的自然语言协作内容更新了持续关注方向"}
+		result.Content = map[string]any{"updated": true, "goal": updated.Goal, "monitoring_continues": true}
+		result.Outcome = "已按用户自然语言反馈更新关注目标；当前调查结束，监控按新目标继续"
 		return result, decision, true
 	}
 	if block.Name == "save_frame_evidence" {

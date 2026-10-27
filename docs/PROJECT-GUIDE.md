@@ -32,6 +32,7 @@ OCR 是“光学字符识别”：把截图里的字读出来。ASR 是“自动
 | `cmd/liveguard/main.go` | 可执行程序入口：读配置、选择存储、组装服务、启动 HTTP、优雅关闭 | `main` 看组件怎样接线；它不实现直播判断规则 |
 | `cmd/monitor-eval/main.go` | 调用真实 MiniMax 配置运行固定文字评测并写 JSON 报告 | 查看命令参数和退出条件 |
 | `cmd/monitor-load/main.go` | 启动合成信号负载测量并写 JSON 报告 | 注意报告明确标注 mock/no capture |
+| `cmd/monitor-store-export/main.go` | 从 SQLite 导出 JSON 快照和观测流水 | 输出目录必须不存在；导出用于查看归档，不含 Pending 队列 |
 | `internal/domain` | 通用事件 ID 和 Web 推送事件等基础类型 | 不放直播领域判断 |
 | `internal/agent` | 与业务无关的模型工具循环、HTTP 客户端、有限重试和熔断器 | 从 `loop.go` 看模型如何被限制 |
 | `internal/browser` | 专用 Chrome 会话、直播 URL 校验、DevTools 截图 | 从 `live_capture.go` 看真实采集入口 |
@@ -54,9 +55,9 @@ OCR 是“光学字符识别”：把截图里的字读出来。ASR 是“自动
 | **Evidence（证据）** | 调查引用的观测或已检查图片，附来源、时间和目标版本 | 有 OCR 文字不代表它一定来自聊天区 |
 | **Investigation（调查）** | Agent 对一条触发观测做的一次有限判断，保留结论和工具步骤 | 失败的调查不等于整个 Run 失败 |
 | **Alert（提醒）** | Go 验证后写入 Run 的提醒记录 | 网页标记已读不等于后端提醒被删除 |
-| **Pending（待处理）** | 当前进程内正在排队、判断或已处理的工作统计 | 不是可从数据库恢复的任务检查点 |
+| **Pending（待处理）** | 队列当前的排队与判断状态；SQLite 另将未完成的信号持久化 | 重启后可重排有效信号并重新调查，不恢复原模型轮次 |
 | **GoalVersion（目标版本）** | 用户每次修改关注目标时递增的数字 | 用来阻止旧目标下的迟到结果污染新目标 |
-| **Repository（仓储）** | 读写 Run 和观测的存储接口 | Memory 只在进程内存储；JSON 文件模式会写入本机 |
+| **Repository（仓储）** | 读写 Run、观测和可恢复 Pending 队列的存储接口 | 运行时持久化使用 SQLite；内存实现用于临时运行和测试 |
 | **Harness（执行框架）** | 把一次受限 Agent 调查串起来的几层代码；其中 `internal/agent/loop.go` 是通用轮次与工具执行内核 | 循环内核不理解直播语义；Monitor 层提供直播工具、异步调度和最终提交校验。见[Agent Harness 详解](AGENT-HARNESS.md) |
 
 Run 状态、采集健康和单次调查状态是三条独立状态线。例如 Run 仍是 `running`，Room 却可能是 `needs_login`；一条 Investigation 也可能是 `failed`，而监控继续接收后续信号。分开记录可以回答“任务是否还开着”“采集是否正常”“这一条判断是否完成”三个不同问题。
@@ -234,7 +235,7 @@ Go 只允许这些 Run 状态转换：`running → paused/stopped/failed/complet
 | 工具调用 | 有单工具 12 秒限制；失败记录在调查轨迹，不会自动重放有副作用的工具 |
 | 截图/OCR | 临时错误指数退避至最多 30 秒后继续尝试，成功后自动恢复；登录/验证要求用户处理。超长内部 OCR 拆分保存，积压时替换等待画面并合并复核触发 |
 | 队列任务 | 有 deadline；过期丢弃调查工作，但不删掉已经保存的观测 |
-| 进程重启 | 持久模式将旧 `running` Run 标为 `paused`；不会自动重放旧队列或接续浏览器操作 |
+| 进程重启 | SQLite 模式将旧 `running` Run 标为 `paused`；继续后重排有效 Pending 并重新调查，不接续浏览器操作或原模型轮次 |
 
 传输重试可能造成模型提供方对两次请求都计费。LiveGuard 不重试 `create_alert` 等业务副作用工具：重复业务操作要靠接收 ID、业务去重和最终状态检查控制，不能把“再发一次 HTTP”当成安全重试。
 
@@ -246,16 +247,17 @@ Go 只允许这些 Run 状态转换：`running → paused/stopped/failed/complet
 
 ## 数据存在哪里
 
-| 数据 | `local` 默认文件模式 | `memory` 临时模式 |
+| 数据 | SQLite 持久化运行模式 | `memory` 临时模式 |
 |---|---|---|
-| Run 快照 | `runtime/liveguard.json` 原子替换写入 | 仅进程内存，退出后丢失 |
-| 完整观测流水 | `runtime/liveguard.json.observations.jsonl` 追加写入 | 仅进程内存，退出后丢失 |
-| 队列和在途取消 | 仅进程内存，重启不恢复 | 仅进程内存，退出后丢失 |
-| 当前调查查看的截图 | 系统临时目录 | `save_frame_evidence` 仅在调查期间保留；正常结束后删除。强制终止后的清理尚未专项验证 |
+| Run 快照 | `runtime/liveguard.sqlite` 的 `runs` 表 | 仅进程内存，退出后丢失 |
+| 完整观测流水 | SQLite `observations` 表 | 仅进程内存，退出后丢失 |
+| Pending 队列和排队图片 | SQLite `pending_signals` 表；重启后恢复有效工作 | 仅进程内存，退出后丢失 |
+| 正在执行的模型请求/工具轮次 | 仅进程内存；恢复时重新调查 | 仅进程内存，退出后丢失 |
+| 当前调查查看的截图 | 系统临时目录；待处理图片暂存在 SQLite 队列记录中 | `save_frame_evidence` 仅在调查期间保留；正常结束后删除。强制终止后的清理尚未专项验证 |
 | Chrome 登录状态 | `runtime/live-profile/` 本机目录 | 仍写入本机目录 |
 | 模型 API Key | 进程内存/环境变量 | 进程内存/环境变量 |
 
-Memory Repository 只在当前进程存储状态。`local` 是默认文件模式：Run 快照和完整观测流水都写到 `runtime/` 下的 JSON 文件；重启后会恢复监控卡片与历史，并将此前正在运行的监控暂停，等待用户继续。任务队列和正在执行的调查不会恢复。常规 OCR 图片和调查中选用的截图都用临时文件，正常处理结束后删除；强制终止后的清理尚未专项验证。可关联的 OCR 文字与文字结论写入监控记录。读取历史归档图的兼容入口仍存在，但当前路径不会新建图片归档。Chrome 登录资料另存在 `runtime/` 下。观测流水没有自动清理策略，磁盘会随时间增长。
+SQLite 是 LiveGuard 唯一的持久化运行仓储。启动时正在运行的监控会暂停；点击继续时，会恢复仍有效且属于当前目标的 Pending 信号并从保存的证据重新开始调查。模型请求和工具轮次无法续跑，进程在外部模型响应与本地提交之间退出时可能重复调用。JSON 仓储模式已移除，旧 JSON 文件不会自动导入。需要查看或归档时，可用 `go run ./cmd/monitor-store-export -db runtime/liveguard.sqlite -out runtime/json-backup` 生成 JSON 快照和观测流水；导出不包含队列，不能重新导入 LiveGuard。`memory` Repository 只在当前进程存储状态。常规 OCR 图片和调查中选用的截图都用临时文件，正常处理结束后删除；强制终止后的清理尚未专项验证。可关联的 OCR 文字与文字结论写入监控记录。读取历史归档图的兼容入口仍存在，但当前路径不会新建调查图片归档。Chrome 登录资料另存在 `runtime/` 下。观测流水没有自动清理策略，数据库和导出文件会随时间增长。
 
 ## 评测与吞吐/延迟：现有证据能说明什么
 
@@ -272,7 +274,7 @@ Memory Repository 只在当前进程存储状态。`local` 是默认文件模式
 
 1. 看 `README.md`，获取产品范围、运行方式和文档索引。
 2. 看本页，再按一次调用路线阅读 `cmd/liveguard/main.go` → `internal/web/server.go` → `internal/monitor/service.go` → `internal/monitor/pending.go` → `internal/monitor/agent_reviewer.go` → `internal/monitor/review_tools.go`。
-3. 跟数据走时看 `internal/monitor/domain.go`、`repository.go`、`ledger.go`；跟本机文件存储走时再看 `file_repository.go`。
+3. 跟数据走时看 `internal/monitor/domain.go`、`repository.go`、`ledger.go` 和 `sqlite_repository.go`。
 4. 看 `internal/agent/loop.go` 理解通用工具循环，再看 `messages_model.go`、`chat_completions_provider.go` 理解模型协议差异。
 5. 看 `internal/monitor/*_test.go` 找边界案例；最后看 `docs/EVALUATION.md` 了解如何运行评测和哪些结论不能外推。
 

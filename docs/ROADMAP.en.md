@@ -36,7 +36,7 @@ If an item needs several design options or affects multiple modules, write a foc
 
 ### 2. Define retention and backup for long-running observation data
 
-**Problem:** Local mode appends the full observation history to `runtime/liveguard.json.observations.jsonl`. With the current “keep the ledger” behavior, observations are not automatically removed, so disk usage grows during long-running sessions.
+**Problem:** The default SQLite mode keeps the full observation history in the `observations` table in `runtime/liveguard.sqlite`. With the current “keep the ledger” behavior, observations are not automatically removed, so disk use grows during long-running sessions. Manual JSON exports also use additional disk space.
 
 **Important boundary:** Screenshots used by the current investigation are held in temporary files. `save_frame_evidence` means that an image is kept temporarily for the current investigation and removed after normal completion. The current path records related text evidence and the text conclusion; it does not archive that screenshot under `runtime/frames`. Cleanup after forced process termination has not been specifically verified. There is still a compatibility path for reading an existing archived image, but that does not mean new screenshots are continuously saved.
 

@@ -123,6 +123,16 @@ func (s *Service) resumeClarifiedInvestigation(runID, investigationID string) {
 		EvidenceAt: time.Now().UTC(), GoalVersion: run.GoalVersion, GoalUpdatedAt: run.GoalUpdatedAt,
 		Goal: run.Goal, UserClarification: inv.UserAnswer, UserInstructions: append([]string(nil), run.UserInstructions...), Plan: planForReviewer(run.Plan, run.Goal, reviewer),
 		RecentEvidence: recent, RecentAlerts: run.Alerts, TriggerFrameObservedAt: event.ObservedAt,
+		UpdateGoal: func(updateCtx context.Context, goal string) (*Run, error) {
+			current, getErr := s.repository.Get(updateCtx, runID)
+			if getErr != nil {
+				return nil, getErr
+			}
+			if strings.TrimSpace(current.Goal) == strings.TrimSpace(goal) {
+				return current, nil
+			}
+			return s.UpdateGoal(updateCtx, runID, goal)
+		},
 		SearchObservations: func(queryCtx context.Context, query ObservationQuery) (ObservationPage, error) {
 			ledger, ok := s.repository.(RunLedger)
 			if !ok {

@@ -40,6 +40,7 @@ type pendingSignal struct {
 	event      SignalEvent
 	version    uint64
 	expires    time.Time
+	frameBytes []byte
 	cleanup    func()
 }
 
@@ -61,11 +62,13 @@ type signalQueue struct {
 	now          func() time.Time
 	process      func(context.Context, pendingSignal) error
 	changed      func()
+	durable      DurablePendingQueue
+	runID        string
 }
 
-func newSignalQueue(ctx context.Context, version uint64, process func(context.Context, pendingSignal) error, changed func()) *signalQueue {
+func newSignalQueue(ctx context.Context, version uint64, process func(context.Context, pendingSignal) error, changed func(), durable DurablePendingQueue, runID string) *signalQueue {
 	ctx, cancel := context.WithCancel(ctx)
-	q := &signalQueue{ctx: ctx, cancel: cancel, version: version, wake: make(chan struct{}, 1), done: make(chan struct{}), now: time.Now, process: process, changed: changed}
+	q := &signalQueue{ctx: ctx, cancel: cancel, version: version, wake: make(chan struct{}, 1), done: make(chan struct{}), now: time.Now, process: process, changed: changed, durable: durable, runID: runID}
 	go q.loop()
 	return q
 }
@@ -76,11 +79,30 @@ func (q *signalQueue) notify() {
 	default:
 	}
 }
+
+func (q *signalQueue) notifyAccepted(event SignalEvent) {
+	q.mu.Lock()
+	if q.activeCancel != nil && !event.ObservedAt.Before(q.activeEvent.ObservedAt) {
+		priority := pendingPriority(event)
+		activePriority := pendingPriority(q.activeEvent)
+		if (priority > activePriority && priority > 0) || numericRevision(q.activeEvent, event) {
+			q.activeCancel()
+		}
+	}
+	q.mu.Unlock()
+	q.notify()
+}
 func (q *signalQueue) stats() PendingStatus {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	s := q.status
 	s.Waiting = len(q.items)
+	durable, runID := q.durable, q.runID
+	q.mu.Unlock()
+	if durable != nil {
+		if waiting, reviewing, err := durable.PendingCounts(context.Background(), runID); err == nil {
+			s.Waiting, s.Reviewing = waiting, reviewing
+		}
+	}
 	return s
 }
 func disposeSignals(items []pendingSignal) {
@@ -224,6 +246,10 @@ func (q *signalQueue) nextIndex(now time.Time) int {
 
 func (q *signalQueue) loop() {
 	defer close(q.done)
+	if q.durable != nil {
+		q.durableLoop()
+		return
+	}
 	for {
 		q.mu.Lock()
 		if q.closed || q.ctx.Err() != nil {
@@ -272,6 +298,65 @@ func (q *signalQueue) loop() {
 			q.status.LastIssue = "消息已过期，未生成新提醒"
 		}
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrGoalChanged) && !errors.Is(err, context.DeadlineExceeded) {
+			q.status.Failed++
+			q.status.LastIssue = "本次判断未完成，继续观察新消息"
+		}
+		q.mu.Unlock()
+		q.changed()
+	}
+}
+
+func (q *signalQueue) durableLoop() {
+	for {
+		q.mu.Lock()
+		if q.closed || q.ctx.Err() != nil {
+			q.mu.Unlock()
+			return
+		}
+		version := q.version
+		q.mu.Unlock()
+		item, found, err := q.durable.ClaimPending(q.ctx, q.runID, version, q.now())
+		if err != nil {
+			if q.ctx.Err() != nil {
+				return
+			}
+			log.Printf("claim durable pending signal failed: monitor=%s error=%q", q.runID, err)
+			if !wait(q.ctx, 250*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		if !found {
+			select {
+			case <-q.ctx.Done():
+				return
+			case <-q.wake:
+			}
+			continue
+		}
+		ctx, cancel := context.WithCancel(q.ctx)
+		q.mu.Lock()
+		q.activeCancel, q.activeEvent, q.status.Reviewing = cancel, item.event, true
+		q.mu.Unlock()
+		q.changed()
+		processErr := q.process(ctx, item)
+		cancel()
+		if !(errors.Is(processErr, context.Canceled) && q.ctx.Err() != nil) {
+			if finishErr := q.durable.FinishPending(context.Background(), q.runID, item.event.ID, false); finishErr != nil {
+				log.Printf("finish durable pending signal failed: monitor=%s signal=%s error=%q", q.runID, item.event.ID, finishErr)
+			}
+		}
+		q.mu.Lock()
+		q.activeCancel = nil
+		q.status.Reviewing = false
+		if processErr == nil {
+			q.status.Processed++
+		}
+		if errors.Is(processErr, context.DeadlineExceeded) {
+			q.status.Expired++
+			q.status.LastIssue = "消息已过期，未生成新提醒"
+		}
+		if processErr != nil && !errors.Is(processErr, context.Canceled) && !errors.Is(processErr, ErrGoalChanged) && !errors.Is(processErr, context.DeadlineExceeded) {
 			q.status.Failed++
 			q.status.LastIssue = "本次判断未完成，继续观察新消息"
 		}
@@ -337,6 +422,22 @@ func (s *Service) SubmitSignal(ctx context.Context, runID string, event SignalEv
 	if len(current.Rooms) > 0 && (current.Rooms[0].Health == SourceNeedsLogin || current.Rooms[0].Health == SourceFailed) {
 		return ErrInputPaused
 	}
+	if _, ok := s.repository.(DurablePendingQueue); ok {
+		frameBytes, frameErr := readPendingFrameBytes(event.FramePath)
+		if frameErr != nil {
+			return frameErr
+		}
+		item := &pendingSignal{
+			version: current.GoalVersion, expires: signalDeadline(event),
+			enqueuedAt: time.Now().UTC(), live: current.SourceMode == "browser_ocr", frameBytes: frameBytes,
+		}
+		_, accepted, duplicate, err := s.acceptSignalAndEnqueue(ctx, runID, event, item)
+		if err != nil || duplicate {
+			return err
+		}
+		q.notifyAccepted(accepted)
+		return nil
+	}
 	snapshot, event, duplicate, err := s.acceptSignal(ctx, runID, event)
 	if err != nil || duplicate {
 		return err
@@ -363,8 +464,48 @@ func (s *Service) SubmitSignal(ctx context.Context, runID string, event SignalEv
 	return err
 }
 
+func readPendingFrameBytes(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxPendingFrameBytes {
+		return nil, ErrFrameBudget
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != info.Size() {
+		return nil, ErrFrameBudget
+	}
+	return data, nil
+}
+
 func (s *Service) newPendingQueue(runCtx context.Context, runID string, version uint64) *signalQueue {
-	return newSignalQueue(runCtx, version, func(workCtx context.Context, item pendingSignal) error {
+	durable, _ := s.repository.(DurablePendingQueue)
+	q := newSignalQueue(runCtx, version, func(workCtx context.Context, item pendingSignal) error {
+		if len(item.frameBytes) > 0 {
+			file, err := os.CreateTemp("", "liveguard-pending-frame-*.png")
+			if err != nil {
+				return err
+			}
+			path := file.Name()
+			if _, err := file.Write(item.frameBytes); err != nil {
+				_ = file.Close()
+				_ = os.Remove(path)
+				return err
+			}
+			if err := file.Close(); err != nil {
+				_ = os.Remove(path)
+				return err
+			}
+			item.event.FramePath = path
+			defer os.Remove(path)
+		}
 		current, err := s.repository.Get(workCtx, runID)
 		if err != nil {
 			return err
@@ -373,7 +514,8 @@ func (s *Service) newPendingQueue(runCtx context.Context, runID string, version 
 			return ErrGoalChanged
 		}
 		return s.processAccepted(workCtx, runID, current, item.event, true, item.priority)
-	}, s.onUpdate)
+	}, s.onUpdate, durable, runID)
+	return q
 }
 
 // A rejected signal has no accepted receipt, so the same idempotency key can
@@ -466,6 +608,14 @@ func (s *Service) closePending(runID string) {
 	q := s.pending[runID]
 	s.mu.Unlock()
 	if q != nil {
+		q.mu.Lock()
+		version := q.version
+		q.mu.Unlock()
 		q.invalidate(0, true)
+		if q.durable != nil {
+			if err := q.durable.RecoverPending(context.Background(), runID, version, q.now()); err != nil {
+				log.Printf("requeue durable pending signals after queue close failed: monitor=%s error=%q", runID, err)
+			}
+		}
 	}
 }

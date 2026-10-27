@@ -12,7 +12,7 @@ The project works with livestream pages from Douyin, Bilibili, Kuaishou, and sim
 
 - Captures a dedicated Chrome session and uses local OCR to read visible text from the livestream page.
 - Optionally transcribes audio that you explicitly share from the browser; the current ASR integration uses MiniMax.
-- Provides a local web UI for monitors, evidence, investigation steps, and alerts. Monitor state and the observation ledger are stored in local JSON files.
+- Provides a local web UI for monitors, evidence, investigation steps, and alerts. Monitor state, the observation ledger, and recoverable pending signals are stored in a local SQLite database by default. A JSON export command is available for inspection and archiving.
 - Lets you pause and resume monitors. In persistent mode, monitors that were running when the process stopped are restored as paused, with their saved history intact.
 
 ## Screenshots from a running instance

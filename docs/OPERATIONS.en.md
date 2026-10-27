@@ -29,27 +29,30 @@ Code entry points: [Run creation and capture recovery](../internal/monitor/servi
 
 ## Local data and long-running use
 
-By default, LiveGuard stores monitoring state on the local machine under `runtime/`. It does not connect to an external database.
+By default, LiveGuard stores monitoring state in the local `runtime/liveguard.sqlite` database. It does not connect to an external database.
 
 | Data | Default location | Behavior after exit/restart |
 |---|---|---|
-| Goal/Plan/Sampling and bounded event, investigation, and alert snapshots | `runtime/liveguard.json`, an atomic JSON snapshot | Restored on next start; a Run that was active is paused so the user can resume it |
-| Full observation history | `runtime/liveguard.json.observations.jsonl`, an append-only log | Restored on next start; legacy observations in the JSON snapshot are migrated on first open |
+| Goal/Plan/Sampling and bounded event, investigation, and alert snapshots | `runs` table in `runtime/liveguard.sqlite` | Restored on next start; a Run that was active is paused so the user can resume it |
+| Full observation history | `observations` table in the same database | Committed in the same transaction as the Run update and queried by page |
+| Pending signals, queue order, and waiting image bytes | `pending_signals` table in the same database | Still-valid signals for the current goal are restored after pause or process restart and investigated again after resume |
 | Service logs | `runtime/liveguard.log`, rotated at 10 MiB to `.1`; change with `LIVEGUARD_LOG_PATH` | Kept locally; container/service deployments need their own collection or backup |
-| Queue, in-flight cancellation, review slots, throttling times, image-byte budget | In memory in Service and `signalQueue` | Not restored; there is no resumable execution checkpoint |
+| Active model request, model turn and tool position, in-flight cancellation, review slots, throttling times | In memory in Service and the Agent runtime | Not restored; the request is cancelled and the persisted signal is investigated again from its saved evidence |
 | Screenshot inspected during an investigation | System temp directory as `liveguard-agent-frame-*.png` | `save_frame_evidence` keeps the image only during the investigation; it is deleted at normal completion, not archived. Cleanup after forced termination has not been specifically verified |
 | Chrome login profile | `runtime/live-profile/` | Browser profile remains local; this does not resume a monitor or queue |
 | API key | In local Go process memory or a user-provided environment variable | UI settings are not written to the repository or browser storage; configure again after restart or supply an environment variable |
 | Whether an alert was read | Browser `localStorage` | Affects only web display, not backend event idempotency |
 | Manually exported/evaluation reports | `.cache/` | Git-ignored; not an automatically maintained service database |
 
-To back up or move local monitor state, copy both `runtime/liveguard.json` and `runtime/liveguard.json.observations.jsonl`. Investigation screenshots are not saved in those files or archived under `runtime/frames/`. Set `LIVEGUARD_LOCAL_STATE_PATH` to move the snapshot; the observation log path is formed by appending `.observations.jsonl`. Setting `LIVEGUARD_INFRA_MODE=memory` switches to in-memory-only mode, so Runs and observations disappear when the process exits.
+SQLite is the only persistent runtime repository; `LIVEGUARD_SQLITE_PATH` changes its location. Run snapshots, observation records, and admission of new queued signals use SQLite transactions. Each Run can hold up to 8 pending signals, each staged image is limited to 4 MiB, and all pending images together are limited to 64 MiB. After restart, queued or processing signals that have not expired and still match the current GoalVersion return to the queue; expired signals and signals for older goals are discarded. An active model request cannot resume at its previous turn. Recovery starts a new investigation from the persisted evidence, so an external model call may be repeated if the process stopped between that call and local commit. This provides at-least-once processing, not exactly-once. Existing JSON/JSONL files are not imported automatically, and LiveGuard no longer opens them as runtime storage; inspect old files with a text or JSON tool if needed.
+
+Create a JSON copy for inspection and archiving with `go run ./cmd/monitor-store-export -db runtime/liveguard.sqlite -out runtime/json-backup-2026-10-27`. The output directory must be new and contains `liveguard.json` plus `liveguard.json.observations.jsonl`, exported from one SQLite snapshot. The export does not include the Pending queue, is not a complete backup, and cannot be imported back into LiveGuard. SQLite is the only persistent runtime repository; explicitly setting `LIVEGUARD_INFRA_MODE=memory` selects temporary in-memory storage, so Runs and observations disappear when the process exits. For a complete SQLite backup, stop the service and copy `runtime/liveguard.sqlite` with any existing `-wal` / `-shm` sidecars. Investigation screenshots are not kept as historical archives; image bytes for queued work are staged in SQLite and removed when the queue item finishes.
 
 OCR deduplicates text before appending new lines to the observation log and queue. Agent review has its own throttle, so it does not call the model on every OCR tick. Both regular capture images and screenshots selected during an investigation use temporary files and are deleted after normal processing. Cleanup after forced termination has not been specifically verified. Related OCR text and text conclusions are stored in monitor records.
 
 The Run snapshot has a limit on the number of events; the complete observation history is stored separately in the append-only log. There is no automatic retention policy for that log, so disk usage grows over time. Back it up or clean it up yourself.
 
-At startup, `RecoverInterrupted` changes leftover `running` Runs to `paused` and stores the `process_interrupted` reason. Resuming rebuilds capture and the queue while keeping history in the same Run. Incomplete investigations, queue positions, and browser execution checkpoints are not restored.
+At startup, `RecoverInterrupted` changes leftover `running` Runs to `paused`, stores the `process_interrupted` reason, and reclaims valid Pending items. Resuming rebuilds capture and the queue, keeps history in the same Run, and investigates recovered signals again. The current tool call, model turn, and browser execution position are not restored.
 
 ### Bounded history does not mean all resources are bounded
 
@@ -74,25 +77,26 @@ The `MemoryRepository` Run map does not limit or expire the number of stopped se
 | Login or CAPTCHA prompt | Sets `needs_login` and closes the input queue; after handling the page, pause and resume so the source is checked again | Does not log in or bypass verification automatically; text detection can misclassify |
 | Screenshot/OCR failure | Screenshot and OCR have separate counters. A delayed state retries with exponential backoff up to 30 seconds and recovers automatically; failed state writes have their own logs and retries | Login/verification still needs a person. An old goal result cannot revive an old runtime. OCR backlog replaces a waiting frame but does not cancel the frame currently being recognized, and is not counted as source failure |
 | OCR text is too long | Internal OCR splits up to 4,000 characters into multiple citeable observations while preserving recognized text and source | External input still validates the per-item length; splitting does not improve OCR accuracy |
-| Local snapshot is locked | Permission/Windows sharing conflicts get six bounded attempts with 310 ms total backoff; failure keeps the old snapshot and records the reason while capture recovery continues | Persistent file locks prevent timely saves; use the file-access error in the logs to diagnose |
 | No text or speech | `ErrNoText` can enter the no-text visual-check path; `ErrNoSpeech` is a normal no-transcript result | A successful screenshot does not prove that the stream is playing or that comments are changing |
 | Model rate limit/network failure | Temporary rate-limit or network problems use bounded retries and a circuit breaker; failed investigations are recorded, but new signals continue. Explicit quota/balance errors end active monitoring under that configuration and show a reason | A model request may have one bounded retry; a provider may charge for both requests. Unknown errors are not guessed to be quota exhaustion |
 | Invalid model format | Shared Agent requests at most one format correction and spends the original turn budget; a second invalid result stops the investigation | No unlimited retries and no fallback to keyword alerts |
 | Tool error/timeout/budget exhausted | Records steps, success state, duration, and stop reason; an incomplete investigation does not submit a normal alert | Context timeout depends on the adapter honoring cancellation; Go cannot kill arbitrary code that ignores context |
-| Queue full/expired investigation | Pending shows dropped, expired, or merged counts and reasons; temporary images are cleaned up and stored observations remain; rejected work may be retried with the original ID | A receipt means accepted/recorded, not completed; there is no full durable per-event processing ledger |
+| Queue full/expired investigation | Pending shows dropped, expired, or merged counts and reasons; SQLite stores unfinished items, and expiry removes the queue item but keeps the observation; rejected work may be retried with the original ID | A receipt means accepted/recorded, not completed; completed or failed per-event state is not a permanent job ledger |
 | Goal change/pause/stop | Goal changes increment `GoalVersion`; pause cancels old work but keeps the Run; stop ends the Run; commit checks prevent late results from taking effect | Resume rebuilds runtime; browser audio requires fresh user authorization |
-| Process exit/restart | Normal exit saves active monitoring as paused and records whether shutdown came from the local API or OS signal; leftover `running` records become paused on next start | User can resume; old browser actions and queued work are not replayed. Memory mode loses state |
+| Process exit/restart | Active Runs become paused on next start and still-valid SQLite Pending signals are requeued; shutdown source is recorded | After Resume, signals are investigated again; the original model turn and browser action are not resumed. Memory mode loses state |
 | Browser disconnect | Accepted queued work uses the monitor context and is not canceled with the HTTP client; SSE is an update hint, and the page reloads a snapshot | SSE is not a durable message bus or proof of external delivery |
 
 The model circuit breaker defaults to two consecutive request failures and a 30-second cooldown across the three configured providers. After the cooldown, only one recovery probe is allowed. Investigation deadline and signal expiry are not model errors, so they do not open the breaker. A single model request may wait up to 60 seconds; an entire Agent investigation may run up to 90 seconds; the signal's own expiry can end it sooner.
 
 The shared `DoModelRequest` retries replayable requests at most once for selected transient network failures and HTTP 408, 429, 500, 502, 503, or 504. It usually waits 250 ms. It does not wait automatically for a `Retry-After` longer than 2 seconds. It does not retry 401/403. The provider may charge for both attempts.
 
-Model request logs include `review_id`, turn, HTTP status, retry count, request duration, available context budget, and timeout source. Planning requests use the same transport policy. Format correction and transport retry are counted separately.
+Model request logs include `review_id` (trigger signal ID), `attempt_id` (unique per investigation attempt), turn, HTTP status, retry count, request duration, available context budget, and timeout source. Agent trace logs also record slot/cooldown waiting, model-turn start, tool start/completion, and investigation completion. Tool logs exclude raw arguments, OCR text, and model prompts. Planning requests use the same transport policy. Format correction and transport retry are counted separately.
 
 When reading request logs, `context_budget_ms` is the remaining **milliseconds** until that request's context deadline, not a token budget; `client_timeout_ms` is the HTTP client timeout. `input_tokens` and `output_tokens` describe one model request. A log such as `unexpected livestream review completed/incomplete` summarizes token use across the investigation's recorded turns.
 
-Group requests by `review_id` and consecutive turns. If the same `review_id` starts again at `turn=1`, it is a new review group; do not blindly add it to the previous one. Interpret `context canceled` together with `LiveGuard shutdown requested`, pause/stop records, and `timeout_source`. If it immediately follows process interruption, it usually means runtime cancellation, not token overflow. `model response truncated at token limit` means one response hit its output limit; `turn_budget` or `call_budget` means the investigation loop used up its turn or call allowance.
+To follow current Agent activity in PowerShell, run `Select-String -Path .\runtime\liveguard.log -Pattern 'attempt_id=' | Select-Object -Last 100`. Group by `attempt_id`: `agent review waiting for slot` means the work is waiting for global capacity/cooldown; `agent review slot acquired` means it can start; `agent model turn started` marks an outgoing model request; `model request completed/failed` marks its response; `agent tool started/completed` marks Go tool execution; then check `agent review finished` and `unexpected livestream review completed/incomplete/failed`. A start entry with no end entry means that stage is still running or has not logged its result. The existing process will not emit the new entries; restart onto the updated build to enable them.
+
+`review_id` identifies the triggering signal, not a unique investigation attempt. A repeated investigation of the same signal restarts at `turn=1`, so group by `attempt_id`. Interpret `context canceled` together with `LiveGuard shutdown requested`, pause/stop records, and `timeout_source`. If it immediately follows process interruption, it usually means runtime cancellation, not token overflow. `model response truncated at token limit` means one response hit its output limit; `turn_budget` or `call_budget` means the investigation loop used up its turn or call allowance.
 
 There is currently no hard token budget per Run or per day. The per-response output limit and investigation turn limit are described in [Agent Harness](AGENT-HARNESS.en.md).
 
@@ -108,8 +112,11 @@ The supported startup script targets Windows. Requirements: Windows 10/11, Go 1.
 git clone https://github.com/sdaAlbert/liveguard.git
 cd liveguard
 go version
+$env:LIVEGUARD_INFRA_MODE = "sqlite"
 powershell -ExecutionPolicy Bypass -File ./scripts/run-mvp.ps1
 ~~~
+
+The startup script prints the active SQLite path, defaulting to `runtime/liveguard.sqlite`; the log also includes `SQLite monitor state persisted to ...`. To check Pending recovery, create a real livestream monitor and let a new OCR signal enter the queue while the Agent is investigating. Press Ctrl+C within two minutes of that signal, wait for shutdown, restart with the same command, and click Resume for that Run. The Run should appear paused first; after Resume, the Agent should investigate the interrupted signal again. Frame signals expire after 30 seconds, so restart sooner for those. The current model turn does not resume; a new investigation record/model request is the evidence of replay. Keep the same SQLite path across both starts.
 
 Open http://127.0.0.1:8080, open the dedicated Chrome window and sign in, then create a livestream monitor. In “Model Settings,” configure provider, API key, model, and optional endpoint. Saving does not send a model request. The key is sent only to the local Go service; it is not stored in browser storage or the repository. Leaving the key empty reuses the current process key for the same provider. After restart, enter it again or provide it through the environment.
 
@@ -142,11 +149,11 @@ A proxy is optional. Set `HTTPS_PROXY` for your own environment if needed. The p
 | `LIVEGUARD_TESSERACT_BIN / OCR_LANGUAGE` | Tesseract path and OCR languages |
 | `LIVEGUARD_ASR_MODE / MODEL / ENDPOINT / FFMPEG_BIN` | Startup ASR configuration; `off` disables it. Audio sharing still requires user authorization |
 | `LIVEGUARD_ALLOWED_HOSTS` | Optional comma-separated allowlist for dedicated-browser hosts; unset means any valid HTTP(S) target is accepted. Configure it if other users can reach the service |
-| `LIVEGUARD_INFRA_MODE` | `local` (default, local JSON files) or `memory` (in-process only; lost on exit) |
-| `LIVEGUARD_LOCAL_STATE_PATH` | Run snapshot path; defaults to `runtime/liveguard.json`. Observation log is a sidecar with `.observations.jsonl` appended |
+| `LIVEGUARD_INFRA_MODE` | `sqlite` (default, persistent local store) or `memory` (temporary in-process store; lost on exit) |
+| `LIVEGUARD_SQLITE_PATH` | SQLite database path; defaults to `runtime/liveguard.sqlite` |
 | `LIVEGUARD_FRAME_ARCHIVE_DIR` | Directory to read previously archived screenshots; defaults to Git-ignored `runtime/frames`. Current investigations do not write new screenshots there |
 | `LIVEGUARD_LOG_PATH` | Persistent service log; defaults to `runtime/liveguard.log`, with one 10 MiB rotated file |
-| `LIVEGUARD_OTEL_ENDPOINT` | Optional external OTLP endpoint; currently covers mainly HTTP request spans, not the full background investigation |
+| `LIVEGUARD_OTEL_ENDPOINT` | Optional OTLP exporter; current Agent progress is logged in `runtime/liveguard.log`; full Agent investigation spans are not yet instrumented |
 
 See [.env.example](../.env.example) for examples. Never put secrets in public documentation.
 ### HTTP API

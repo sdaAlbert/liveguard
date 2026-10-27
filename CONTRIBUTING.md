@@ -26,7 +26,7 @@ The supported quick-start path uses Windows PowerShell, Go, Google Chrome, and T
 powershell -ExecutionPolicy Bypass -File .\scripts\run-mvp.ps1
 ```
 
-The default local mode stores monitor state in JSON files under `runtime/`; it does not require Docker or a database. Set `LIVEGUARD_INFRA_MODE=memory` to keep state in process memory only. That data is lost when the process exits. Optional integrations, such as OTLP tracing, require an externally managed service.
+The default local mode stores monitor state, observations, and recoverable pending signals in `runtime/liveguard.sqlite`; it does not require Docker or an external database. Set `LIVEGUARD_INFRA_MODE=memory` only for temporary in-process runs; that data is lost when the process exits. JSON is available as an export format for inspection and archiving, not as a runtime repository. Optional integrations, such as OTLP tracing, require an externally managed service.
 
 If MiniMax is configured in local OpenClaw settings, the launcher can reuse that provider. Never commit API keys, browser profiles, private screenshots, runtime state, or local evaluation output.
 

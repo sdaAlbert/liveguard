@@ -15,7 +15,7 @@ go build ./...
 node --check internal/web/static/monitor.js
 ```
 
-The tests cover agent tool permissions and budgets, retries and timeouts, monitor-state changes, queues and idempotency, failure recovery, file-repository restart recovery, browser-capture cancellation, OCR upload, and web APIs. Most service tests use fixed inputs and a mock Reviewer. They verify program rules, not the model’s livestream judgments.
+The tests cover agent tool permissions and budgets, retries and timeouts, monitor-state changes, queues and idempotency, failure recovery, JSON file-repository restart recovery, SQLite Pending recovery across pause/reopen/resume, browser-capture cancellation, OCR upload, and web APIs. The SQLite recovery case uses a temporary database and mock Reviewer. These tests verify program rules, not real-model quality or real-livestream end-to-end recovery.
 
 ## Latency from real runtime records
 

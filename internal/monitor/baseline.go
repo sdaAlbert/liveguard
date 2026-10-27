@@ -220,6 +220,9 @@ func (s *Service) commitInitialBaseline(ctx context.Context, runID string, goalV
 	})
 	if err == nil && updated != nil {
 		s.onUpdate()
+		if needsLogin && updated.Status == RunRunning {
+			_, err = s.pauseForHuman(context.Background(), runID)
+		}
 	}
 	return err
 }

@@ -30,25 +30,28 @@
 
 ## 本机数据文件与长期运行
 
-LiveGuard 默认把监控状态写在本机 `runtime/` 目录，不连接外部数据库：
+LiveGuard 默认把监控状态写入本机 `runtime/liveguard.sqlite`，不连接外部数据库：
 
 | 信息 | 默认位置 | 退出/重启后的行为 |
 |---|---|---|
-| Goal/Plan/Sampling、有限事件/调查/提醒快照 | `runtime/liveguard.json` 原子 JSON 快照 | 下次启动恢复；此前运行中的监控会被暂停，用户可手动继续 |
-| 完整观测流水 | `runtime/liveguard.json.observations.jsonl` 追加日志 | 下次启动恢复；旧 JSON 快照中的历史会在首次打开时迁入流水 |
+| Goal/Plan/Sampling、有限事件/调查/提醒快照 | `runtime/liveguard.sqlite` 的 `runs` 表 | 下次启动恢复；此前运行中的监控会被暂停，用户可手动继续 |
+| 完整观测流水 | 同一数据库的 `observations` 表 | 和产生观测的 Run 更新在同一事务中提交，可分页查询 |
+| 待处理信号、排队顺序和等待中的图片 | 同一数据库的 `pending_signals` 表 | 暂停或进程重启后恢复仍有效且属于当前目标的信号；继续监控后重新调查 |
 | 服务运行日志 | `runtime/liveguard.log`，达到 10 MiB 后滚动到 `.1`；可用 `LIVEGUARD_LOG_PATH` 改路径 | 保留在本机；容器/服务部署需自行采集或备份 |
-| 队列、在途取消、reviewSlots、节流时间、图片字节预算 | Service 与 signalQueue 内存 | 不恢复；没有可恢复执行检查点 |
+| 正在运行的模型请求、模型轮次和工具调用位置、在途取消、reviewSlots、节流时间 | Service 与 Agent 运行时内存 | 不恢复；暂停或重启后取消该请求，并从已持久化的信号重新开始一次调查 |
 | 调查中查看的截图 | 系统临时目录中的 `liveguard-agent-frame-*.png` | `save_frame_evidence` 只在当前调查中保留图片；正常结束后删除，不归档图片。强制终止后的清理尚未专项验证 |
 | Chrome 登录资料 | `runtime/live-profile/` | 浏览器资料仍在本机；这不代表监控任务或队列自动续跑 |
 | API Key | 本地 Go 进程内存，或用户提供的环境变量 | UI 设置不写仓库/浏览器；重启需重新配置或从环境读取 |
 | 网页提醒已读 | 浏览器 localStorage | 只影响网页展示，不是后端事件幂等依据 |
 | 人工导出/评测报告 | `.cache/` | 被 Git 忽略；不是服务自动写出的状态数据库 |
 
-若要迁移或备份本地监控状态，应一起复制 `runtime/liveguard.json` 和 `runtime/liveguard.json.observations.jsonl`。当前调查截图不会保存在这两个文件中，也不会归档到 `runtime/frames/`。`LIVEGUARD_LOCAL_STATE_PATH` 可以修改状态快照位置，观测流水路径会在其后追加 `.observations.jsonl`。将 `LIVEGUARD_INFRA_MODE=memory` 可切为纯内存模式，进程退出后 Run 和观测都会丢失。
+SQLite 是唯一的持久化运行仓储，数据库路径可用 `LIVEGUARD_SQLITE_PATH` 修改。Run 快照、观测记录和新信号的队列登记使用 SQLite 事务；每个 Run 最多保存 8 个待处理信号，单张暂存图片最多 4 MiB、全部待处理图片最多 64 MiB。重启后，仍未过期且 GoalVersion 匹配的排队或处理中信号会回到队列；过期或属于旧目标的信号会丢弃。正在进行的模型请求无法从原轮次续跑，恢复时会以已保存证据重新调查，外部模型调用与本地提交之间仍可能产生重复调用，因此这是至少一次处理，不是 exactly-once。既有 JSON/JSONL 文件不会自动导入，LiveGuard 也不再把它们作为运行仓储打开；需要查看旧文件时可用文本或 JSON 工具手动检查。
+
+生成用于查看和归档的 JSON 副本：`go run ./cmd/monitor-store-export -db runtime/liveguard.sqlite -out runtime/json-backup-2026-10-27`。输出目录必须是新目录，包含 `liveguard.json` 和 `liveguard.json.observations.jsonl`；导出读取同一 SQLite 快照，但不包含 Pending 队列，不是完整备份，也不能重新导入 LiveGuard。运行时只支持 SQLite 持久化和显式选择的临时内存模式；`LIVEGUARD_INFRA_MODE=memory` 下进程退出后 Run 和观测都会丢失。复制 SQLite 数据库作为完整备份时先停止服务，并一并复制存在的 `-wal` / `-shm` 文件。当前调查截图不会作为历史归档保存；队列中等待处理的图片字节则暂存在 SQLite，队列结束后随记录删除。
 
 OCR 先做文本去重，再把新增行写入流水和入队；Agent 复核有独立节流，不会随 OCR 频率每秒调用模型。常规采样图片和调查中选用的截图都使用临时文件，正常处理结束后删除；强制终止后的临时文件清理尚未专项验证。可关联的 OCR 文字和文字结论会写入监控记录。Run 快照中的事件数量有上限，完整观测流水单独追加保存。观测流水没有自动清理策略，磁盘会随时间增长；需要自行备份或清理。
 
-服务启动时 RecoverInterrupted 会把遗留的 `running` Run 标成 `paused` 并保存 `process_interrupted` 原因。用户点击继续会重建采集与队列，保留同一 Run 的历史；未完成调查、队列位置和浏览器执行检查点不会恢复。
+服务启动时 RecoverInterrupted 会把遗留的 `running` Run 标成 `paused` 并保存 `process_interrupted` 原因，同时回收有效 Pending 项。用户点击继续会重建采集与队列，保留同一 Run 的历史，并重新调查恢复的信号；当前工具调用、模型轮次和浏览器执行位置不会恢复。
 
 ### 有界历史不等于全局资源有界
 
@@ -73,19 +76,20 @@ RunStatus、SourceHealth、Investigation.Status 是三个维度。Run 可处于 
 | 登录/验证码提示 | needs_login，关闭输入队列；用户处理页面后暂停再继续以重新核验 | 不自动登录/绕过验证，文字检测仍可能误判 |
 | 截图/OCR失败 | 截图与 OCR 分阶段计数；delayed 状态指数退避，最长 30 秒后继续尝试，成功后自动恢复；状态写入失败记录独立日志并重试 | 明确登录/验证仍需用户处理；旧目标结果不能复活旧运行时。OCR 积压只替换等待画面，不取消正在识别的画面，不算源故障 |
 | OCR 文字过长 | 内部 OCR 按最多 4000 字符拆成多条可引用观测，保留全部识别文字和来源 | 外部输入接口仍校验单条长度；拆分不会提高 OCR 识别准确率 |
-| 本地快照被占用 | 对权限/Windows 共享冲突进行 6 次有限尝试，总退避 310 ms；失败保留旧快照并记录原因，采集继续恢复 | 持续占用会导致状态无法及时保存，需要处理日志给出的文件访问错误 |
 | 无文字/无语音 | ErrNoText 可进入无文字视觉检查路径；ErrNoSpeech 是正常无转写结果 | 截图成功只说明可截图，不证明直播仍在播放、评论持续刷新 |
 | 模型限流/网络问题 | 普通限流或网络问题使用有限重试和熔断；失败留下failed调查，继续收新信号；明确额度/余额不可用则结束当前配置下的活跃监控并显示原因 | 单次传输可能已进行一次有限重试；提供方可能仍对重试请求计费；未知错误不猜成额度耗尽 |
 | 模型格式错误 | 共享 Agent 最多一次格式纠正，消耗原轮数预算；再次无效停止调查 | 不是无限重试；失败不切换成关键词提醒 |
 | 工具错误/超时/预算耗尽 | 记录轨迹、成功状态、耗时与 StopReason；不完整调查不提交正常提醒 | context 超时要求适配器响应取消，不能强杀任意忽略 context 的 Go 代码 |
-| 队列满/调查任务过期 | Pending 展示丢弃/过期/合并数量和原因；临时图片清理、已入库观测保留；拒绝接收可重试原 ID | 接收回执不是完成回执；尚未提供每事件完整持久处理状态 |
+| 队列满/调查任务过期 | Pending 展示丢弃/过期/合并数量和原因；SQLite 保存未完成项，过期后删除队列项但保留观测；拒绝接收可重试原 ID | 接收回执不是完成回执；完成或失败后的每事件状态不是永久任务账本 |
 | 改目标/暂停/停止 | 改目标递增 GoalVersion；暂停取消旧工作但保留 Run；停止终结 Run；提交检查防迟到结果生效 | Resume 重建运行时；浏览器音频需要用户重新授权 |
-| 进程退出/重启 | 正常退出将活跃监控保存为 paused；记录退出由本机 API 还是操作系统信号触发；异常退出遗留的 running 在下次启动时转为 paused | 用户可点击继续；不自动续接旧浏览器操作或重放旧队列。memory 模式的状态会丢失 |
+| 进程退出/重启 | 下次启动时活跃监控转为 paused；SQLite 中仍有效的 Pending 信号重新入队；记录退出由本机 API 还是操作系统信号触发 | 用户点击继续后重新调查信号；不会续接原模型轮次或旧浏览器操作。内存模式的状态会丢失 |
 | 网页断开 | 已接受的排队任务使用监控 context，不随 HTTP 客户端断开取消；SSE 是更新提示，网页重新拉取快照 | SSE 不是持久消息总线或外部送达确认 |
 
-配置入口为三个提供方统一设置的熔断阈值为连续 2 次模型请求错误、冷却 30 秒；之后只允许一个恢复探测。Agent 总时限或信号到期不计作模型错误，因此不会仅因调查预算用完就触发熔断。单次模型请求最多等待 60 秒，整个 Agent 调查最多 90 秒；信号仍受自己的有效期约束，过期后不会继续提交提醒。共享 DoModelRequest 对可重放的请求，仅在有限网络错误、408/429/500/502/503/504 上重试，通常等 250ms；Retry-After 超过 2 秒不自动等到重试。401/403 不进行无意义重试。模型可能对两次请求都计费。模型请求日志包含 review_id、轮次、HTTP 状态、重试次数、请求耗时、可用上下文预算和超时来源；可用同一 review_id 将请求轨迹与调查失败日志关联。计划阶段的请求也使用该传输机制；格式纠正与传输重试分别计数。
+配置入口为三个提供方统一设置的熔断阈值为连续 2 次模型请求错误、冷却 30 秒；之后只允许一个恢复探测。Agent 总时限或信号到期不计作模型错误，因此不会仅因调查预算用完就触发熔断。单次模型请求最多等待 60 秒，整个 Agent 调查最多 90 秒；信号仍受自己的有效期约束，过期后不会继续提交提醒。共享 DoModelRequest 对可重放的请求，仅在有限网络错误、408/429/500/502/503/504 上重试，通常等 250ms；Retry-After 超过 2 秒不自动等到重试。401/403 不进行无意义重试。模型可能对两次请求都计费。请求日志记录 `review_id`（触发信号 ID）、`attempt_id`（每次调查尝试的唯一 ID）、轮次、HTTP 状态、重试次数、请求耗时、可用上下文预算和超时来源；Agent trace 还记录等全局名额、模型轮次开始、工具开始/结束和调查结束。工具日志不包含原始参数、OCR 文本或模型提示词。计划阶段的请求也使用同一传输机制；格式纠正与传输重试分别计数。
 
-排查请求日志时，`context_budget_ms` 表示该请求开始时其 context deadline 的剩余**毫秒数**，不是 token 预算；`client_timeout_ms` 是 HTTP 客户端超时。`input_tokens` / `output_tokens` 是单次模型请求的用量；`unexpected livestream review completed/incomplete` 汇总了一次调查已记录的多轮用量。若只看请求日志，应按 `review_id` 和连续轮次归组；同一 `review_id` 再次从 `turn=1` 开始代表另一组复核，不能和上一组盲目相加。日志中的 `context canceled` 要结合 `LiveGuard shutdown requested`、暂停/停止记录和 `timeout_source` 判断；如果它紧跟进程中断，通常表示请求被运行生命周期取消，不应误判为 token 超限。`model response truncated at token limit` 则是单次响应触及输出限制；`turn_budget` / `call_budget` 表示调查循环用尽轮数或调用数。当前没有每 Run 或每日累计 token 硬预算，单轮输出限制和调查轮数限制见[Agent Harness 详解](AGENT-HARNESS.md)。
+排查 Agent 当前进度时，在 PowerShell 运行 `Select-String -Path .\runtime\liveguard.log -Pattern 'attempt_id=' | Select-Object -Last 100`。按同一个 `attempt_id` 查看完整尝试：`agent review waiting for slot` 表示在等调查名额/冷却，`agent review slot acquired` 表示已获准，`agent model turn started` 表示模型请求刚开始，`model request completed/failed` 表示请求返回，`agent tool started/completed` 表示 Go 工具执行，最后看 `agent review finished` 和 `unexpected livestream review completed/incomplete/failed`。只有开始行而暂时没有结束行，说明该阶段仍在执行或进程尚未写出结束结果。旧进程不会产生新增格式，重启到新版本后生效。
+
+排查请求日志时，`review_id` 是信号 ID，不能唯一标识调查尝试；同一信号再次调查时 `turn` 会重新从 1 开始，应以 `attempt_id` 分组。`context_budget_ms` 表示该请求开始时其 context deadline 的剩余**毫秒数**，不是 token 预算；`client_timeout_ms` 是 HTTP 客户端超时。`input_tokens` / `output_tokens` 是单次模型请求的用量；`unexpected livestream review completed/incomplete` 汇总一次调查的多轮用量。日志中的 `context canceled` 要结合 `LiveGuard shutdown requested`、暂停/停止记录和 `timeout_source` 判断；如果它紧跟进程中断，通常表示请求被运行生命周期取消，不应误判为 token 超限。`model response truncated at token limit` 则是单次响应触及输出限制；`turn_budget` / `call_budget` 表示调查循环用尽轮数或调用数。当前没有每 Run 或每日累计 token 硬预算，单轮输出限制和调查轮数限制见[Agent Harness 详解](AGENT-HARNESS.md)。
 
 采集恢复在代码中区分“可重试delayed”与“真正paused”，入队只拦截needs_login/capture_failed；成功观测先恢复输入健康，队列满或图片预算拒绝不计为采集失败。明确额度错误也有用户可见的结束原因。未解决的问题与候选改进方向见[优化路线图](ROADMAP.md)。
 
@@ -99,8 +103,11 @@ RunStatus、SourceHealth、Investigation.Status 是三个维度。Run 可处于 
 git clone https://github.com/sdaAlbert/liveguard.git
 cd liveguard
 go version
+$env:LIVEGUARD_INFRA_MODE = "sqlite"
 powershell -ExecutionPolicy Bypass -File ./scripts/run-mvp.ps1
 ~~~
+
+启动脚本会显示实际 SQLite 文件位置，默认是 `runtime/liveguard.sqlite`；日志也会出现 `SQLite monitor state persisted to ...`。验证 Pending 恢复：创建一个真实直播监控，等 Agent 正在调查时让新的 OCR 信号进入待处理队列，然后在信号观察时间起 2 分钟内按 Ctrl+C，等待服务退出，再用同一命令启动并点击该 Run 的“继续”。Run 应先显示已暂停，继续后 Agent 会重新调查中断信号。图片信号只有 30 秒有效期，需更快重启。模型正在执行的轮次不会续接；看到新的调查记录/模型请求表示恢复后重新执行。不要切换 SQLite 路径，否则会打开另一个数据库。
 
 打开 http://127.0.0.1:8080 ，先打开专用 Chrome 登录，再新建直播监控。在右上角“模型设置”配置提供方、API Key、模型和可选地址。保存设置不发送模型请求；设置仅向本机 Go 服务发送密钥，不放入浏览器存储或仓库。留空 Key 可复用同一提供方当前进程密钥。重启需重新填写或读环境。
 
@@ -131,11 +138,11 @@ $env:LIVEGUARD_OCR_LANGUAGE = "chi_sim+eng"
 | LIVEGUARD_TESSERACT_BIN / OCR_LANGUAGE | OCR 路径和语言 |
 | LIVEGUARD_ASR_MODE / MODEL / ENDPOINT / FFMPEG_BIN | ASR 启动配置；off 关闭；分享音频仍需用户主动授权 |
 | LIVEGUARD_ALLOWED_HOSTS | 可选的专用浏览器主机白名单，逗号分隔；未设置时接受任意有效 HTTP(S) 目标。服务如暴露给其他用户，应配置白名单 |
-| LIVEGUARD_INFRA_MODE | `local`（默认，本机 JSON 文件）或 `memory`（进程内存，退出丢失） |
-| LIVEGUARD_LOCAL_STATE_PATH | 本机 Run 快照位置，默认 `runtime/liveguard.json`；观测流水写在其 `.observations.jsonl` 侧车文件 |
+| LIVEGUARD_INFRA_MODE | `sqlite`（默认，本机持久化）或 `memory`（临时进程内存，退出丢失） |
+| LIVEGUARD_SQLITE_PATH | SQLite 数据库位置，默认 `runtime/liveguard.sqlite` |
 | LIVEGUARD_FRAME_ARCHIVE_DIR | 已有归档截图的读取目录，默认 `runtime/frames`（Git 忽略）；当前调查不会向该目录写入新截图 |
 | LIVEGUARD_LOG_PATH | 持久化服务日志位置，默认 `runtime/liveguard.log`，10 MiB 滚动保留一个旧文件 |
-| LIVEGUARD_OTEL_ENDPOINT | 可选外部 OTLP；当前主要是 HTTP 请求 span，未覆盖完整后台调查链路 |
+| LIVEGUARD_OTEL_ENDPOINT | 可选 OTLP 导出器；当前主要依靠 `runtime/liveguard.log` 中的结构化模型/Agent 过程记录，尚未为 Agent 调查建立完整 OTel span |
 
 配置示例见 [.env.example](../.env.example)。不要把密钥写进公开文档。
 

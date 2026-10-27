@@ -34,11 +34,40 @@ type ObservationPage struct {
 }
 
 // RunLedger stores the complete history separately from the bounded Run view.
-// FileRepository persists it across process restarts; MemoryRepository keeps
+// SQLiteRepository persists it across process restarts; MemoryRepository keeps
 // it for the lifetime of the process.
 type RunLedger interface {
 	RecordObservation(context.Context, string, SignalEvent) error
 	SearchObservations(context.Context, string, ObservationQuery) (ObservationPage, error)
+}
+
+func observationsAdded(previous, next *Run) []SignalEvent {
+	if next == nil {
+		return nil
+	}
+	knownEvents := map[string]bool{}
+	knownInvestigations := map[string]Investigation{}
+	if previous != nil {
+		for _, event := range previous.Events {
+			knownEvents[event.ID] = true
+		}
+		for _, investigation := range previous.Investigations {
+			knownInvestigations[investigation.ID] = investigation
+		}
+	}
+	var result []SignalEvent
+	for _, event := range next.Events {
+		if event.ID != "" && !knownEvents[event.ID] {
+			result = append(result, event)
+		}
+	}
+	for _, investigation := range next.Investigations {
+		previousInvestigation, existed := knownInvestigations[investigation.ID]
+		if !existed || previousInvestigation.Status != investigation.Status || previousInvestigation.UpdatedAt != investigation.UpdatedAt {
+			result = append(result, visualObservations(investigation)...)
+		}
+	}
+	return result
 }
 
 func normalizeObservationQuery(query ObservationQuery) ObservationQuery {

@@ -4,9 +4,9 @@ $OriginalMiniMaxAPIKey = $env:MINIMAX_API_KEY
 Push-Location $RepoRoot
 try {
     $env:GOCACHE = Join-Path $RepoRoot ".cache\go-build"
-    if (-not $env:LIVEGUARD_INFRA_MODE) { $env:LIVEGUARD_INFRA_MODE = "local" }
-    if ($env:LIVEGUARD_INFRA_MODE -ne "local" -and $env:LIVEGUARD_INFRA_MODE -ne "memory") {
-        throw "LIVEGUARD_INFRA_MODE must be 'local' or 'memory'."
+    if (-not $env:LIVEGUARD_INFRA_MODE) { $env:LIVEGUARD_INFRA_MODE = "sqlite" }
+    if ($env:LIVEGUARD_INFRA_MODE -ne "sqlite" -and $env:LIVEGUARD_INFRA_MODE -ne "memory") {
+        throw "LIVEGUARD_INFRA_MODE must be 'sqlite' or 'memory'."
     }
     if (-not $env:LIVEGUARD_OTEL_ENDPOINT) { $env:LIVEGUARD_OTEL_ENDPOINT = "off" }
     if (-not $env:LIVEGUARD_MONITOR_LLM_MODE) { $env:LIVEGUARD_MONITOR_LLM_MODE = "auto" }
@@ -40,9 +40,9 @@ try {
     Write-Host "Starting LiveGuard MVP at http://$env:LIVEGUARD_ADDR"
     if ($env:LIVEGUARD_INFRA_MODE -eq "memory") {
         Write-Host "This mode keeps monitor history in memory only; it will be lost when the process exits."
-    } else {
-        $statePath = if ($env:LIVEGUARD_LOCAL_STATE_PATH) { $env:LIVEGUARD_LOCAL_STATE_PATH } else { "runtime/liveguard.json" }
-        Write-Host "This mode saves monitor history and Agent decisions locally: $statePath (observations: $statePath.observations.jsonl)"
+    } elseif ($env:LIVEGUARD_INFRA_MODE -eq "sqlite") {
+        $statePath = if ($env:LIVEGUARD_SQLITE_PATH) { $env:LIVEGUARD_SQLITE_PATH } else { "runtime/liveguard.sqlite" }
+        Write-Host "This mode saves monitor history and recoverable pending signals locally in SQLite: $statePath"
     }
     if ($env:LIVEGUARD_MONITOR_PROVIDER -eq "minimax" -and $env:MINIMAX_API_KEY) {
         Write-Host "MiniMax $env:LIVEGUARD_MONITOR_MODEL is configured for goal planning and signal review."

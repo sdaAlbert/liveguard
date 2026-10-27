@@ -35,9 +35,8 @@ try {
 const statusLabels = {running:"监听中",paused:"已暂停",stopped:"已停止",failed:"异常",completed:"已结束"};
 const decisionLabels = {waiting_more_evidence:"继续观察",waiting_user:"需要你补充",reviewing_clarification:"结合补充判断中",confirmed:"已提醒",suppressed:"已忽略",needs_human:"需要处理",incomplete:"调查未完成·继续监听",failed:"判断失败·继续监听"};
 const eventLabels = {coupon_drop:"优惠活动",giveaway:"抽奖活动",major_announcement:"重要消息",game_moment:"游戏关键时刻",chat_match:"聊天命中",custom_goal:"关注内容",human_verification:"安全验证"};
-const toolLabels = {review_unexpected_event:"判断关注目标与重要内容",request_user_input:"向你询问判断规则",read_live_window:"读取证据窗口",search_observations:"读取相关文字",query_recent_alerts:"检查重复提醒",search_recent_alerts:"检查同类提醒",inspect_live_frame:"查看直播画面",save_frame_evidence:"选用画面证据",reanalyze_clip:"复核字幕和画面",reanalyze_evidence:"复核证据",create_alert:"提醒用户",request_human_takeover:"请求用户处理"};
+const toolLabels = {review_unexpected_event:"判断关注目标与重要内容",update_monitoring_goal:"更新关注方向",request_user_input:"向你询问判断规则",read_live_window:"读取证据窗口",search_observations:"读取相关文字",query_recent_alerts:"检查重复提醒",search_recent_alerts:"检查同类提醒",inspect_live_frame:"查看直播画面",save_frame_evidence:"选用画面证据",reanalyze_clip:"复核字幕和画面",reanalyze_evidence:"复核证据",create_alert:"提醒用户",request_human_takeover:"请求用户处理"};
 const sourceLabels = {asr:"口播转写",frame:"画面采样",vision:"视觉判断"};
-const providerLabels = {minimax:"MiniMax",openai:"OpenAI",deepseek:"DeepSeek",rules:"本地规则"};
 const healthLabels = {unconfigured:"未配置",waiting_signal:"等待信号",healthy:"正常",delayed:"采集延迟",needs_login:"需要登录",capture_failed:"采集失败"};
 
 function escapeHTML(value) {
@@ -108,7 +107,9 @@ function monitorState(run) {
   const room = run.rooms?.[0] || {};
   const unread = unreadAlerts(run).length;
   if (run.status === "stopped" || run.status === "completed") return {tone:"gray", label:statusLabels[run.status], unread};
-  if (run.status === "paused") return {tone:"gray", label:"已暂停", unread};
+  if (run.status === "paused") return run.stop_reason === "human_verification" || room.health === "needs_login"
+    ? {tone:"yellow", label:"需要你完成验证", unread}
+    : {tone:"gray", label:"已暂停", unread};
   if (run.status === "failed" && run.stop_reason === "api_quota_exhausted") return {tone:"yellow", label:"API 额度已耗尽", unread};
   if (run.baseline?.status === "pending" || run.baseline?.status === "reviewing") return {tone:"green", label:"Agent 正在初看", unread};
   if (run.baseline?.status === "needs_login") return {tone:"yellow", label:"需要登录 / 验证", unread};
@@ -137,7 +138,9 @@ function monitorState(run) {
 function agentState(run) {
   const room = run.rooms?.[0] || {};
   if (run.status === "stopped" || run.status === "completed") return {tone:"gray", label:"监控已结束"};
-  if (run.status === "paused") return {tone:"gray", label:"监控已暂停"};
+  if (run.status === "paused") return run.stop_reason === "human_verification" || room.health === "needs_login"
+    ? {tone:"yellow", label:"等待你完成验证"}
+    : {tone:"gray", label:"监控已暂停"};
   if (run.status === "failed") return {tone:"yellow", label:run.stop_reason === "api_quota_exhausted" ? "模型额度不可用" : "监控异常"};
   if (!snapshotsConnected || !streamConnected) return {tone:"yellow", label:"状态同步中"};
   if (stopping.has(run.id)) return {tone:"gray", label:"正在停止"};
@@ -274,7 +277,9 @@ function monitorFeedback(run, state) {
   const linkedInvestigation = latest && investigations.find(inv => (inv.evidence || []).some(evidence => evidence.event_id === latest.id));
   const recentInvestigation = linkedInvestigation || (latest && investigations.find(inv => inv.updated_at && new Date(inv.updated_at) >= new Date(latest.observed_at)));
   if (newestAlert) return `新提醒 · ${newestAlert.summary}`;
-  if (run.status === "paused") return "监控已暂停 · 点击继续恢复采集";
+  if (run.status === "paused") return run.stop_reason === "human_verification"
+    ? "请先在直播页完成验证，再告诉 Agent 已处理以继续监控"
+    : "监控已暂停 · 点击继续恢复采集";
   if (run.status === "stopped" || run.status === "completed") return "监控已结束";
   if (run.status === "failed" && run.stop_reason === "api_quota_exhausted") return "模型额度不可用 · 监控已结束";
   if (run.baseline?.status === "pending" || run.baseline?.status === "reviewing") return "正在初看直播画面，随后开始持续监控";
@@ -420,13 +425,6 @@ function renderInvestigation(inv) {
   const question = inv.status === "waiting_user" && !inv.user_answer ? `<form class="clarification-form" data-investigation-id="${escapeAttribute(inv.id)}"><p class="clarification-prompt">${escapeHTML(inv.user_question || "Agent 需要你补充判断规则")}</p>${inv.user_options?.length ? `<div class="clarification-options">${inv.user_options.map(option => `<button class="clarification-option" type="button" data-answer="${escapeAttribute(option)}">${escapeHTML(option)}</button>`).join("")}</div>` : ""}<textarea name="answer" rows="3" maxlength="1000" ${runPaused ? "disabled" : ""} required placeholder="补充这次判断需要的条件…">${escapeHTML(clarificationDrafts.get(inv.id) || "")}</textarea><div class="clarification-submit-row"><small>${runPaused ? "继续监控后可回复 Agent" : "你的回答只用于这次判断；监控会继续运行"}</small><button class="detail-primary" type="submit" ${runPaused || replyingToAgent.has(inv.id) ? "disabled" : ""}>${replyingToAgent.has(inv.id) ? "提交中…" : "回复 Agent"}</button></div><p class="clarification-error" aria-live="polite"></p></form>` : inv.user_answer ? `<div class="clarification-answer"><small>你的补充</small><p>${escapeHTML(inv.user_answer)}</p></div>` : "";
   return `<article class="investigation-item"><div class="detail-item-meta"><span>${escapeHTML(displayEventLabel(inv.event_type))}</span><time>${eventTime(inv.updated_at || inv.created_at)}</time><span class="decision-state ${escapeHTML(inv.status)}">${escapeHTML(status)}</span></div><p class="investigation-conclusion">${escapeHTML(conclusion)}</p>${keyEvidenceMarkup(inv.evidence, detailRunID)}${activity}${question}${inv.user_answer && inv.status === "reviewing_clarification" ? `<p class="clarification-working">Agent 正在结合你的补充重新判断。</p>` : ""}</article>`;
 }
-function detailModelSummary() {
-  const status = globalModelSettings;
-  if (!status) return "正在读取全局模型设置…";
-  if (!status.configured) return "本地规则 · 未配置大模型";
-  return `${providerLabels[status.provider] || status.provider} · ${status.model || "默认模型"}${status.quota_exhausted ? " · 额度不可用" : " · 已配置"}`;
-}
-
 function renderMonitorDetail() {
   const dialog = $("#monitorDetailDialog");
   const content = $("#monitorDetailContent");
@@ -440,6 +438,8 @@ function renderMonitorDetail() {
   // Replacing a focused textarea interrupts IME composition (notably Chinese
   // input), even if its value and caret are restored afterwards.
   if (content.contains(document.activeElement) && document.activeElement.matches("textarea, input, [contenteditable=true]")) {
+    const focusGoal = content.querySelector(".detail-goal-hero");
+    if (focusGoal) focusGoal.textContent = run.goal || "尚未形成当前关注方向";
     const liveState = content.querySelector(".detail-live-state");
     if (liveState) {
       const state = agentState(run);
@@ -463,15 +463,14 @@ function renderMonitorDetail() {
   const openDetails = [...content.querySelectorAll("details")].map(item => item.open);
   content.innerHTML = `
     <header class="detail-topbar"><button id="detailBack" class="detail-back" type="button"><span aria-hidden="true">←</span> 返回监控室</button><div class="detail-live-state" role="status" aria-live="polite"><i class="status-dot ${state.tone}" aria-hidden="true"></i><span class="agent-status-label">${escapeHTML(state.label)}</span></div><div class="detail-top-actions">${canControl ? `<button id="detailPause" class="detail-control" type="button" ${pausing.has(run.id) || stopping.has(run.id) ? "disabled" : ""}>${pausing.has(run.id) ? "处理中…" : run.status === "paused" ? "继续" : "暂停"}</button><button id="detailStop" class="detail-control danger" type="button" ${stopping.has(run.id) ? "disabled" : ""}>${stopping.has(run.id) ? "结束中…" : "结束监控"}</button>` : ""}</div></header>
-    <div id="detailScroll" class="detail-scroll"><section class="detail-hero"><div class="detail-kicker">LIVEGUARD / 监控详情</div><h1>${escapeHTML(room.name || run.name || "直播监控")}</h1><a class="detail-room-link" href="${escapeAttribute(run.target_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHTML(run.target_url || "未提供直播链接")} <span aria-hidden="true">↗</span></a><p class="detail-goal-hero">${escapeHTML(run.goal || "未设置关注目标")}</p></section>
+    <div id="detailScroll" class="detail-scroll"><section class="detail-hero"><div class="detail-kicker">LIVEGUARD / 监控详情</div><h1>${escapeHTML(room.name || run.name || "直播监控")}</h1><a class="detail-room-link" href="${escapeAttribute(run.target_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHTML(run.target_url || "未提供直播链接")} <span aria-hidden="true">↗</span></a><p class="detail-goal-hero"><span>关注目标</span>${escapeHTML(run.goal || "尚未形成当前关注方向")}</p></section>
       <div class="detail-layout"><div class="detail-main-column">
         <section class="detail-section"><div class="detail-section-heading"><div><span class="detail-section-label">Agent 状态</span><h2>最近判断</h2></div></div><div class="detail-list">${investigations.length ? investigations.slice(0, 10).map(renderInvestigation).join("") : `<p class="detail-empty">${globalModelSettings?.configured ? "等待新信号触发调查。" : "尚未配置模型，暂时不能开始 Agent 调查。"}</p>`}</div></section>
         <section class="detail-section"><div class="detail-section-heading"><div><span class="detail-section-label">用户提醒</span><h2>提醒记录</h2></div>${unreadAlerts(run).length ? `<button id="detailAcknowledge" class="text-action" type="button">全部标为已读</button>` : ""}</div><div class="detail-list">${alerts.length ? alerts.map(renderAlert).join("") : `<p class="detail-empty">暂时没有提醒。LiveGuard 会在检测到与关注目标有关的内容时显示在这里。</p>`}</div></section>
       </div><aside class="detail-side-column">
-        <section class="detail-panel"><div class="detail-section-heading"><div><span class="detail-section-label">与 Agent 协作</span><h2>下达指令</h2></div></div><form id="detailInstructionForm" class="detail-goal-form"><label for="detailInstructionInput">补充条件、反馈页面已处理或提出新问题。更新关注目标时，请以“目标：”开头。</label><textarea id="detailInstructionInput" class="goal-input" maxlength="1000" ${instructionDisabled ? "disabled" : ""} placeholder="例如：验证码已处理，请继续；或者：目标：只关注主播正式公布的新品价格">${escapeHTML(draft)}</textarea><button class="detail-primary" type="submit" ${instructionDisabled || instructionSaving.has(run.id) ? "disabled" : ""}>${instructionSaving.has(run.id) ? "发送中…" : "发送给 Agent"}</button><p class="goal-status">${escapeHTML(instructionStatus)}</p></form></section>
+        <section class="detail-panel"><div class="detail-section-heading"><div><span class="detail-section-label">与 Agent 协作</span><h2>下达指令</h2></div></div><form id="detailInstructionForm" class="detail-goal-form"><label for="detailInstructionInput">补充条件、反馈页面已处理或提出新问题。Agent 会判断这些内容是否改变后续关注方向。</label><textarea id="detailInstructionInput" class="goal-input" maxlength="1000" ${instructionDisabled ? "disabled" : ""} placeholder="例如：验证码已处理，请继续；或者：后面只关注主播正式公布的新品价格">${escapeHTML(draft)}</textarea><button class="detail-primary" type="submit" ${instructionDisabled || instructionSaving.has(run.id) ? "disabled" : ""}>${instructionSaving.has(run.id) ? "发送中…" : "发送给 Agent"}</button><p class="goal-status">${escapeHTML(instructionStatus)}</p></form></section>
         <section class="detail-panel"><div class="detail-section-heading"><div><span class="detail-section-label">采集状态</span><h2>直播来源</h2></div></div><dl class="detail-facts"><div><dt>状态</dt><dd>${escapeHTML(healthLabels[room.health] || room.status || "未知")}</dd></div><div><dt>最近采集</dt><dd>${eventTime(room.last_capture_at || room.last_seen)}</dd></div><div><dt>截图尝试</dt><dd>${sampling.capture_count || 0}</dd></div><div><dt>实际间隔</dt><dd>${room.capture_interval_ms ? `${Math.round(room.capture_interval_ms / 1000)} 秒` : `${sampling.capture_interval_seconds || run.plan?.capture_interval_seconds || "—"} 秒`}</dd></div><div><dt>采集耗时</dt><dd>${room.capture_duration_ms ? `${room.capture_duration_ms} ms` : "—"}</dd></div><div><dt>下次信号</dt><dd>${sampling.next_event_at ? eventTime(sampling.next_event_at) : (sampling.reason || "持续观察")}</dd></div><div><dt>OCR积压跳过</dt><dd>${sampling.perception_dropped || 0}</dd></div></dl>${room.last_error || run.last_error ? `<p class="detail-problem">${escapeHTML(room.last_error || run.last_error)}</p>` : ""}${run.plan?.capability_warning ? `<p class="detail-problem">${escapeHTML(run.plan.capability_warning)}</p>` : ""}</section>
         <section class="detail-panel"><div class="detail-section-heading"><div><span class="detail-section-label">可选输入</span><h2>口播识别</h2></div></div><p class="detail-muted">只共享并处理你在浏览器弹窗中选择的直播音频。</p><button class="audio-capture" type="button" ${run.status !== "running" ? "disabled" : ""}>${escapeHTML(audioLabel)}</button>${run.status !== "running" ? `<p class="detail-muted">监控运行时可以开启口播识别。</p>` : ""}</section>
-        <section class="detail-panel"><div class="detail-section-heading"><div><span class="detail-section-label">全局配置</span><h2>模型设置</h2></div></div><p class="detail-model-summary">${escapeHTML(detailModelSummary())}</p><button id="detailModelSettings" class="detail-secondary" type="button">管理全局模型设置</button><p class="detail-muted">模型配置对所有监控生效。</p></section>
       </aside></div>
     </div>`;
   if (!dialog.open) dialog.showModal();
@@ -494,13 +493,6 @@ function renderMonitorDetail() {
   instructionInput.addEventListener("input", () => instructionDrafts.set(run.id, instructionInput.value));
   $("#detailInstructionForm").addEventListener("submit", event => submitInstruction(event, run.id, instructionInput));
   $(".audio-capture").addEventListener("click", event => toggleAudioCapture(run.id, event.currentTarget));
-  $("#detailModelSettings").addEventListener("click", async () => {
-    $("#modelSettingsStatus").textContent = "正在读取当前设置…";
-    $("#modelSettingsStatus").className = "settings-status";
-    $("#modelSettingsDialog").showModal();
-    try { await loadModelSettings(); }
-    catch (error) { $("#modelSettingsStatus").textContent = error.message; $("#modelSettingsStatus").className = "settings-status error"; }
-  });
 }
 
 async function submitInstruction(event, id, input) {

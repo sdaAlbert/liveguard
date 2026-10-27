@@ -32,6 +32,7 @@ OCR means optical character recognition: reading text from an image. ASR means a
 | `cmd/liveguard/main.go` | Executable entry point: reads settings, chooses storage, wires services, starts HTTP, shuts down cleanly | Read `main` to see how components are connected; business rules are elsewhere. |
 | `cmd/monitor-eval/main.go` | Runs the fixed text-evaluation command with configured MiniMax and writes a JSON report | Check command options and exit conditions. |
 | `cmd/monitor-load/main.go` | Runs synthetic signal-load measurements and writes a JSON report | Note the explicit mock/no-capture label. |
+| `cmd/monitor-store-export/main.go` | Exports a SQLite Run snapshot and observation ledger as JSON | Destination must not exist; the export is for inspection and excludes Pending items. |
 | `internal/domain` | Shared event IDs and web-push event types | Not livestream decision logic. |
 | `internal/agent` | Business-independent model/tool loop, HTTP client, limited retries, and circuit breaker | Start with `loop.go` to see how model actions are bounded. |
 | `internal/browser` | Dedicated Chrome session, livestream URL validation, and DevTools screenshot capture | Start with `live_capture.go` for the real capture entry point. |
@@ -54,9 +55,9 @@ OCR means optical character recognition: reading text from an image. ASR means a
 | **Evidence** | An observation or inspected image cited by an investigation, with source, time, and goal version | OCR text does not prove it came from chat. |
 | **Investigation** | One bounded Agent judgment triggered by an observation, with conclusion and tool steps | A failed investigation does not mean the whole Run failed. |
 | **Alert** | A reminder record saved to the Run after Go validation | Marking it read in the web page does not delete it from the backend. |
-| **Pending** | In-process counts for work waiting, reviewing, or completed | It is not a job checkpoint that can be resumed from a database after restart. |
+| **Pending** | Runtime counts for work waiting, reviewing, or completed; SQLite persists unfinished signals | After restart, valid signals can be requeued for a new investigation; the previous model turn is not resumed. |
 | **GoalVersion** | A number incremented whenever the user changes the monitoring goal | It prevents a late result for an old goal from changing the new goal. |
-| **Repository** | A storage interface for Runs and observations | Memory storage lasts only for the process; JSON file mode writes locally. |
+| **Repository** | A storage interface for Runs, observations, and recoverable Pending work | SQLite is the persistent runtime store; the in-memory implementation is for temporary runs and tests. |
 | **Harness (execution framework)** | The layers that run one controlled Agent investigation; `internal/agent/loop.go` is the generic turn/tool kernel | The kernel does not understand livestream semantics; Monitor supplies domain tools, async scheduling, and final checks. See the [Agent Harness guide](AGENT-HARNESS.en.md). |
 
 Run status, capture health, and one investigation's status are three separate state lines. A Run can still be `running` while its Room reports `needs_login`; one Investigation can be `failed` while the monitor keeps accepting future signals. This separation answers “is the task open?”, “is capture healthy?”, and “did this judgment finish?”
@@ -232,7 +233,7 @@ Background `SubmitSignal` is detached from the HTTP client connection. Once admi
 | Tool call | One tool has a 12-second deadline. Failure is recorded in the investigation; side-effecting tools are not automatically replayed. |
 | Screenshot/OCR | Temporary failures back off exponentially up to 30 seconds and retry; success resumes normally. Login/verification requires user action. Long internal OCR jobs can be split; under backlog, waiting frames are replaced and review triggers coalesced. |
 | Queued work | Has a deadline. Expired work is not investigated, but the accepted observation is retained. |
-| Process restart | In persistent mode, previously running Runs become paused; the old queue is not replayed and browser operations do not continue from their prior position. |
+| Process restart | With SQLite, previously running Runs become paused; Resume requeues valid Pending signals for a new investigation. Browser operations and model turns do not continue from their prior position. |
 
 A transport retry can cause the provider to bill both requests. LiveGuard does not retry business side-effect tools such as `create_alert`. Repeated business actions are controlled with event IDs, business deduplication, and final state checks; simply sending the same HTTP request again is not automatically safe.
 
@@ -244,16 +245,17 @@ Alerts have a separate semantic deduplication window. It catches some near-dupli
 
 ## Where data is stored
 
-| Data | Default `local` file mode | Temporary `memory` mode |
+| Data | Persistent SQLite runtime mode | Temporary `memory` mode |
 |---|---|---|
-| Run snapshot | Atomically replaced at `runtime/liveguard.json` | In process only; lost at exit. |
-| Full observation ledger | Appended to `runtime/liveguard.json.observations.jsonl` | In process only; lost at exit. |
-| Queue and in-flight cancellation | In process only; not restored after restart | In process only; lost at exit. |
-| Screenshot used during an investigation | System temp directory | `save_frame_evidence` keeps it only for the investigation; deleted after normal completion. Cleanup after forced termination is not specifically verified. |
+| Run snapshot | `runs` table in `runtime/liveguard.sqlite` | In process only; lost at exit. |
+| Full observation ledger | SQLite `observations` table | In process only; lost at exit. |
+| Pending queue and queued images | SQLite `pending_signals`; valid work is recovered after restart | In process only; lost at exit. |
+| Active model request/tool turn | In process only; investigation restarts from saved evidence | In process only; lost at exit. |
+| Screenshot used during an investigation | System temp directory; queued image bytes are staged in SQLite | `save_frame_evidence` keeps it only for the investigation; deleted after normal completion. Cleanup after forced termination is not specifically verified. |
 | Chrome login profile | Local directory `runtime/live-profile/` | Still stored locally. |
 | Model API key | Process memory/environment variable | Process memory/environment variable. |
 
-Memory Repository stores state only while the process runs. `local` is the default file mode: Run snapshots and the full observation ledger are JSON files under `runtime/`. On restart, saved monitor cards and history are restored; Runs that had been running become paused and wait for the user to resume. Queues and active investigations are not restored. Ordinary OCR screenshots and images selected during investigation use temporary files and are deleted after normal completion; cleanup after forced termination has not been specifically verified. Related OCR text and textual conclusions are stored with the monitor. A compatibility path can read older archived images, but the current path does not create new image archives. Chrome login profile is also local. The observation ledger has no automatic cleanup policy, so disk use grows.
+SQLite is LiveGuard's only persistent runtime repository. On startup, Runs that were active become paused; resuming restores valid Pending signals for the current goal and starts new investigations from saved evidence. Model requests and tool turns do not resume, and a crash between an external model response and local commit may repeat the call. JSON repository mode has been removed, and old JSON files are not imported automatically. Create a JSON copy for inspection and archiving with `go run ./cmd/monitor-store-export -db runtime/liveguard.sqlite -out runtime/json-backup`; it contains the Run snapshot and observation ledger, but not the queue, and cannot be imported back into LiveGuard. Memory Repository stores state only while the process runs. Ordinary OCR screenshots and images selected during investigation use temporary files and are deleted after normal completion; cleanup after forced termination has not been specifically verified. Related OCR text and textual conclusions are stored with the monitor. A compatibility path can read older archived images, but the current path does not create new investigation image archives. Chrome login profile is also local. The observation ledger has no automatic cleanup policy, so database and export size grow over time.
 
 ## Evaluation, throughput, and latency: what current evidence can show
 
@@ -270,7 +272,7 @@ See [Evaluation and verification](EVALUATION.en.md) for measurements and boundar
 
 1. Read `README.md` for scope, startup, and document links.
 2. Read this guide, then follow `cmd/liveguard/main.go` → `internal/web/server.go` → `internal/monitor/service.go` → `internal/monitor/pending.go` → `internal/monitor/agent_reviewer.go` → `internal/monitor/review_tools.go`.
-3. Follow data through `internal/monitor/domain.go`, `repository.go`, and `ledger.go`; read `file_repository.go` for local file persistence.
+3. Follow data through `internal/monitor/domain.go`, `repository.go`, `ledger.go`, and `sqlite_repository.go`.
 4. Read `internal/agent/loop.go` for the generic tool loop, then `messages_model.go` and `chat_completions_provider.go` for provider protocol differences.
 5. Read `internal/monitor/*_test.go` for boundary cases. Finally, read `docs/EVALUATION.md` for how to run measurement tools and what cannot be inferred from their results.
 

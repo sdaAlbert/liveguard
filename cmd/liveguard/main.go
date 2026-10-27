@@ -54,7 +54,7 @@ func main() {
 		defer cancel()
 		_ = shutdownTrace(shutdownCtx)
 	}()
-	infraMode := strings.ToLower(envOr("LIVEGUARD_INFRA_MODE", "local"))
+	infraMode := strings.ToLower(envOr("LIVEGUARD_INFRA_MODE", "sqlite"))
 	chromePath := envOr("LIVEGUARD_CHROME_PATH", defaultChromePath())
 	webServer := webapp.New("artifacts")
 	webServer.SetShutdownHandler(func() {
@@ -64,21 +64,21 @@ func main() {
 	var monitorRepository monitor.Repository
 	if infraMode == "memory" {
 		monitorRepository = monitor.NewMemoryRepository()
-	} else if infraMode == "local" {
-		localPath := envOr("LIVEGUARD_LOCAL_STATE_PATH", filepath.Join("runtime", "liveguard.json"))
-		localRepository, err := monitor.OpenFileRepository(localPath)
+	} else if infraMode == "sqlite" {
+		sqlitePath := envOr("LIVEGUARD_SQLITE_PATH", filepath.Join("runtime", "liveguard.sqlite"))
+		sqliteRepository, err := monitor.OpenSQLiteRepository(sqlitePath)
 		if err != nil {
-			log.Fatalf("local monitor store: %v", err)
+			log.Fatalf("SQLite monitor store: %v", err)
 		}
 		defer func() {
-			if err := localRepository.Close(); err != nil {
-				log.Printf("save local monitor state: %v", err)
+			if err := sqliteRepository.Close(); err != nil {
+				log.Printf("close SQLite monitor store: %v", err)
 			}
 		}()
-		monitorRepository = localRepository
-		log.Printf("local monitor state persisted to %s", localPath)
+		monitorRepository = sqliteRepository
+		log.Printf("SQLite monitor state persisted to %s", sqlitePath)
 	} else {
-		log.Fatalf("unsupported LIVEGUARD_INFRA_MODE %q; use local or memory", infraMode)
+		log.Fatalf("unsupported LIVEGUARD_INFRA_MODE %q; use sqlite or memory", infraMode)
 	}
 	monitorService := monitor.NewService(monitorRepository, func() {
 		webServer.Publish(domain.Event{ID: domain.NewID("event"), Type: "monitor_update", Message: "monitor state updated", At: time.Now().UTC()})

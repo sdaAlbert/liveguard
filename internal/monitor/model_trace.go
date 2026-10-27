@@ -10,13 +10,14 @@ type modelCallTraceContextKey struct{}
 
 type modelCallTrace struct {
 	ReviewID       string
+	AttemptID      string
 	Turn           int
 	ParentDeadline time.Time
 }
 
-func withModelCallTrace(ctx context.Context, reviewID string, turn int) context.Context {
+func withModelCallTrace(ctx context.Context, reviewID, attemptID string, turn int) context.Context {
 	trace := modelCallTraceFromContext(ctx)
-	trace.ReviewID, trace.Turn = reviewID, turn
+	trace.ReviewID, trace.AttemptID, trace.Turn = reviewID, attemptID, turn
 	if trace.ParentDeadline.IsZero() {
 		trace.ParentDeadline, _ = ctx.Deadline()
 	}

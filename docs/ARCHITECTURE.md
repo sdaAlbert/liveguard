@@ -31,7 +31,7 @@ LiveGuard 的 Agent 不负责持续运行，也不直接控制浏览器或写入
 | 模型处理期间新信号继续到达 | 每监控有界等待队列、优先级老化、deadline、有限合并和全局并发门控 | 队列满会拒绝或淘汰低优先级待处理项；观测留存不代表调查完成 |
 | 无变化时不应反复启动判断 | OCR 行去重、调查节流、按需看图与历史检索、稳定状态降频 | 去重发生在 OCR 之后；UI 变化仍可能产出新文本并触发调查；没有每日金额或 token 总预算 |
 | 多次调查需要连续性 | 观测流水持久化；每次调查按需搜索历史观测和近期提醒 | 没有独立事件状态账本；“预告、开始、延期、取消”之间的关系仍由调查解释 |
-| 长时间运行中会暂停、失败或改目标 | Run 状态、采集健康和单次调查状态分开；取消上下文和目标版本校验保护提交 | 队列和在途调查是进程内状态，重启不恢复精确执行位置；观测和归档图片没有自动清理 |
+| 长时间运行中会暂停、失败或改目标 | Run 状态、采集健康和单次调查状态分开；SQLite 持久化 Pending，取消上下文和目标版本校验保护提交 | 重启后重新调查有效 Pending，不续接模型轮次或浏览器位置；观测和归档图片没有自动清理 |
 
 核心取舍是让模型负责解释、让 Go 负责约束。模型输出可以影响调查结论和采样建议，但必须经工具前置条件、证据校验和状态提交规则才能产生提醒或改变采样节奏。
 
@@ -78,7 +78,7 @@ flowchart TD
 | `Service` | [`service.go`](../internal/monitor/service.go)、[`pending.go`](../internal/monitor/pending.go) | Run 生命周期、信号接收、Pending 队列、调查许可、取消与提交前校验 |
 | `UnexpectedEventReviewer` | [`agent_reviewer.go`](../internal/monitor/agent_reviewer.go)、[`review_tools.go`](../internal/monitor/review_tools.go) | 对一个调查窗口运行有限工具循环，生成结论和证据引用；不直接写 Repository |
 | `ToolModel` / `ModelSession` | [`model_session.go`](../internal/monitor/model_session.go) | 模型协议接缝：把统一轮次、工具调用和图片内容转换成提供方消息格式 |
-| `Repository` | [`repository.go`](../internal/monitor/repository.go)、[`file_repository.go`](../internal/monitor/file_repository.go) | 对单个 Run 做原子读取和有界状态变更；实现分别对应内存和本地文件 |
+| `Repository` | [`repository.go`](../internal/monitor/repository.go)、[`sqlite_repository.go`](../internal/monitor/sqlite_repository.go) | 对单个 Run 做原子读取和有界状态变更；运行时使用 SQLite，内存实现仅用于临时运行和测试 |
 | `RunLedger` | [`ledger.go`](../internal/monitor/ledger.go) 及各 Repository 实现 | 保存和分页检索完整观测；与 Run 快照中用于控制台显示的有界记录分开 |
 
 这些接口把会变化的能力放在明确接缝上：感知器可替换，模型协议由 Adapter 转换，Repository 可替换；测试也从同一接口注入假实现。调查规则仍集中在 `AgentReviewer` 与 Go 提交校验中，没有复制到每个模型 Adapter。完整 Agent Harness 的分层职责与执行预算见[Agent Harness 详解](AGENT-HARNESS.md)。
@@ -137,7 +137,7 @@ flowchart TD
 
 同步 `Ingest` 为兼容、测试和同步负载入口：事件仍可被记录，但因冷却或没有可用槽位而未启动的调查不会留在异步队列等待。`SubmitSignal` 则为成功入队的信号等待后台执行许可，直到调查完成、被取消或 deadline 到期。因此同步接收吞吐不代表异步队列的完成吞吐或排队延迟。
 
-队列状态 `Waiting/Reviewing/Processed/Failed/Dropped/Expired/Coalesced` 是当前进程的执行状态，不是可恢复的任务账本。暂停、停止或改目标会关闭/清理旧队列并取消在途 context；服务重启不会从 Pending 精确恢复未完成工作。
+队列统计 `Waiting/Reviewing/Processed/Failed/Dropped/Expired/Coalesced` 反映当前运行状态；SQLite 的 `pending_signals` 表负责保存尚未完成的工作。暂停和进程重启会保留仍有效的信号；重新继续时从信号证据开启新的调查。停止或改目标会清掉待办并取消在途 context。
 
 ## 证据规则与提醒提交
 
@@ -176,7 +176,9 @@ flowchart TD
 
 改目标时先准备新计划，再原子更新用户目标、计划、采样状态和 `GoalVersion`，之后清空旧队列并取消旧调查。即使旧模型请求不及时响应，它的结果也无法在新目标下提交。暂停会保留 Run 与历史并取消运行时；继续时以同一 Run 重建采集/调查循环。停止则结束 Run。
 
-Repository `Update` 回调必须只执行有界的内存状态变更，不应在锁中调用模型、浏览器或其他网络。Memory Repository 用互斥锁和副本；文件 Adapter 在内存仓储逻辑上持久化快照与观测追加记录。它们保护 Repository 内状态更新的一致性，不构成跨进程任务队列或外部副作用的 exactly-once。
+Repository `Update` 回调必须只执行有界的内存状态变更，不应在锁中调用模型、浏览器或其他网络。默认 SQLite Adapter 将 Run 快照、完整观测流水和 Pending 信号分别保存；接收新信号时，Run 事件、观测和待办入队在一个事务中提交，拒绝入队则整笔回滚。队列按每个 Run 最多 8 项限制容量，图片暂存受单张 4 MiB、总量 64 MiB 限制。Worker 以事务把待办从 `pending` 标为 `processing`，正常结束后删除；暂停或重启中断时保留该行，启动恢复将有效的 `processing` 项重置为 `pending`。继续运行后，Worker 从保存的证据重新开启调查。过期信号和 GoalVersion 已变化的旧信号会被删除；修改目标时同一事务清掉旧版本待办。
+
+SQLite 可以保证本地状态更新和待办入队的一致性，但不能恢复发出请求后的模型会话、工具轮次或浏览器内部执行位置。进程若在模型已产生外部结果、而本地结果尚未提交时退出，恢复后可能再次调用模型，因此是至少一次处理。运行时不再提供 JSON 仓储；`cmd/monitor-store-export` 可从同一 SQLite 只读事务导出 JSON 快照与 JSONL 观测流水，供人工查看和归档。导出不包含 Pending 队列，也不能重新导入 LiveGuard。
 
 ## 跨调查上下文与持久化
 
@@ -185,8 +187,8 @@ Repository `Update` 回调必须只执行有界的内存状态变更，不应在
 | 状态/记录 | 生命周期和用途 |
 |---|---|
 | `Run` | 保存目标、`GoalVersion`、MonitoringPlan、采样策略、房间、近期记录、Investigation 和 Alert；快照中的历史有上限，超过后设置 `HistoryTruncated` |
-| `RunLedger` | 保存完整 OCR/ASR/frame/视觉观测并按页检索；文件模式跨进程保存，Memory Repository 仅在当前进程保留 |
-| `Pending` | 进程内等待和执行信息；不是持久任务状态，重启后不会恢复排队位置 |
+| `RunLedger` | 保存完整 OCR/ASR/frame/视觉观测并按页检索；SQLite 与 JSON 文件模式跨进程保存，Memory Repository 仅在当前进程保留 |
+| `Pending` | SQLite 持久化等待信号并在重启后回收仍有效的处理中项目；JSON 和内存模式只在进程内保存队列 |
 | `Investigation` | 一次调查的状态、原因、证据、工具轨迹和 token/耗时；证据不足可以等待，后续调查通过搜索历史重新核验 |
 | `Alert` | 后端已经接受的提醒记录；浏览器是否已读由前端另行维护，不表示第三方送达回执 |
 
@@ -215,5 +217,5 @@ Run 快照中的 Event 最多 2,000 条、Investigation/Alert 各最多 500 条�
 | ReAct 循环和工具协议 | [`internal/agent/loop.go`](../internal/agent/loop.go)、[`agent_reviewer.go`](../internal/monitor/agent_reviewer.go)、[`review_tools.go`](../internal/monitor/review_tools.go)、[`review_context.go`](../internal/monitor/review_context.go) |
 | 队列、时效、公平并发 | [`pending.go`](../internal/monitor/pending.go)、[`signal_policy.go`](../internal/monitor/signal_policy.go)、[`review_gate.go`](../internal/monitor/review_gate.go) |
 | 证据来源和提交约束 | [`evidence.go`](../internal/monitor/evidence.go)、[`service.go`](../internal/monitor/service.go)、[`repository.go`](../internal/monitor/repository.go) |
-| 观测流水与长期查询 | [`ledger.go`](../internal/monitor/ledger.go)、[`file_repository.go`](../internal/monitor/file_repository.go) |
+| 观测流水与长期查询 | [`ledger.go`](../internal/monitor/ledger.go)、[`sqlite_repository.go`](../internal/monitor/sqlite_repository.go) |
 | Provider Adapter 与重试 | [`model_session.go`](../internal/monitor/model_session.go)、[`messages_model.go`](../internal/monitor/messages_model.go)、[`chat_completions_provider.go`](../internal/monitor/chat_completions_provider.go)、[`retry.go`](../internal/agent/retry.go) |

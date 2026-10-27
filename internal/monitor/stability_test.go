@@ -48,20 +48,6 @@ func TestCaptureRecoversAfterMoreThanThreeTemporaryFailures(t *testing.T) {
 	t.Fatalf("temporary failures permanently stopped capture: calls=%d", c.calls.Load())
 }
 
-func TestSnapshotReplacementRetriesSharingFailure(t *testing.T) {
-	calls := 0
-	err := replaceSnapshot("temporary", "snapshot", func(_, _ string) error {
-		calls++
-		if calls < 4 {
-			return &os.LinkError{Op: "rename", Old: "temporary", New: "snapshot", Err: os.ErrPermission}
-		}
-		return nil
-	})
-	if err != nil || calls != 4 {
-		t.Fatalf("transient snapshot lock not retried: calls=%d err=%v", calls, err)
-	}
-}
-
 func TestBrowserReviewRefreshesTriggerAfterGlobalSlotWait(t *testing.T) {
 	s := NewService(NewMemoryRepository(), nil)
 	defer s.StopAll()

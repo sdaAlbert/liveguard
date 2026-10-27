@@ -17,6 +17,7 @@ type UnexpectedEventDecision struct {
 	VisualEvidenceID    string            `json:"-"`
 	VisualOCREvidenceID string            `json:"-"`
 	VisualArchiveID     string            `json:"-"`
+	AttemptID           string            `json:"-"`
 	TransportRetries    int               `json:"-"`
 	Sampling            *SamplingProposal `json:"sampling,omitempty"`
 	Action              string            `json:"action"`
@@ -40,6 +41,7 @@ type UnexpectedEventDecision struct {
 }
 
 type UnexpectedEventInput struct {
+	AttemptID              string
 	UserClarification      string
 	UserInstructions       []string
 	EvidenceAt             time.Time
@@ -58,6 +60,7 @@ type UnexpectedEventInput struct {
 	TriggerFrame           string
 	CaptureFrame           func(context.Context) (FrameAsset, error)
 	RecordFrameEvidence    func(context.Context, FrameAsset) error
+	UpdateGoal             func(context.Context, string) (*Run, error)
 }
 
 type FrameAsset struct {

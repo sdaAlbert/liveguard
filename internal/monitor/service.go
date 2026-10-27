@@ -353,9 +353,8 @@ func (s *Service) planForRuntime(run *Run, reviewer UnexpectedEventReviewer) Mon
 	return plan
 }
 
-// UpdateGoal applies an explicit user-edited monitoring goal and replans its
-// bounded sensing policy. The model may suggest a plan, but only the user's
-// submitted goal is committed; no model-generated message is auto-approved.
+// UpdateGoal applies a selected monitoring goal and replans its bounded sensing
+// policy. User collaboration messages or the dedicated goal API can select it.
 func (s *Service) UpdateGoal(ctx context.Context, id, goal string) (*Run, error) {
 	goal = strings.TrimSpace(goal)
 	if utf8.RuneCountInString(goal) < 2 || utf8.RuneCountInString(goal) > 240 {
@@ -482,11 +481,28 @@ func (s *Service) SubmitInstruction(ctx context.Context, id, instruction string)
 		s.onUpdate()
 		return s.Resume(ctx, id)
 	}
+	s.reopenPendingQueue(id, updated.GoalVersion)
 	s.onUpdate()
 	if investigationID != "" {
 		go s.resumeClarifiedInvestigation(id, investigationID)
 	}
 	return updated, nil
+}
+
+// reopenPendingQueue restores admission after a user has handled a human
+// verification challenge. The monitor may still be running while that queue
+// is closed, so an explicit user message is the signal to resume review.
+func (s *Service) reopenPendingQueue(runID string, version uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runCtx := s.contexts[runID]
+	if runCtx == nil || runCtx.Err() != nil {
+		return
+	}
+	if q := s.pending[runID]; q != nil && q.accepting() {
+		return
+	}
+	s.pending[runID] = s.newPendingQueue(runCtx, runID, version)
 }
 
 func (s *Service) List(ctx context.Context) ([]Summary, error) {
@@ -508,16 +524,19 @@ func (s *Service) Stop(ctx context.Context, id string) (*Run, error) {
 	q := s.pending[id]
 	s.mu.Unlock()
 	completedAt := time.Now().UTC()
+	var pendingStatus *PendingStatus
+	if q != nil {
+		status := q.stats()
+		status.Waiting, status.Reviewing = 0, false
+		pendingStatus = &status
+	}
 	run, err := s.repository.Update(ctx, id, func(run *Run) error {
 		if run.Status != RunRunning && run.Status != RunPaused {
 			return nil
 		}
 		run.Status = RunStopped
-		if q != nil {
-			status := q.stats()
-			status.Waiting = 0
-			status.Reviewing = false
-			run.Pending = &status
+		if pendingStatus != nil {
+			run.Pending = pendingStatus
 		}
 		for i := range run.Investigations {
 			inv := &run.Investigations[i]
@@ -566,6 +585,12 @@ func (s *Service) Pause(ctx context.Context, id string) (*Run, error) {
 	s.mu.Lock()
 	cancel, runCtx, q := s.cancels[id], s.contexts[id], s.pending[id]
 	s.mu.Unlock()
+	var pendingStatus *PendingStatus
+	if q != nil {
+		status := q.stats()
+		status.Waiting, status.Reviewing = 0, false
+		pendingStatus = &status
+	}
 	updated, err := s.repository.Update(ctx, id, func(run *Run) error {
 		if run.Status == RunPaused {
 			return nil
@@ -574,10 +599,8 @@ func (s *Service) Pause(ctx context.Context, id string) (*Run, error) {
 			return ErrInvalidTransition
 		}
 		run.Status = RunPaused
-		if q != nil {
-			status := q.stats()
-			status.Waiting, status.Reviewing = 0, false
-			run.Pending = &status
+		if pendingStatus != nil {
+			run.Pending = pendingStatus
 		}
 		for i := range run.Rooms {
 			run.Rooms[i].Status = "paused"
@@ -626,6 +649,18 @@ func (s *Service) Resume(ctx context.Context, id string) (*Run, error) {
 	}
 	s.reservations++
 	s.mu.Unlock()
+	if store, ok := s.repository.(DurablePendingQueue); ok {
+		current, err := s.repository.Get(ctx, id)
+		if err == nil && current.Status == RunPaused {
+			err = store.RecoverPending(ctx, id, current.GoalVersion, time.Now().UTC())
+		}
+		if err != nil {
+			s.mu.Lock()
+			s.reservations--
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
 	updated, err := s.repository.Update(ctx, id, func(run *Run) error {
 		if run.Status != RunPaused {
 			return ErrInvalidTransition
@@ -650,6 +685,9 @@ func (s *Service) Resume(ctx context.Context, id string) (*Run, error) {
 				run.Rooms[i].Health = SourceWaiting
 				run.Rooms[i].LastError = ""
 			}
+		}
+		if run.Baseline != nil && run.Baseline.Status == BaselineNeedsLogin {
+			run.Baseline = &LiveBaseline{Status: BaselinePending}
 		}
 		return nil
 	})
@@ -843,29 +881,34 @@ func (s *Service) clearCaptureError(ctx context.Context, runID string, goalVersi
 	return err
 }
 func (s *Service) RecoverInterrupted(ctx context.Context) error {
-	runs, err := s.repository.ListRunning(ctx)
+	runs, err := s.repository.List(ctx)
 	if err != nil {
 		return err
 	}
+	durable, hasDurableQueue := s.repository.(DurablePendingQueue)
 	for _, run := range runs {
-		if run.Status != RunRunning {
-			continue
-		}
-		if _, err := s.repository.Update(ctx, run.ID, func(current *Run) error {
-			if current.Status != RunRunning {
+		if run.Status == RunRunning {
+			if _, err := s.repository.Update(ctx, run.ID, func(current *Run) error {
+				if current.Status != RunRunning {
+					return nil
+				}
+				current.Status = RunPaused
+				current.CompletedAt = nil
+				current.StopReason = "process_interrupted"
+				current.Pending = &PendingStatus{LastIssue: "未完成工作在进程重启时中断；有效待处理信号可在继续后恢复"}
+				current.LastError = "服务重启中断了上次运行，已暂停；点击继续会重新采集，并恢复仍有效的待处理信号"
+				for i := range current.Rooms {
+					current.Rooms[i].Status = "paused"
+				}
 				return nil
+			}); err != nil {
+				return err
 			}
-			current.Status = RunPaused
-			current.CompletedAt = nil
-			current.StopReason = "process_interrupted"
-			current.Pending = &PendingStatus{LastIssue: "未完成工作在进程重启时中断；原观测仍可搜索"}
-			current.LastError = "服务重启中断了上次运行，已暂停；点击继续会重新采集，原流水保留，未完成调查不会重放"
-			for i := range current.Rooms {
-				current.Rooms[i].Status = "paused"
+		}
+		if hasDurableQueue && (run.Status == RunRunning || run.Status == RunPaused) {
+			if err := durable.RecoverPending(ctx, run.ID, run.GoalVersion, time.Now().UTC()); err != nil {
+				return err
 			}
-			return nil
-		}); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -972,6 +1015,7 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 	_, reviewer, _ := s.agentConfig()
 	snapshot.Plan = s.planForRuntime(snapshot, reviewer)
 	if eventType != "human_verification" && reviewer != nil {
+		attemptID := domain.NewID("review")
 		sampling := s.effectiveSampling(snapshot, time.Now().UTC())
 		var release func()
 		var allowed, overloaded bool
@@ -983,12 +1027,16 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 			if priority > 0 || pendingPriority(event) > 0 || (snapshot.SourceMode != "browser_ocr" && time.Until(signalDeadline(event)) < time.Minute) {
 				requested = -1
 			}
+			slotWaitStarted := time.Now()
+			log.Printf("agent review waiting for slot: monitor=%q review_id=%q attempt_id=%q event_id=%q minimum_interval_seconds=%d signal_remaining_ms=%d", runID, event.ID, attemptID, event.ID, requested, time.Until(signalDeadline(event)).Milliseconds())
 			waitCtx, waitCancel := context.WithDeadline(ctx, signalDeadline(event))
 			release, err = s.awaitReview(waitCtx, runID, requested)
 			waitCancel()
 			if err != nil {
+				log.Printf("agent review slot wait ended: monitor=%q review_id=%q attempt_id=%q event_id=%q wait_ms=%d error=%q", runID, event.ID, attemptID, event.ID, time.Since(slotWaitStarted).Milliseconds(), err)
 				return err
 			}
+			log.Printf("agent review slot acquired: monitor=%q review_id=%q attempt_id=%q event_id=%q wait_ms=%d", runID, event.ID, attemptID, event.ID, time.Since(slotWaitStarted).Milliseconds())
 			allowed = true
 			// Reload after waiting so previous alerts are visible. The
 			// triggering signal itself remains in the bounded evidence input.
@@ -1043,11 +1091,22 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 			}
 			frameCheck := event.Source == SignalFrame
 			input := UnexpectedEventInput{
+				AttemptID:   attemptID,
 				EvidenceAt:  time.Now().UTC(),
 				GoalVersion: snapshot.GoalVersion, GoalUpdatedAt: snapshot.GoalUpdatedAt,
 				Goal: snapshot.Goal, UserInstructions: append([]string(nil), snapshot.UserInstructions...),
 				Plan: snapshot.Plan, Baseline: snapshot.Baseline, Sampling: sampling, FrameCheck: frameCheck, RecentEvidence: recent,
 				RecentAlerts: snapshot.Alerts, TriggerFrameObservedAt: event.ObservedAt,
+				UpdateGoal: func(updateCtx context.Context, goal string) (*Run, error) {
+					current, getErr := s.repository.Get(updateCtx, runID)
+					if getErr != nil {
+						return nil, getErr
+					}
+					if strings.TrimSpace(current.Goal) == strings.TrimSpace(goal) {
+						return current, nil
+					}
+					return s.UpdateGoal(updateCtx, runID, goal)
+				},
 				SearchObservations: func(queryCtx context.Context, query ObservationQuery) (ObservationPage, error) {
 					ledger, ok := s.repository.(RunLedger)
 					if !ok {
@@ -1126,9 +1185,9 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 			if reviewErr == nil {
 				if reviewDecisionIncomplete(decision) {
 					decision.Failure = reviewIncompleteMessage(decision.StopReason)
-					log.Printf("unexpected livestream review incomplete: model=%s stop_reason=%s turns=%d confidence=%.2f input_tokens=%d output_tokens=%d latency_ms=%d", decision.Model, decision.StopReason, decision.Turns, decision.Confidence, decision.InputTokens, decision.OutputTokens, decision.LatencyMS)
+					log.Printf("unexpected livestream review incomplete: model=%s review_id=%q attempt_id=%q event_id=%q stop_reason=%s turns=%d confidence=%.2f input_tokens=%d output_tokens=%d latency_ms=%d", decision.Model, event.ID, decision.AttemptID, event.ID, decision.StopReason, decision.Turns, decision.Confidence, decision.InputTokens, decision.OutputTokens, decision.LatencyMS)
 				} else {
-					log.Printf("unexpected livestream review completed: model=%s action=%s confidence=%.2f input_tokens=%d output_tokens=%d latency_ms=%d", decision.Model, decision.Action, decision.Confidence, decision.InputTokens, decision.OutputTokens, decision.LatencyMS)
+					log.Printf("unexpected livestream review completed: model=%s review_id=%q attempt_id=%q event_id=%q action=%s confidence=%.2f input_tokens=%d output_tokens=%d latency_ms=%d", decision.Model, event.ID, decision.AttemptID, event.ID, decision.Action, decision.Confidence, decision.InputTokens, decision.OutputTokens, decision.LatencyMS)
 				}
 				review = &decision
 			} else {
@@ -1147,7 +1206,7 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 				}
 				review = &decision
 				if decision.StopReason != "circuit_open" && !errors.Is(reviewErr, context.Canceled) {
-					log.Printf("unexpected livestream review failed: model=%s event_id=%q stop_reason=%s signal_age_ms=%d signal_remaining_ms=%d turns=%d input_tokens=%d output_tokens=%d latency_ms=%d error=%q", decision.Model, event.ID, decision.StopReason, time.Since(event.ObservedAt).Milliseconds(), time.Until(signalDeadline(event)).Milliseconds(), decision.Turns, decision.InputTokens, decision.OutputTokens, decision.LatencyMS, reviewErr)
+					log.Printf("unexpected livestream review failed: model=%s review_id=%q attempt_id=%q event_id=%q stop_reason=%s signal_age_ms=%d signal_remaining_ms=%d turns=%d input_tokens=%d output_tokens=%d latency_ms=%d error=%q", decision.Model, event.ID, decision.AttemptID, event.ID, decision.StopReason, time.Since(event.ObservedAt).Milliseconds(), time.Until(signalDeadline(event)).Milliseconds(), decision.Turns, decision.InputTokens, decision.OutputTokens, decision.LatencyMS, reviewErr)
 				}
 			}
 		}
@@ -1176,6 +1235,14 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 		}
 		if eventType == "human_verification" || (reviewer == nil && eventType != "") {
 			investigate(run, event, eventType)
+			if eventType == "human_verification" {
+				for i := range run.Rooms {
+					if run.Rooms[i].ID == event.RoomID {
+						run.Rooms[i].Health = SourceNeedsLogin
+						run.Rooms[i].LastError = "页面要求完成登录或安全验证"
+					}
+				}
+			}
 		} else if review != nil {
 			if review.Action == "alert" && review.EvidenceBasis == "live" {
 				for _, newer := range run.Events {
@@ -1207,7 +1274,10 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 	})
 	if err == nil {
 		if eventType == "human_verification" {
-			s.closePending(runID)
+			_, err = s.pauseForHuman(context.Background(), runID)
+			if err != nil {
+				return err
+			}
 		}
 		if quotaFailure {
 			s.endQuotaExhaustedRuns(runID, reviewer)
@@ -1217,11 +1287,80 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 	return err
 }
 
+// pauseForHuman waits for the user to handle a verification challenge while
+// keeping the dedicated browser tab open. Resume can then restart collection
+// in that same authenticated tab after the user confirms they are done.
+func (s *Service) pauseForHuman(ctx context.Context, id string) (*Run, error) {
+	s.mu.Lock()
+	cancel, runCtx, q := s.cancels[id], s.contexts[id], s.pending[id]
+	s.mu.Unlock()
+	var pendingStatus *PendingStatus
+	if q != nil {
+		status := q.stats()
+		status.Waiting, status.Reviewing = 0, false
+		pendingStatus = &status
+	}
+	updated, err := s.repository.Update(ctx, id, func(run *Run) error {
+		if run.Status == RunPaused {
+			return nil
+		}
+		if run.Status != RunRunning {
+			return ErrInvalidTransition
+		}
+		run.Status, run.StopReason = RunPaused, "human_verification"
+		if pendingStatus != nil {
+			run.Pending = pendingStatus
+		}
+		for i := range run.Rooms {
+			run.Rooms[i].Status = "paused"
+		}
+		for i := range run.Investigations {
+			inv := &run.Investigations[i]
+			if inv.Status == InvestigationReviewing && inv.UserAnswer != "" {
+				if err := TransitionInvestigation(inv, InvestigationWaitingUser); err != nil {
+					return err
+				}
+				inv.Conclusion = "监控等待你完成登录或安全验证；确认处理后发送消息即可继续"
+				inv.UpdatedAt = time.Now().UTC()
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return updated, err
+	}
+	if q != nil {
+		q.invalidate(0, true)
+		if q.durable != nil {
+			if err := q.durable.RecoverPending(context.Background(), id, updated.GoalVersion, q.now()); err != nil {
+				log.Printf("recover pending signals while waiting for verification failed: monitor=%s error=%q", id, err)
+			}
+		}
+	}
+	if cancel != nil {
+		cancel()
+	}
+	s.mu.Lock()
+	if s.contexts[id] == runCtx {
+		delete(s.cancels, id)
+		delete(s.contexts, id)
+		delete(s.pending, id)
+		delete(s.lastUnexpectedReview, id)
+	}
+	s.mu.Unlock()
+	s.onUpdate()
+	return updated, nil
+}
+
 func reviewDecisionIncomplete(decision UnexpectedEventDecision) bool {
 	return decision.StopReason != "" && decision.StopReason != "finished" && decision.StopReason != "terminal_tool"
 }
 
 func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEvent) (*Run, SignalEvent, bool, error) {
+	return s.acceptSignalAndEnqueue(ctx, runID, event, nil)
+}
+
+func (s *Service) acceptSignalAndEnqueue(ctx context.Context, runID string, event SignalEvent, pending *pendingSignal) (*Run, SignalEvent, bool, error) {
 	if !utf8.ValidString(event.Text) || strings.TrimSpace(event.Text) == "" || utf8.RuneCountInString(event.Text) > maxSignalTextRunes {
 		return nil, event, false, errors.New("signal text must contain 1-4000 characters")
 	}
@@ -1277,12 +1416,15 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 	}{event.RoomID, event.Source, event.Text, event.Confidence})
 	fingerprint := sha256.Sum256(fingerprintBytes)
 	duplicate := false
-	updated, err := s.repository.Update(ctx, runID, func(run *Run) error {
+	apply := func(run *Run) (pendingSignal, bool, error) {
 		if run.Status != RunRunning {
-			return errors.New("monitor is not running")
+			return pendingSignal{}, false, errors.New("monitor is not running")
+		}
+		if pending != nil && run.GoalVersion > 1 && event.ObservedAt.Before(run.GoalUpdatedAt) {
+			return pendingSignal{}, false, ErrGoalChanged
 		}
 		if event.GoalVersion != 0 && event.GoalVersion != run.GoalVersion {
-			return ErrGoalChanged
+			return pendingSignal{}, false, ErrGoalChanged
 		}
 		if run.EventReceipts == nil {
 			run.EventReceipts = []EventReceipt{}
@@ -1298,10 +1440,10 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 		for _, receipt := range run.EventReceipts {
 			if receipt.ID == event.ID {
 				if receipt.Fingerprint != hex.EncodeToString(fingerprint[:]) {
-					return ErrEventIDConflict
+					return pendingSignal{}, false, ErrEventIDConflict
 				}
 				duplicate = true
-				return nil
+				return pendingSignal{}, false, nil
 			}
 		}
 		run.EventSequence++
@@ -1323,10 +1465,34 @@ func (s *Service) acceptSignal(ctx context.Context, runID string, event SignalEv
 				}
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, event, false, err
+		if pending == nil {
+			return pendingSignal{}, false, nil
+		}
+		item := *pending
+		item.event = event
+		item.version = run.GoalVersion
+		item.priority = pendingPriority(event)
+		return item, true, nil
+	}
+	var updated *Run
+	var updateErr error
+	if pending != nil {
+		if store, ok := s.repository.(DurablePendingQueue); ok {
+			updated, updateErr = store.UpdateAndEnqueuePending(ctx, runID, apply)
+		} else {
+			updated, updateErr = s.repository.Update(ctx, runID, func(run *Run) error {
+				_, _, applyErr := apply(run)
+				return applyErr
+			})
+		}
+	} else {
+		updated, updateErr = s.repository.Update(ctx, runID, func(run *Run) error {
+			_, _, applyErr := apply(run)
+			return applyErr
+		})
+	}
+	if updateErr != nil {
+		return nil, event, false, updateErr
 	}
 	if duplicate {
 		return updated, event, true, nil

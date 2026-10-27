@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,23 @@ type blockingReviewer struct {
 	started chan struct{}
 	release chan struct{}
 	calls   atomic.Int32
+}
+
+type restartQueueReviewer struct {
+	calls    atomic.Int32
+	started  chan int32
+	canceled chan struct{}
+}
+
+func (r *restartQueueReviewer) Review(ctx context.Context, _ UnexpectedEventInput) (UnexpectedEventDecision, error) {
+	call := r.calls.Add(1)
+	r.started <- call
+	if call == 1 {
+		<-ctx.Done()
+		close(r.canceled)
+		return UnexpectedEventDecision{}, ctx.Err()
+	}
+	return UnexpectedEventDecision{Action: "ignore", Category: "other", Confidence: .9}, nil
 }
 
 type blockingTranscriber struct{ started chan struct{} }
@@ -409,6 +427,86 @@ func TestUnexpectedImportantEventCanAlertOutsideUserGoal(t *testing.T) {
 	}
 	if current.Investigations[0].Steps[1].Outcome != "已读取 1 条近期字幕证据" || current.Investigations[0].Steps[2].Outcome != "未发现同类提醒记录" {
 		t.Fatalf("executed tool outcomes should be persisted for the UI and replay: %#v", current.Investigations[0].Steps)
+	}
+}
+
+func TestSQLiteSubmitSignalSurvivesPauseAndProcessRestart(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "liveguard.sqlite")
+	repo, err := OpenSQLiteRepository(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer := &restartQueueReviewer{started: make(chan int32, 2), canceled: make(chan struct{})}
+	service := NewService(repo, nil)
+	service.SetUnexpectedEventReviewer(reviewer, time.Millisecond)
+	run, err := service.Start(ctx, StartInput{TargetURL: "https://live.example.com/restart", Goal: "抽奖开始时提醒我", SourceMode: "ocr_upload"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := SignalEvent{RoomID: run.Rooms[0].ID, Source: SignalOCR, Text: "抽奖马上开始", ObservedAt: time.Now().UTC()}
+	if err := service.SubmitSignal(ctx, run.ID, event); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case call := <-reviewer.started:
+		if call != 1 {
+			t.Fatalf("first review call = %d", call)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("durable queue did not start reviewing the submitted signal")
+	}
+	if _, err := service.Pause(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reviewer.canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pause did not cancel the in-flight review")
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err = OpenSQLiteRepository(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	service = NewService(repo, nil)
+	service.SetUnexpectedEventReviewer(reviewer, time.Millisecond)
+	if err := service.RecoverInterrupted(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waiting, reviewing, err := repo.PendingCounts(ctx, run.ID)
+	if err != nil || waiting != 1 || reviewing {
+		t.Fatalf("restart recovery should restore one waiting signal: waiting=%d reviewing=%v err=%v", waiting, reviewing, err)
+	}
+	if _, err := service.Resume(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case call := <-reviewer.started:
+		if call != 2 {
+			t.Fatalf("recovered review call = %d, want 2", call)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovered signal was not reviewed after Resume")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		waiting, reviewing, err = repo.PendingCounts(ctx, run.ID)
+		if err == nil && waiting == 0 && !reviewing {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil || waiting != 0 || reviewing {
+		t.Fatalf("completed recovered signal remained pending: waiting=%d reviewing=%v err=%v", waiting, reviewing, err)
+	}
+	current, err := repo.Get(ctx, run.ID)
+	if err != nil || current.Status != RunRunning || len(current.Events) != 1 {
+		t.Fatalf("Run or accepted event was not restored: status=%s events=%d err=%v", current.Status, len(current.Events), err)
 	}
 }
 
