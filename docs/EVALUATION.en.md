@@ -51,6 +51,22 @@ go run ./cmd/monitor-load -mode async -requests 800
 
 These throughput figures apply only to the mock backend load. Real model throughput depends on model response time, the number of review turns per signal, and input rate. Existing runtime records are not a controlled end-to-end throughput test.
 
+## Sampling a real run
+
+Run `scripts/capture-runtime.ps1` while LiveGuard is running to periodically collect local process resources and `/api/metrics`. The default interval is 5 seconds; press `Ctrl+C` to stop, or set a duration:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ./scripts/capture-runtime.ps1 -DurationMinutes 10
+```
+
+The script defaults to `http://127.0.0.1:8080/api/metrics` and sums processes named `liveguard`. If multiple instances are running, pass `-ProcessId 1234` to select one. `-MetricsUrl` changes the endpoint, `-IntervalSeconds 10` changes the interval, and `-OutputDirectory` changes where results are written. By default, files go to `artifacts/runtime-monitoring/<timestamp>/`:
+
+- `resource-samples.csv`: process memory, cumulative CPU time, OS threads/handles, Go goroutines and heap, plus queue, model-call, token, cost, and alert-latency summaries for each sample.
+- `queue-samples.csv`: waiting count, oldest wait, and reviewing status for each monitor queue at each sample time.
+- `metrics-snapshots.jsonl`: one complete `/api/metrics` JSON snapshot per line for later analysis.
+
+Process CPU seconds and Go `total_alloc_bytes`/GC count are cumulative since process start; memory, goroutine count, and queue length are point-in-time values. Model calls, tokens, and estimated cost are aggregates over the endpoint's current window (24 hours), not the amount added during each 5-second interval. This script observes a real workload; **it does not generate load, replace a benchmark, or provide a production alerting dashboard**. If the metrics endpoint is unavailable, samples are still written with empty metric fields and the error recorded.
+
 ## Multi-window sustained run
 
 In the latest 6-minute stability run, 8 headless Chrome test pages ran alongside screenshots and Tesseract OCR. A mock Reviewer with a 15-second delay simulated slow reviews. All 8 windows ended healthy; each captured 71–73 frames, and 20 frames were skipped due to backlog. This run did not reproduce a multi-window capture stall. The pages were synthetic and do not represent capture quality on a real livestream platform.

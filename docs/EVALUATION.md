@@ -51,6 +51,22 @@ go run ./cmd/monitor-load -mode async -requests 800
 
 这些吞吐数只适用于 mock 后端负载。实际模型服务吞吐受模型响应时间、每条调查调用轮数和输入速率影响；现有真实运行记录不足以形成受控的端到端吞吐测试。
 
+## 真实运行采样
+
+`scripts/capture-runtime.ps1` 可在 LiveGuard 正在运行时定时采集本机资源和 `/api/metrics`。默认每 5 秒采样，按 `Ctrl+C` 停止；也可设置运行时长：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ./scripts/capture-runtime.ps1 -DurationMinutes 10
+```
+
+脚本默认连接 `http://127.0.0.1:8080/api/metrics`，并汇总进程名为 `liveguard` 的进程。如果同时运行多个实例，可传 `-ProcessId 1234` 指定一个；也可用 `-MetricsUrl` 指定指标地址、用 `-IntervalSeconds 10` 调整采样间隔、用 `-OutputDirectory` 指定输出目录。默认结果保存在 `artifacts/runtime-monitoring/<时间戳>/`：
+
+- `resource-samples.csv`：每次采样的进程内存、累计 CPU 时间、线程/句柄数、Go 协程与堆内存，以及队列、模型调用、Token、费用和提醒延迟摘要。
+- `queue-samples.csv`：每个采样时刻各监控队列的等待数、最老等待时间和处理中状态。
+- `metrics-snapshots.jsonl`：每行一份完整 `/api/metrics` JSON 快照，可供后续脚本分析。
+
+进程 CPU 秒数和 Go `total_alloc_bytes`、GC 次数是进程启动以来的累计值；内存、协程数和队列长度是采样时刻的瞬时值。模型调用、Token 和估算费用是指标接口统计窗口内（当前为最近 24 小时）的汇总值，并非该 5 秒采样间隔新增的用量。该脚本用于观察真实工作负载期间的变化，**不会制造负载，也不是压测或生产告警面板**；指标服务不可用时，采样文件仍会写入，但对应字段为空并记录错误。
+
 ## 多窗口持续运行
 
 最近一次 6 分钟稳定性测试同时运行 8 个 headless Chrome 测试页、截图和 Tesseract OCR，并用 15 秒 mock Reviewer 模拟慢复核。8 个窗口结束时均为健康状态，每个窗口截图 71–73 次，共跳过 20 帧积压；本轮没有复现多窗口采集停止。测试页是合成网页，不代表真实直播平台的采集效果。

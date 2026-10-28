@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -55,6 +56,7 @@ type QueueRunMetric struct {
 type RuntimeMetrics struct {
 	GeneratedAt              time.Time        `json:"generated_at"`
 	WindowStart              time.Time        `json:"window_start"`
+	GoRuntime                GoRuntimeMetrics `json:"go_runtime"`
 	QueueWaiting             int              `json:"queue_waiting"`
 	QueueOldestWaitMS        int64            `json:"queue_oldest_wait_ms"`
 	Queues                   []QueueRunMetric `json:"queues"`
@@ -63,6 +65,19 @@ type RuntimeMetrics struct {
 	AverageReceivedToAlertMS int64            `json:"average_received_to_alert_ms"`
 	AverageSignalToAlertMS   int64            `json:"average_signal_to_alert_ms"`
 	AlertHistoryLimited      bool             `json:"alert_history_limited"`
+}
+
+// GoRuntimeMetrics is a point-in-time snapshot of the current Go process.
+// These values are sampled when /api/metrics is requested; they are not a
+// historical time series by themselves.
+type GoRuntimeMetrics struct {
+	Goroutines int    `json:"goroutines"`
+	HeapAlloc  uint64 `json:"heap_alloc_bytes"`
+	HeapInuse  uint64 `json:"heap_inuse_bytes"`
+	HeapSys    uint64 `json:"heap_sys_bytes"`
+	Sys        uint64 `json:"sys_bytes"`
+	TotalAlloc uint64 `json:"total_alloc_bytes"`
+	NumGC      uint32 `json:"num_gc"`
 }
 
 type ModelPricing struct {
@@ -153,7 +168,22 @@ func summarizeCost(summary *ModelCallSummary) {
 // a recent sample, not a lifetime counter.
 func (s *Service) RuntimeMetrics(ctx context.Context) (RuntimeMetrics, error) {
 	now := time.Now().UTC()
-	metrics := RuntimeMetrics{GeneratedAt: now, WindowStart: now.Add(-24 * time.Hour), Queues: []QueueRunMetric{}}
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	metrics := RuntimeMetrics{
+		GeneratedAt: now,
+		WindowStart: now.Add(-24 * time.Hour),
+		GoRuntime: GoRuntimeMetrics{
+			Goroutines: runtime.NumGoroutine(),
+			HeapAlloc:  mem.HeapAlloc,
+			HeapInuse:  mem.HeapInuse,
+			HeapSys:    mem.HeapSys,
+			Sys:        mem.Sys,
+			TotalAlloc: mem.TotalAlloc,
+			NumGC:      mem.NumGC,
+		},
+		Queues: []QueueRunMetric{},
+	}
 	runs, err := s.repository.List(ctx)
 	if err != nil {
 		return metrics, err
