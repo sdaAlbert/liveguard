@@ -27,22 +27,24 @@ type reviewToolResult struct {
 }
 
 type reviewState struct {
-	readEvidenceTurn    int
-	historyEvidence     []SignalEvent
-	historySearches     int
-	contextBudget       *reviewContextBudget
-	searchedHistory     bool
-	searchedCategory    string
-	searchAlertsTurn    int
-	duplicateFound      bool
-	frameInspected      bool
-	frameSavedForReview bool
-	frameInspectTurn    int
-	frameObservedAt     time.Time
-	frameEventID        string
-	frameArchiveID      string
-	frameAsset          *FrameAsset
-	frameAssetOwned     bool
+	readEvidenceTurn     int
+	historyEvidence      []SignalEvent
+	seenEvidenceIDs      map[string]bool
+	historyRecordsReused int
+	historySearches      int
+	contextBudget        *reviewContextBudget
+	searchedHistory      bool
+	searchedCategory     string
+	searchAlertsTurn     int
+	duplicateFound       bool
+	frameInspected       bool
+	frameSavedForReview  bool
+	frameInspectTurn     int
+	frameObservedAt      time.Time
+	frameEventID         string
+	frameArchiveID       string
+	frameAsset           *FrameAsset
+	frameAssetOwned      bool
 }
 
 const maxObservationSearchPages = 6
@@ -156,6 +158,9 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 		}
 	}
 	if block.Name == "search_observations" {
+		if state.seenEvidenceIDs == nil {
+			state.seenEvidenceIDs = make(map[string]bool)
+		}
 		if state.contextBudget != nil && state.contextBudget.exhausted {
 			result.IsError, result.Content, result.Outcome = true, `{"error":"investigation evidence context budget exhausted; stop searching and decide from evidence already returned"}`, "本次调查的历史证据上下文已满，停止继续检索"
 			return result, UnexpectedEventDecision{}, false
@@ -233,15 +238,31 @@ func (r *AgentReviewer) executeTool(ctx context.Context, block agent.ToolCall, i
 		if args.Scope == "all" {
 			state.searchedHistory = true
 		}
-		modelEvents, acceptedEvents, contextTruncated := state.contextBudget.compactObservationPage(page.Events)
+		newEvents := make([]SignalEvent, 0, len(page.Events))
+		alreadyInContext := 0
+		for _, event := range page.Events {
+			if state.seenEvidenceIDs[event.ID] {
+				alreadyInContext++
+				continue
+			}
+			newEvents = append(newEvents, event)
+		}
+		state.historyRecordsReused += alreadyInContext
+		modelEvents, acceptedEvents, contextTruncated := state.contextBudget.compactObservationPage(newEvents)
 		contextTruncated = contextTruncated || state.contextBudget.exhausted && page.HasMore
 		state.historyEvidence = append(state.historyEvidence, acceptedEvents...)
+		for _, event := range acceptedEvents {
+			state.seenEvidenceIDs[event.ID] = true
+		}
 		var nextBefore, nextBeforeSequence, nextBeforeID any
 		if page.HasMore && !contextTruncated {
 			nextBefore, nextBeforeSequence, nextBeforeID = page.NextBefore, page.NextBeforeSequence, page.NextBeforeEventID
 		}
-		encoded, _ := json.Marshal(map[string]any{"observations": modelEvents, "count_returned": len(modelEvents), "total_matches": page.TotalMatches, "count_semantics": "matching observation records, not distinct real-world events", "has_more": page.HasMore || contextTruncated, "context_budget_exhausted": contextTruncated, "next_before": nextBefore, "next_before_sequence": nextBeforeSequence, "next_before_id": nextBeforeID, "limit": query.Limit})
-		outcome := fmt.Sprintf("从%s观测记录中找到 %d 条", map[bool]string{true: "整场", false: "近期"}[args.Scope == "all"], len(modelEvents))
+		encoded, _ := json.Marshal(map[string]any{"observations": modelEvents, "count_returned": len(modelEvents), "already_in_context": alreadyInContext, "total_matches": page.TotalMatches, "count_semantics": "matching observation records, not distinct real-world events", "has_more": page.HasMore || contextTruncated, "context_budget_exhausted": contextTruncated, "next_before": nextBefore, "next_before_sequence": nextBeforeSequence, "next_before_id": nextBeforeID, "limit": query.Limit})
+		// Report matched records, including ones already present in the prompt. The
+		// model payload still omits duplicates; the audit outcome describes the
+		// search result rather than only newly added context.
+		outcome := fmt.Sprintf("从%s观测记录中找到 %d 条", map[bool]string{true: "整场", false: "近期"}[args.Scope == "all"], len(modelEvents)+alreadyInContext)
 		if contextTruncated {
 			outcome += "；本次调查上下文已满，停止继续检索"
 		} else if page.HasMore {

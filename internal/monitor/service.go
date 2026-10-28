@@ -414,6 +414,7 @@ func (s *Service) UpdateGoal(ctx context.Context, id, goal string) (*Run, error)
 		run.UserInstructions = nil
 		run.Plan = plan
 		run.GoalVersion++
+		run.InvestigationMemory = nil
 		run.GoalUpdatedAt = time.Now().UTC()
 		run.Sampling = initialSampling(plan, run.GoalUpdatedAt)
 		if run.SourceMode == "browser_ocr" {
@@ -1096,7 +1097,9 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 				GoalVersion: snapshot.GoalVersion, GoalUpdatedAt: snapshot.GoalUpdatedAt,
 				Goal: snapshot.Goal, UserInstructions: append([]string(nil), snapshot.UserInstructions...),
 				Plan: snapshot.Plan, Baseline: snapshot.Baseline, Sampling: sampling, FrameCheck: frameCheck, RecentEvidence: recent,
-				RecentAlerts: snapshot.Alerts, TriggerFrameObservedAt: event.ObservedAt,
+				RecentAlerts:           snapshot.Alerts,
+				RecentMemory:           selectInvestigationMemory(snapshot.InvestigationMemory, snapshot.GoalVersion, event.RoomID, time.Now().UTC()),
+				TriggerFrameObservedAt: event.ObservedAt,
 				UpdateGoal: func(updateCtx context.Context, goal string) (*Run, error) {
 					current, getErr := s.repository.Get(updateCtx, runID)
 					if getErr != nil {
@@ -1736,8 +1739,9 @@ func applyUnexpectedReviewTo(run *Run, event SignalEvent, decision UnexpectedEve
 		} else {
 			run.Investigations = append(run.Investigations, inv)
 		}
+		updateInvestigationMemory(run, inv, decision, now)
 	}
-	inv.Review = &ReviewMetrics{Model: decision.Model, InputTokens: decision.InputTokens, OutputTokens: decision.OutputTokens, LatencyMS: decision.LatencyMS, Turns: decision.Turns, StopReason: decision.StopReason}
+	inv.Review = &ReviewMetrics{Model: decision.Model, InputTokens: decision.InputTokens, OutputTokens: decision.OutputTokens, LatencyMS: decision.LatencyMS, Turns: decision.Turns, StopReason: decision.StopReason, HistoryRecordsReused: decision.HistoryRecordsReused}
 	inv.Review.FormatRepairs = decision.Repairs
 	inv.Review.TransportRetries = decision.TransportRetries
 	if len(decision.UsedEvidence) > 0 {

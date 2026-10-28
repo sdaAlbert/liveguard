@@ -122,7 +122,9 @@ func (s *Service) resumeClarifiedInvestigation(runID, investigationID string) {
 	input := UnexpectedEventInput{
 		EvidenceAt: time.Now().UTC(), GoalVersion: run.GoalVersion, GoalUpdatedAt: run.GoalUpdatedAt,
 		Goal: run.Goal, UserClarification: inv.UserAnswer, UserInstructions: append([]string(nil), run.UserInstructions...), Plan: planForReviewer(run.Plan, run.Goal, reviewer),
-		RecentEvidence: recent, RecentAlerts: run.Alerts, TriggerFrameObservedAt: event.ObservedAt,
+		RecentEvidence: recent, RecentAlerts: run.Alerts,
+		RecentMemory:           selectInvestigationMemory(run.InvestigationMemory, run.GoalVersion, event.RoomID, time.Now().UTC()),
+		TriggerFrameObservedAt: event.ObservedAt,
 		UpdateGoal: func(updateCtx context.Context, goal string) (*Run, error) {
 			current, getErr := s.repository.Get(updateCtx, runID)
 			if getErr != nil {

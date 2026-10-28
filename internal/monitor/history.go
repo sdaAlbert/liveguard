@@ -1,5 +1,7 @@
 package monitor
 
+import "time"
+
 const (
 	maxRunEvents             = 2000
 	maxRunInvestigations     = 500
@@ -15,6 +17,7 @@ func boundRunHistory(run *Run) {
 	if run == nil {
 		return
 	}
+	pruneInvestigationMemory(run, time.Now().UTC())
 	if len(run.Events) > maxRunEvents {
 		run.Events = append([]SignalEvent(nil), run.Events[len(run.Events)-maxRunEvents:]...)
 		run.HistoryTruncated = true

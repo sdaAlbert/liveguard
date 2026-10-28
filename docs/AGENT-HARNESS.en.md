@@ -118,13 +118,18 @@ One edge case needs precise wording: a signal that has expired by the time it re
 
 ## 7. Context, images, and runtime records
 
+- `search_observations` is on demand, not a mandatory step in every Investigation. When the triggering signal is sufficient, the Agent can finish or propose an alert directly; it searches when timeline, status, or counterevidence could change the decision. One Investigation allows at most 6 history-search calls, 8 tool calls total by default, and 6 model turns. Run-scoped `InvestigationMemory` is injected as bounded historical context without an extra retrieval call, but it cannot be cited as alert evidence.
 - The first model turn can include up to 6 recent observations, with up to 600 characters per observation. History search allows up to 6 pages, 12 records per page, and 400 characters of source text per record.
+- Each Investigation can include up to 5 `InvestigationMemory` notes from the same goal version, expiring 24 hours after their evidence. Each note keeps up to 3 evidence references. Goal changes clear older-version notes; the Agent treats notes as historical leads, and a current alert still requires evidence validated in the current Investigation.
 - A single investigation's history-search results are capped at 12,000 Unicode characters. If that budget is reached, only whole records that fit are returned and the model is told not to keep paging.
 - The 12,000-character history budget does **not** include the system prompt, tool definitions, images, assistant responses, or other context. It is not a global token limit for model input.
 - Each model response is capped at 4,096 output tokens. Actual input and output usage is recorded in review metrics and model logs.
 - During an investigation, `Observation` temporarily carries tool calls, tool outputs, and timing for the next turn. Persisted `AgentStep` records the tool name, purpose, result summary, success flag, and duration. Review metrics record model, token usage, total duration, turn count, stop reason, format corrections, and transport retries.
 - Persisted records do not guarantee the full model prompt, every raw tool argument, or every raw tool response. There is no one-click replay of a complete investigation. Say “tool-step summaries and runtime metrics are recorded,” not “every part of the Agent trace is stored.”
 - Image use is bounded by image size, investigation scope, and temporary-file lifetime. Whether image understanding is available depends on actual model configuration and archived evidence. OCR text alone is not a visual conclusion.
+- Starting on turn 4, earlier text tool results may be compacted into a summary with evidence IDs, sources, and timestamps while retaining the fixed goal/plan prefix and latest tool round. Investigations containing image results skip this compaction. This reduces one Investigation's session context; it is not cross-investigation memory or a global token hard limit.
+
+This first memory layer stores investigation notes, not entity-level event lifecycle state, a vector database, or cross-Run user profiles. Its quality still needs a fixed-event evaluation comparing accuracy, stale-memory influence, latency, and token cost with memory disabled.
 
 “Async task” does not mean “streaming model tokens.” Investigations run in a background queue; the browser receives state updates over HTTP/SSE. SSE sends state-change hints, not each token as the model generates it.
 

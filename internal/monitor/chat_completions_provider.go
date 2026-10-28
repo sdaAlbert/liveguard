@@ -46,17 +46,37 @@ func (p *ChatCompletionsProvider) NewSession(config ModelSessionConfig) ModelSes
 		}
 		initial = parts
 	}
-	return &chatSession{model: p, config: config, messages: []any{
+	prefix := []any{
 		map[string]any{"role": "system", "content": config.System},
 		map[string]any{"role": "user", "content": initial},
-	}}
+	}
+	return &chatSession{model: p, config: config, prefix: prefix, messages: append([]any(nil), prefix...)}
 }
 
 type chatSession struct {
 	model    *ChatCompletionsProvider
 	config   ModelSessionConfig
+	prefix   []any
 	messages []any
 }
+
+func (s *chatSession) CompactContext(memory string) bool {
+	if len(s.messages) <= len(s.prefix)+1 {
+		return false
+	}
+	latest, ok := s.messages[len(s.messages)-1].(map[string]any)
+	if !ok || latest["role"] != "assistant" {
+		return false
+	}
+	compacted := append([]any(nil), s.prefix...)
+	if strings.TrimSpace(memory) != "" {
+		compacted = append(compacted, map[string]any{"role": "user", "content": memory})
+	}
+	compacted = append(compacted, latest)
+	s.messages = compacted
+	return true
+}
+
 type chatCompletionResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {

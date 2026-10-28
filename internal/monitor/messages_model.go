@@ -33,14 +33,34 @@ func (m *MessagesModel) NewSession(config ModelSessionConfig) ModelSession {
 	if len(config.InitialContent) > 0 {
 		content = messagesToolContent(config.InitialContent)
 	}
-	return &messagesSession{model: m, config: config, messages: []map[string]any{{"role": "user", "content": content}}}
+	initial := map[string]any{"role": "user", "content": content}
+	return &messagesSession{model: m, config: config, prefix: []map[string]any{initial}, messages: []map[string]any{initial}}
 }
 
 type messagesSession struct {
 	model    *MessagesModel
 	config   ModelSessionConfig
+	prefix   []map[string]any
 	messages []map[string]any
 }
+
+func (s *messagesSession) CompactContext(memory string) bool {
+	if len(s.messages) <= len(s.prefix)+1 {
+		return false
+	}
+	latest := s.messages[len(s.messages)-1]
+	if latest["role"] != "assistant" {
+		return false
+	}
+	compacted := append([]map[string]any(nil), s.prefix...)
+	if strings.TrimSpace(memory) != "" {
+		compacted = append(compacted, map[string]any{"role": "user", "content": memory})
+	}
+	compacted = append(compacted, latest)
+	s.messages = compacted
+	return true
+}
+
 type miniMaxContentBlock struct {
 	Type  string          `json:"type"`
 	ID    string          `json:"id,omitempty"`

@@ -188,11 +188,15 @@ Continuity comes from searchable observations and structured business state, not
 | `RunLedger` | Stores complete OCR/ASR/frame/vision observations and supports paginated search. SQLite and JSON file modes persist it; Memory Repository keeps data only in process. |
 | `Pending` | SQLite persists waiting signals and reclaims valid in-flight work after restart; JSON and memory modes keep queue state in process only. |
 | `Investigation` | One investigation's state, reason, evidence, tool trace, and token/time metrics. It can wait if evidence is insufficient; a later investigation can search history again. |
+| `InvestigationMemory` | Up to 32 Run-scoped notes that expire 24 hours after their evidence; later investigations on the same goal version use them as historical leads, never as current event state or alert evidence. |
 | `Alert` | An alert accepted by the backend. Whether a browser user has read it is maintained separately by the frontend; it is not a third-party delivery receipt. |
 
 Run snapshots keep at most 2,000 Events, 500 Investigations, and 500 Alerts. An Investigation keeps at most 100 Evidence items and 64 tool Steps. The full history is separate in `RunLedger`, so trimming the console snapshot does not impose the same limit on observation search. Historical observations and archived images have no automatic cleanup policy, so storage grows.
 
-`InvestigationWaitingUser`, queue `Waiting`, and an event marked “needs confirmation” are different. The first means the investigation asked the user a question; queue waiting means work has not run. There is no separate event-state ledger linking announcement, start, delay, and cancellation; these are represented in observations and investigation explanations. Go owns `GoalVersion`, Run state, and contexts so model memory is not the source of truth.
+`InvestigationWaitingUser`, queue `Waiting`, and an event marked “needs confirmation” are different. The first means the investigation asked the user a question; queue waiting means work has not run. There is no separate business state ledger linking announcement, start, delay, and cancellation; these are represented in observations and investigation explanations. Go owns `GoalVersion`, Run state, and context so model memory is not the source of truth.
+
+`InvestigationMemory` is a bounded, expiring note from a completed investigation. It keeps the goal version, room, conclusion, timestamp, and up to three evidence references in the persisted Run snapshot; it is derived without an extra model call. A later investigation receives at most five notes, preferring the same room and newer entries. Updating the goal clears notes from the prior version. The model may use a note to guide history search, but not to prove current status or cite a new alert.
+
 
 ## Sampling policy and cost limits
 

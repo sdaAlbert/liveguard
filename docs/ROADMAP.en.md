@@ -1,6 +1,6 @@
 # LiveGuard Improvement Roadmap
 
-Last reviewed: 2026-10-15
+Last reviewed: 2026-10-27
 
 This document collects known problems and possible improvements so collaborators can discuss work, split it into tasks, and agree on evidence. The items below are **candidates**. They are not scheduled or promised, and every item is currently “Candidate — discussion needed.”
 

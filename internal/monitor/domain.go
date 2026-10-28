@@ -139,16 +139,17 @@ type AgentStep struct {
 }
 
 type ReviewMetrics struct {
-	TransportRetries int               `json:"transport_retries,omitempty"`
-	SamplingProposal *SamplingProposal `json:"sampling_proposal,omitempty"`
-	SamplingPolicy   SamplingState     `json:"sampling_policy"`
-	Model            string            `json:"model,omitempty"`
-	InputTokens      int64             `json:"input_tokens"`
-	OutputTokens     int64             `json:"output_tokens"`
-	LatencyMS        int64             `json:"latency_ms"`
-	Turns            int               `json:"turns"`
-	StopReason       string            `json:"stop_reason,omitempty"`
-	FormatRepairs    int               `json:"format_repairs,omitempty"`
+	TransportRetries     int               `json:"transport_retries,omitempty"`
+	HistoryRecordsReused int               `json:"history_records_reused,omitempty"`
+	SamplingProposal     *SamplingProposal `json:"sampling_proposal,omitempty"`
+	SamplingPolicy       SamplingState     `json:"sampling_policy"`
+	Model                string            `json:"model,omitempty"`
+	InputTokens          int64             `json:"input_tokens"`
+	OutputTokens         int64             `json:"output_tokens"`
+	LatencyMS            int64             `json:"latency_ms"`
+	Turns                int               `json:"turns"`
+	StopReason           string            `json:"stop_reason,omitempty"`
+	FormatRepairs        int               `json:"format_repairs,omitempty"`
 }
 
 type Investigation struct {
@@ -168,6 +169,21 @@ type Investigation struct {
 	CreatedAt    time.Time      `json:"created_at"`
 	UpdatedAt    time.Time      `json:"updated_at"`
 	Review       *ReviewMetrics `json:"review,omitempty"`
+}
+
+// InvestigationMemory is a bounded, expiring note from a completed
+// investigation. It helps later investigations find relevant history, but it
+// is not a claim that the event is still current or standalone alert evidence.
+type InvestigationMemory struct {
+	GoalVersion uint64     `json:"goal_version"`
+	ID          string     `json:"id"`
+	RoomID      string     `json:"room_id,omitempty"`
+	EventType   string     `json:"event_type,omitempty"`
+	Outcome     string     `json:"outcome"`
+	Note        string     `json:"note"`
+	Evidence    []Evidence `json:"evidence,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   time.Time  `json:"expires_at"`
 }
 
 type Alert struct {
@@ -206,33 +222,34 @@ type MonitoringPlan struct {
 }
 
 type Run struct {
-	StopReason              string          `json:"stop_reason,omitempty"`
-	LastError               string          `json:"last_error,omitempty"`
-	Pending                 *PendingStatus  `json:"pending,omitempty"`
-	ID                      string          `json:"id"`
-	Name                    string          `json:"name"`
-	TargetURL               string          `json:"target_url"`
-	Goal                    string          `json:"goal"`
-	UserInstructions        []string        `json:"user_instructions,omitempty"`
-	GoalVersion             uint64          `json:"goal_version"`
-	GoalUpdatedAt           time.Time       `json:"goal_updated_at"`
-	Plan                    MonitoringPlan  `json:"plan"`
-	Baseline                *LiveBaseline   `json:"baseline,omitempty"`
-	Sampling                SamplingState   `json:"sampling"`
-	SourceMode              string          `json:"source_mode"`
-	Status                  RunStatus       `json:"status"`
-	Rooms                   []Room          `json:"rooms"`
-	Events                  []SignalEvent   `json:"events"`
-	EventReceipts           []EventReceipt  `json:"event_receipts,omitempty"`
-	EventSequence           uint64          `json:"event_sequence,omitempty"`
-	Investigations          []Investigation `json:"investigations"`
-	Alerts                  []Alert         `json:"alerts"`
-	StartedAt               time.Time       `json:"started_at"`
-	UpdatedAt               time.Time       `json:"updated_at"`
-	CompletedAt             *time.Time      `json:"completed_at,omitempty"`
-	Version                 int64           `json:"version"`
-	HistoryTruncated        bool            `json:"history_truncated,omitempty"`
-	ReviewBackpressureCount int             `json:"review_backpressure_count,omitempty"`
+	StopReason              string                `json:"stop_reason,omitempty"`
+	LastError               string                `json:"last_error,omitempty"`
+	Pending                 *PendingStatus        `json:"pending,omitempty"`
+	ID                      string                `json:"id"`
+	Name                    string                `json:"name"`
+	TargetURL               string                `json:"target_url"`
+	Goal                    string                `json:"goal"`
+	UserInstructions        []string              `json:"user_instructions,omitempty"`
+	GoalVersion             uint64                `json:"goal_version"`
+	GoalUpdatedAt           time.Time             `json:"goal_updated_at"`
+	Plan                    MonitoringPlan        `json:"plan"`
+	Baseline                *LiveBaseline         `json:"baseline,omitempty"`
+	Sampling                SamplingState         `json:"sampling"`
+	SourceMode              string                `json:"source_mode"`
+	Status                  RunStatus             `json:"status"`
+	Rooms                   []Room                `json:"rooms"`
+	Events                  []SignalEvent         `json:"events"`
+	EventReceipts           []EventReceipt        `json:"event_receipts,omitempty"`
+	EventSequence           uint64                `json:"event_sequence,omitempty"`
+	Investigations          []Investigation       `json:"investigations"`
+	InvestigationMemory     []InvestigationMemory `json:"investigation_memory,omitempty"`
+	Alerts                  []Alert               `json:"alerts"`
+	StartedAt               time.Time             `json:"started_at"`
+	UpdatedAt               time.Time             `json:"updated_at"`
+	CompletedAt             *time.Time            `json:"completed_at,omitempty"`
+	Version                 int64                 `json:"version"`
+	HistoryTruncated        bool                  `json:"history_truncated,omitempty"`
+	ReviewBackpressureCount int                   `json:"review_backpressure_count,omitempty"`
 }
 
 type Summary struct {

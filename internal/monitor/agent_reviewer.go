@@ -76,8 +76,9 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		"user_clarification": strings.TrimSpace(input.UserClarification),
 		"user_instructions":  input.UserInstructions,
 		"monitor_plan":       input.Plan, "sampling_state": input.Sampling,
-		"live_baseline": input.Baseline,
-		"frame_check":   input.FrameCheck, "server_time": time.Now().UTC(),
+		"live_baseline":                   input.Baseline,
+		"historical_investigation_memory": input.RecentMemory,
+		"frame_check":                     input.FrameCheck, "server_time": time.Now().UTC(),
 		"frame_available": frameAvailable, "model_capabilities": caps,
 		"triggering_signal": evidence[0],
 	})
@@ -104,7 +105,13 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		System:  reviewInstructions(),
 		Initial: string(initial), Tools: toolDefinitions(definitions), MaxOutputTokens: reviewMaxOutputTokens, EnsureRequiredTool: true,
 	})
-	state := reviewState{readEvidenceTurn: -1, searchAlertsTurn: -1, frameInspectTurn: -1, contextBudget: newReviewContextBudget()}
+	state := reviewState{
+		readEvidenceTurn: -1, searchAlertsTurn: -1, frameInspectTurn: -1,
+		contextBudget: newReviewContextBudget(), seenEvidenceIDs: make(map[string]bool),
+	}
+	if eventID := input.RecentEvidence[0].ID; eventID != "" {
+		state.seenEvidenceIDs[eventID] = true
+	}
 	defer func() {
 		if state.frameAssetOwned && state.frameAsset != nil {
 			_ = os.Remove(state.frameAsset.Path)
@@ -124,10 +131,20 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	loop := agent.Loop{Limits: r.Limits, Tools: tools, TerminalTools: map[string]bool{"create_alert": true, "request_user_input": true, "update_monitoring_goal": true}}
 	var inTokens, outTokens int64
 	var retries int
+	var priorToolObservations []agent.Observation
 	model := r.Model.ModelID()
 	feedback := ""
 	ctx = withModelCallTrace(ctx, eventID, attemptID, -1)
 	result, loopErr := loop.Run(ctx, func(turnCtx context.Context, previous []agent.Observation, turn int) (agent.ModelTurn, error) {
+		if turn >= compactSessionAfterTurn && feedback == "" {
+			if compactor, ok := session.(modelSessionCompactor); ok {
+				if memory, ready := compactInvestigationMemory(priorToolObservations); ready {
+					if compactor.CompactContext(memory) {
+						log.Printf("agent session context compacted: review_id=%q attempt_id=%q turn=%d prior_tool_results=%d memory_chars=%d", eventID, attemptID, turn+1, len(priorToolObservations), runeCount(memory))
+					}
+				}
+			}
+		}
 		turnCtx = withModelCallTrace(turnCtx, eventID, attemptID, turn+1)
 		requiredTool := ""
 		if turn == 0 && frameAvailable && reviewRequiresVision(input) {
@@ -136,6 +153,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		log.Printf("agent model turn started: review_id=%q attempt_id=%q event_id=%q turn=%d previous_tool_results=%d required_tool=%q context_budget_ms=%d", eventID, attemptID, eventID, turn+1, len(previous), requiredTool, deadlineBudget(turnCtx))
 		reply, err := session.Next(turnCtx, previous, requiredTool, feedback)
 		feedback = ""
+		priorToolObservations = append(priorToolObservations, previous...)
 		retries += reply.TransportRetries
 		inTokens += reply.InputTokens
 		outTokens += reply.OutputTokens
@@ -174,6 +192,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		})
 	}
 	decision.StopReason, decision.Turns, decision.Repairs = result.StopReason, result.Turns, result.Repairs
+	decision.HistoryRecordsReused = state.historyRecordsReused
 	if state.readEvidenceTurn >= 0 && decision.Action != "alert" {
 		used := map[string]bool{}
 		for _, event := range state.historyEvidence {
@@ -181,10 +200,15 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 				continue
 			}
 			used[event.ID] = true
-			decision.UsedEvidence = append(decision.UsedEvidence, Evidence{
+			item := Evidence{
+				GoalVersion: event.GoalVersion, RoomID: event.RoomID,
 				EventID: event.ID, Source: string(event.Source), Text: boundedReviewText(event.Text, 400),
 				Confidence: event.Confidence, ObservedAt: event.ObservedAt,
-			})
+			}
+			if item.GoalVersion == 0 {
+				item.GoalVersion = input.GoalVersion
+			}
+			decision.UsedEvidence = append(decision.UsedEvidence, item)
 		}
 	}
 	decision.TransportRetries = retries
@@ -203,7 +227,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 			r.Breaker.Success()
 		}
 	}
-	log.Printf("agent review finished: review_id=%q attempt_id=%q event_id=%q model=%q stop_reason=%s turns=%d tools=%d input_tokens=%d output_tokens=%d latency_ms=%d error=%q", eventID, attemptID, eventID, model, decision.StopReason, decision.Turns, len(result.Observations), decision.InputTokens, decision.OutputTokens, decision.LatencyMS, loopErr)
+	log.Printf("agent review finished: review_id=%q attempt_id=%q event_id=%q model=%q stop_reason=%s turns=%d tools=%d history_records_reused=%d input_tokens=%d output_tokens=%d latency_ms=%d error=%q", eventID, attemptID, eventID, model, decision.StopReason, decision.Turns, len(result.Observations), decision.HistoryRecordsReused, decision.InputTokens, decision.OutputTokens, decision.LatencyMS, loopErr)
 	return decision, loopErr
 }
 
@@ -227,6 +251,11 @@ func userClarificationAllowed(input UnexpectedEventInput) bool {
 
 func boundedReviewInput(input UnexpectedEventInput) UnexpectedEventInput {
 	input.RecentEvidence = append([]SignalEvent(nil), input.RecentEvidence[:min(len(input.RecentEvidence), 6)]...)
+	if len(input.RecentEvidence) > 0 {
+		input.RecentMemory = selectInvestigationMemory(input.RecentMemory, input.GoalVersion, input.RecentEvidence[0].RoomID, time.Now().UTC())
+	} else {
+		input.RecentMemory = nil
+	}
 	for i := range input.RecentEvidence {
 		input.RecentEvidence[i].Text = boundedReviewText(input.RecentEvidence[i].Text, 600)
 	}
