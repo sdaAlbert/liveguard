@@ -14,6 +14,7 @@ It supports livestream pages from Douyin, Bilibili, Kuaishou, and similar platfo
 - Optionally transcribes browser audio that you explicitly share; the current ASR integration uses MiniMax.
 - Uses an agent to investigate signals, search recorded observations, and inspect a frame when needed.
 - Carries bounded investigation memory across later reviews of the same monitoring goal. Notes are persisted with the Run, expire after 24 hours, and guide historical searches; current alerts still require evidence from the current investigation.
+- Tracks appearance and disappearance of explicit OCR target terms on screen. A disappearance requires three consecutive successful samples without the term; text no longer visible on screen does not prove an item was delisted or is out of stock.
 - Stores monitor state, observations, and recoverable pending signals in local SQLite. JSON is available for inspection and archiving through an export command.
 - The web interface can switch between English and Simplified Chinese using the language button in the monitoring room; the selection is remembered in the browser. Stream names, monitoring goals, evidence, and agent-generated findings remain in their original language.
 
@@ -58,6 +59,7 @@ LiveGuard only analyzes signals it captures; sampling intervals, visible page co
 ## Update history
 
 - **2026-10 — Bounded investigation memory:** Completed investigations can leave short, evidence-linked notes for later reviews of the same goal. Notes are persisted with the Run, capped at 32 stored and 5 supplied to a review, expire after 24 hours, and are cleared when the goal changes. They are historical leads only; the observation ledger remains the source of truth and a new alert must cite evidence validated in its current investigation.
+- **2026-10 — OCR visibility tracking:** Explicit target terms can produce appearance and disappearance signals from recognized screen text. Disappearance requires three consecutive successful OCR samples without a match; it reports on-screen visibility, not product availability.
 - **2026-10 — SQLite persistence:** Replaced runtime JSON snapshot and JSONL storage plus the in-memory pending queue with SQLite. This brings monitor state, observations, and accepted pending signals under one transactional store, so valid queued work can be recovered after restart. The duplicate JSON runtime repository was removed; JSON export remains for inspection and archiving and does not include pending work.
 
 ## Security and privacy

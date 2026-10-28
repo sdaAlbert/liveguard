@@ -16,10 +16,18 @@ func (s *Service) ingestCapturedFrame(ctx context.Context, runID string, event S
 }
 
 func (s *Service) submitCapturedFrame(ctx context.Context, runID string, event SignalEvent, deduper *OCRLineDeduper) error {
-	return s.handleCapturedFrame(ctx, runID, event, deduper, s.SubmitSignal)
+	return s.submitCapturedFrameWithPresence(ctx, runID, event, deduper, nil)
+}
+
+func (s *Service) submitCapturedFrameWithPresence(ctx context.Context, runID string, event SignalEvent, deduper *OCRLineDeduper, presence *OCRPresenceTracker) error {
+	return s.handleCapturedFrameWithPresence(ctx, runID, event, deduper, presence, s.SubmitSignal)
 }
 
 func (s *Service) handleCapturedFrame(ctx context.Context, runID string, event SignalEvent, deduper *OCRLineDeduper, submit func(context.Context, string, SignalEvent) error) error {
+	return s.handleCapturedFrameWithPresence(ctx, runID, event, deduper, nil, submit)
+}
+
+func (s *Service) handleCapturedFrameWithPresence(ctx context.Context, runID string, event SignalEvent, deduper *OCRLineDeduper, presence *OCRPresenceTracker, submit func(context.Context, string, SignalEvent) error) error {
 	run, err := s.repository.Get(ctx, runID)
 	if err != nil {
 		return err
@@ -52,7 +60,22 @@ func (s *Service) handleCapturedFrame(ctx context.Context, runID string, event S
 	if run.GoalVersion > 1 && event.ObservedAt.Before(run.GoalUpdatedAt) {
 		return recordFrame("归档截图：目标更新前采样")
 	}
+	transitions, commitPresence := presence.Preview(event.Text, event.ObservedAt)
 	text, commitDedupe := deduper.Preview(event.Text, event.ObservedAt)
+	if len(transitions) > 0 {
+		event.Text = formatPresenceTransitions(transitions)
+		if text != "" {
+			event.Text += "\n本次新识别文字：" + text
+		}
+		for _, part := range splitCapturedOCR(event) {
+			if err := submit(ctx, runID, part); err != nil {
+				return err
+			}
+		}
+		commitDedupe()
+		commitPresence()
+		return nil
+	}
 	if text != "" {
 		event.Text = text
 		newLines := map[string]bool{}
@@ -72,9 +95,30 @@ func (s *Service) handleCapturedFrame(ctx context.Context, runID string, event S
 			}
 		}
 		commitDedupe()
+		commitPresence()
 		return nil
 	}
-	return recordFrame("归档截图：OCR 与近期文字重复")
+	if err := recordFrame("归档截图：OCR 与近期文字重复"); err != nil {
+		return err
+	}
+	commitPresence()
+	return nil
+}
+
+func formatPresenceTransitions(transitions []presenceTransition) string {
+	parts := make([]string, 0, len(transitions))
+	for _, transition := range transitions {
+		if transition.Kind == "appeared" {
+			parts = append(parts, "【OCR可见状态变化】目标“"+transition.Term+"”在本次画面中出现。匹配原文：“"+transition.MatchedText+"”。")
+			continue
+		}
+		lastSeen := ""
+		if !transition.LastSeenAt.IsZero() {
+			lastSeen = transition.LastSeenAt.UTC().Format(time.RFC3339)
+		}
+		parts = append(parts, "【OCR可见状态变化】目标“"+transition.Term+"”连续 3 次成功采样未出现在识别文字中。最后一次匹配时间："+lastSeen+"；最后匹配原文：“"+transition.MatchedText+"”。这只表示目标文字当前未见于可读画面，不证明商品已下架或售罄。")
+	}
+	return strings.Join(parts, "\n")
 }
 
 // OCR is an internal observation, not a user request. Preserve long frames as

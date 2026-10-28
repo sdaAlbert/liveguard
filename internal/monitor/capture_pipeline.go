@@ -188,6 +188,7 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 		}
 	}()
 	var deduper OCRLineDeduper
+	var presenceTracker OCRPresenceTracker
 	var version uint64
 	for {
 		select {
@@ -210,6 +211,7 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 					version = run.GoalVersion
 					deduper = OCRLineDeduper{}
 				}
+				presenceTracker.Configure(run.GoalVersion, run.Plan.PresenceTerms)
 				started := time.Now()
 				select {
 				case s.ocrSlots <- struct{}{}:
@@ -245,7 +247,7 @@ func (s *Service) perceptionLoop(ctx context.Context, runID string, jobs <-chan 
 				if err = coordinatePerception(ctx, results, version, nil, time.Duration(event.PerceptionDurationMS)*time.Millisecond); err != nil {
 					return err
 				}
-				err = s.submitCapturedFrame(ctx, runID, event, &deduper)
+				err = s.submitCapturedFrameWithPresence(ctx, runID, event, &deduper, &presenceTracker)
 				if errors.Is(err, ErrPendingFull) || errors.Is(err, ErrFrameBudget) {
 					return nil
 				}

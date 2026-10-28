@@ -56,7 +56,7 @@ func defaultGoalPlan(goal, planner string) MonitoringPlan {
 	return MonitoringPlan{
 		Summary: strategy, CaptureIntervalSeconds: captureSeconds, ReviewIntervalSeconds: reviewSeconds,
 		UseOCR: true, RecommendASR: asr, VisionPolicy: visionPolicy, Tools: tools,
-		UserConsent: consent, Planner: planner,
+		PresenceTerms: presenceTermsFromGoal(goal), UserConsent: consent, Planner: planner,
 		Signals:    signals,
 		AlertScope: alertScope,
 	}
@@ -69,6 +69,10 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 	}
 	if runes := []rune(plan.Summary); len(runes) > 280 {
 		plan.Summary = string(runes[:280])
+	}
+	plan.PresenceTerms = normalizePresenceTerms(plan.PresenceTerms, goal)
+	if len(plan.PresenceTerms) == 0 {
+		plan.PresenceTerms = presenceTermsFromGoal(goal)
 	}
 	// OCR coverage is intentionally independent from Agent review cadence.
 	// The local text pass runs at one-second intervals unless deployment config
@@ -145,6 +149,9 @@ func normalizeMonitoringPlan(plan MonitoringPlan, goal string) MonitoringPlan {
 func summarizeMonitoringPlan(plan MonitoringPlan) string {
 	parts := []string{fmt.Sprintf("本地 OCR 每 %d 秒采样", plan.CaptureIntervalSeconds)}
 	parts = append(parts, fmt.Sprintf("有新信号时最短每 %d 秒交给 Agent 复核", plan.ReviewIntervalSeconds))
+	if len(plan.PresenceTerms) > 0 {
+		parts = append(parts, fmt.Sprintf("跟踪 %q 在可见 OCR 画面中的出现与消失", strings.Join(plan.PresenceTerms, "、")))
+	}
 	if plan.RecommendASR {
 		parts = append(parts, "建议你授权开启口播识别")
 	} else {

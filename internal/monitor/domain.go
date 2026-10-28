@@ -215,6 +215,7 @@ type MonitoringPlan struct {
 	VisionPolicy           string             `json:"vision_policy"`
 	AlertScope             string             `json:"alert_scope"`
 	Tools                  []string           `json:"tools"`
+	PresenceTerms          []string           `json:"presence_terms,omitempty"`
 	UserConsent            []string           `json:"user_consent,omitempty"`
 	Planner                string             `json:"planner"`
 	Signals                []string           `json:"signals"`

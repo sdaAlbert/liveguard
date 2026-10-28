@@ -17,6 +17,9 @@ func numericRevision(a, b SignalEvent) bool {
 	if a.RoomID != b.RoomID || a.Source != b.Source || a.Source == SignalFrame || b.ObservedAt.Before(a.ObservedAt) {
 		return false
 	}
+	if strings.Contains(a.Text, "【OCR可见状态变化】") || strings.Contains(b.Text, "【OCR可见状态变化】") {
+		return false
+	}
 	left, right := numericValue.FindAllString(a.Text, -1), numericValue.FindAllString(b.Text, -1)
 	if len(left) == 0 || len(left) != len(right) || strings.Join(left, "|") == strings.Join(right, "|") {
 		return false
@@ -58,6 +61,9 @@ func signalDeadline(event SignalEvent) time.Time {
 func pendingPriority(event SignalEvent) int {
 	if event.Source == SignalFrame {
 		return -1
+	}
+	if strings.Contains(event.Text, "【OCR可见状态变化】") {
+		return 2
 	}
 	if containsAny(event.Text, []string{"取消", "作废", "更正", "终止", "延期", "不再", "改为", "停止"}) {
 		return 2
