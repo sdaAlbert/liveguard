@@ -178,6 +178,17 @@ func (s *Service) SetFrameCapturer(capturer FrameCapturer) { s.capturer = captur
 // SetUnexpectedEventReviewer lets the model spot high-salience moments outside
 // the user's explicit goal. Calls are throttled per monitor to control cost.
 func (s *Service) SetUnexpectedEventReviewer(reviewer UnexpectedEventReviewer, minInterval time.Duration) {
+	traceStore, _ := s.repository.(InvestigationTraceRepository)
+	switch configured := reviewer.(type) {
+	case *AgentReviewer:
+		if configured.TraceStore == nil {
+			configured.TraceStore = traceStore
+		}
+	case *MiniMaxUnexpectedEventReviewer:
+		if configured.TraceStore == nil {
+			configured.TraceStore = traceStore
+		}
+	}
 	s.modelMu.Lock()
 	defer s.modelMu.Unlock()
 	s.reviewer = reviewer
@@ -1743,6 +1754,7 @@ func applyUnexpectedReviewTo(run *Run, event SignalEvent, decision UnexpectedEve
 		updateInvestigationMemory(run, inv, decision, now)
 	}
 	inv.Review = &ReviewMetrics{Model: decision.Model, InputTokens: decision.InputTokens, OutputTokens: decision.OutputTokens, LatencyMS: decision.LatencyMS, Turns: decision.Turns, StopReason: decision.StopReason, HistoryRecordsReused: decision.HistoryRecordsReused}
+	inv.Review.TraceID = decision.TraceID
 	inv.Review.FormatRepairs = decision.Repairs
 	inv.Review.TransportRetries = decision.TransportRetries
 	if len(decision.UsedEvidence) > 0 {

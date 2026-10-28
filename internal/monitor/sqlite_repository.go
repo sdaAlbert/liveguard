@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"liveguard/internal/agent"
 	_ "modernc.org/sqlite"
 )
 
@@ -108,6 +109,16 @@ func (r *SQLiteRepository) initialize(ctx context.Context) error {
 			created_at_ns INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS model_calls_by_time ON model_calls(created_at_ns)`,
+		`CREATE TABLE IF NOT EXISTS investigation_traces (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			event_id TEXT NOT NULL,
+			attempt_id TEXT NOT NULL,
+			started_at_ns INTEGER NOT NULL,
+			updated_at_ns INTEGER NOT NULL,
+			payload BLOB NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS investigation_traces_by_run ON investigation_traces(run_id, started_at_ns DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := r.db.ExecContext(ctx, statement); err != nil {
@@ -707,6 +718,130 @@ func (r *SQLiteRepository) ModelCallSummary(ctx context.Context, since time.Time
 	}
 	summarizeCost(&summary)
 	return summary, nil
+}
+
+func (r *SQLiteRepository) CreateInvestigationTrace(ctx context.Context, trace *InvestigationTrace) error {
+	if err := validateInvestigationTrace(trace); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(trace)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO investigation_traces(id,run_id,event_id,attempt_id,started_at_ns,updated_at_ns,payload) VALUES(?,?,?,?,?,?,?)`, trace.ID, trace.RunID, trace.EventID, trace.AttemptID, trace.StartedAt.UnixNano(), trace.UpdatedAt.UnixNano(), encoded); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM investigation_traces WHERE run_id=? AND id IN (SELECT id FROM investigation_traces WHERE run_id=? ORDER BY started_at_ns DESC LIMIT -1 OFFSET ?)`, trace.RunID, trace.RunID, maxInvestigationTracesPerRun); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) AppendInvestigationTraceStep(ctx context.Context, traceID string, step agent.ReplayStep) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var payload []byte
+	if err := tx.QueryRowContext(ctx, `SELECT payload FROM investigation_traces WHERE id=?`, traceID).Scan(&payload); err != nil {
+		return err
+	}
+	var trace InvestigationTrace
+	if err := json.Unmarshal(payload, &trace); err != nil {
+		return err
+	}
+	if step.Sequence != len(trace.Steps)+1 {
+		return errors.New("trace step sequence is invalid")
+	}
+	trace.Steps = append(trace.Steps, step)
+	trace.UpdatedAt = time.Now().UTC()
+	encoded, err := json.Marshal(trace)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE investigation_traces SET updated_at_ns=?,payload=? WHERE id=?`, trace.UpdatedAt.UnixNano(), encoded, traceID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) CompleteInvestigationTrace(ctx context.Context, traceID string, decision UnexpectedEventDecision, stopReason, traceErr string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var payload []byte
+	if err := tx.QueryRowContext(ctx, `SELECT payload FROM investigation_traces WHERE id=?`, traceID).Scan(&payload); err != nil {
+		return err
+	}
+	var trace InvestigationTrace
+	if err := json.Unmarshal(payload, &trace); err != nil {
+		return err
+	}
+	trace.Decision, trace.StopReason, trace.Error = decision, stopReason, traceErr
+	trace.Status = "complete"
+	if traceErr != "" {
+		trace.Status = "incomplete"
+	}
+	trace.CompletedAt, trace.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	encoded, err := json.Marshal(trace)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE investigation_traces SET updated_at_ns=?,payload=? WHERE id=?`, trace.UpdatedAt.UnixNano(), encoded, traceID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) GetInvestigationTrace(ctx context.Context, runID, traceID string) (*InvestigationTrace, error) {
+	var payload []byte
+	err := r.db.QueryRowContext(ctx, `SELECT payload FROM investigation_traces WHERE run_id=? AND id=?`, runID, traceID).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var trace InvestigationTrace
+	if err := json.Unmarshal(payload, &trace); err != nil {
+		return nil, fmt.Errorf("decode investigation trace: %w", err)
+	}
+	return &trace, nil
+}
+
+func (r *SQLiteRepository) ListInvestigationTraces(ctx context.Context, runID string) ([]InvestigationTraceSummary, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT payload FROM investigation_traces WHERE run_id=? ORDER BY started_at_ns DESC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var summaries []InvestigationTraceSummary
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var trace InvestigationTrace
+		if err := json.Unmarshal(payload, &trace); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, InvestigationTraceSummary{ID: trace.ID, EventID: trace.EventID, AttemptID: trace.AttemptID, Status: trace.Status, StepCount: len(trace.Steps), StartedAt: trace.StartedAt, CompletedAt: trace.CompletedAt, Action: trace.Decision.Action, StopReason: trace.StopReason})
+	}
+	return summaries, rows.Err()
 }
 
 func (r *SQLiteRepository) SearchObservations(ctx context.Context, runID string, query ObservationQuery) (ObservationPage, error) {

@@ -153,6 +153,16 @@ $env:LIVEGUARD_MODEL_PRICING = '{"模型 ID":{"input_per_million":1.0,"output_pe
 
 模型记录只包含调用关联 ID、模型、耗时、结果类别、重试和 token 数，不保存提示词或完整工具往返，因此这些指标不代表可重放 trace。提醒延迟受 Run 历史保留上限影响；切换到内存存储时，模型调用记录会随进程退出而丢失。
 
+需要在本机测试期间留存资源趋势时，可在另一个 PowerShell 窗口运行采样脚本：
+
+~~~powershell
+.\scripts\capture-runtime.ps1 -IntervalSeconds 5
+~~~
+
+按 `Ctrl+C` 结束，也可以加 `-DurationMinutes 30` 让它自动运行 30 分钟。默认每 5 秒读取 `/api/metrics`，并采集匹配到的 `liveguard` Windows 进程；可用 `-ProcessId` 指定 PID、`-MetricsUrl` 指定服务地址。输出目录默认位于 `artifacts/runtime-monitoring/<时间戳>/`，包含资源汇总 CSV、逐监控队列 CSV 和原始指标 JSONL。指标接口提供采样时刻的 Go Goroutine 数、堆内存与 GC 计数；PowerShell 同时记录进程工作集、私有内存、OS 线程、句柄和累计 CPU 时间。它是本机采样，不是告警服务；停止服务后无法继续读取 API，离线/错误样本会写入资源 CSV。
+
+已配置模型的 Agent 调查会额外记录可回放循环：规范化后的每轮模型结果、工具调用和工具结果。SQLite 每个 Run 最多保留最近 20 条调查 trace；工具输出单项最多保留 48 KiB，截图内容只记 MIME、长度和 SHA-256 摘要，不保存图片字节。trace 可能包含直播文本和工具参数，仍属于本机敏感数据。回放只在原模型轮次和工具结果上运行 Agent 循环，不请求模型、不调用原工具处理器，也不会提交提醒。它用于确认调用顺序和复现循环路径，不会重新推理原始提示词，也不能保证原外部环境可重建。
+
 配置示例见 [.env.example](../.env.example)。不要把密钥写进公开文档。
 
 ### HTTP 接口
@@ -174,6 +184,8 @@ $env:LIVEGUARD_MODEL_PRICING = '{"模型 ID":{"input_per_million":1.0,"output_pe
 | GET/POST /api/browser/session | 查询/打开专用浏览器窗口，不代表已登录成功 |
 | GET/PUT /api/settings/model | 本机模型设置 |
 | GET /api/metrics | 队列、模型调用和提醒延迟的只读运行指标 |
+| GET /api/monitors/{id}/traces | 调查 trace 摘要列表 |
+| POST /api/monitors/{id}/traces/{trace_id}/replay | 无外部副作用地回放一条调查循环 |
 
 source_mode 支持 browser_ocr（真实截图）、ocr_upload（手工输入/上传）、demo_replay（合成演示）。缺省模式在 Go Service 中是 demo_replay，不能因演示流走通就判断真实采集走通。
 

@@ -140,6 +140,7 @@ type AgentStep struct {
 
 type ReviewMetrics struct {
 	TransportRetries     int               `json:"transport_retries,omitempty"`
+	TraceID              string            `json:"trace_id,omitempty"`
 	HistoryRecordsReused int               `json:"history_records_reused,omitempty"`
 	SamplingProposal     *SamplingProposal `json:"sampling_proposal,omitempty"`
 	SamplingPolicy       SamplingState     `json:"sampling_policy"`

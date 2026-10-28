@@ -11,12 +11,13 @@ import (
 // MiniMaxUnexpectedEventReviewer preserves the programmatic entrypoint used
 // by existing evals. All decisions and tools run through AgentReviewer.
 type MiniMaxUnexpectedEventReviewer struct {
-	APIKey   string
-	Model    string
-	Client   *http.Client
-	Endpoint string
-	Breaker  *agent.CircuitBreaker
-	Limits   agent.LoopLimits
+	APIKey     string
+	Model      string
+	Client     *http.Client
+	Endpoint   string
+	Breaker    *agent.CircuitBreaker
+	Limits     agent.LoopLimits
+	TraceStore InvestigationTraceRepository
 }
 
 func (r *MiniMaxUnexpectedEventReviewer) runtime() *AgentReviewer {
@@ -24,7 +25,7 @@ func (r *MiniMaxUnexpectedEventReviewer) runtime() *AgentReviewer {
 	if model == "" {
 		model = "MiniMax-M3"
 	}
-	return &AgentReviewer{Model: &MessagesModel{APIKey: r.APIKey, Model: model, Client: r.Client, Endpoint: r.Endpoint, Vision: true}, Breaker: r.Breaker, Limits: r.Limits}
+	return &AgentReviewer{Model: &MessagesModel{APIKey: r.APIKey, Model: model, Client: r.Client, Endpoint: r.Endpoint, Vision: true}, Breaker: r.Breaker, Limits: r.Limits, TraceStore: r.TraceStore}
 }
 func (r *MiniMaxUnexpectedEventReviewer) Review(ctx context.Context, input UnexpectedEventInput) (UnexpectedEventDecision, error) {
 	return r.runtime().Review(ctx, input)

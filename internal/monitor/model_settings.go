@@ -100,7 +100,8 @@ func (s *Service) ConfigureModel(input ModelSettingsInput) (ModelSettingsStatus,
 	if config.Provider != "rules" {
 		model := observedToolModel{ToolModel: configuredToolModel(config), observe: s.observeModelCall(config.Provider, config.Model)}
 		planner = &AgentGoalPlanner{Model: model}
-		reviewer = &AgentReviewer{Model: model, Breaker: agent.NewCircuitBreaker(2, 30*time.Second)}
+		traceStore, _ := s.repository.(InvestigationTraceRepository)
+		reviewer = &AgentReviewer{Model: model, Breaker: agent.NewCircuitBreaker(2, 30*time.Second), TraceStore: traceStore}
 		if config.Capabilities.Vision {
 			baseline = &AgentBaselineAnalyzer{Model: model}
 		}

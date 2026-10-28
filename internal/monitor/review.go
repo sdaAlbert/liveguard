@@ -18,6 +18,7 @@ type UnexpectedEventDecision struct {
 	VisualOCREvidenceID  string            `json:"-"`
 	VisualArchiveID      string            `json:"-"`
 	AttemptID            string            `json:"-"`
+	TraceID              string            `json:"-"`
 	TransportRetries     int               `json:"-"`
 	Sampling             *SamplingProposal `json:"sampling,omitempty"`
 	Action               string            `json:"action"`

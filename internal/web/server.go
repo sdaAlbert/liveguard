@@ -61,6 +61,11 @@ type RuntimeMetricsService interface {
 	RuntimeMetrics(context.Context) (monitor.RuntimeMetrics, error)
 }
 
+type InvestigationTraceService interface {
+	ListInvestigationTraces(context.Context, string) ([]monitor.InvestigationTraceSummary, error)
+	ReplayInvestigation(context.Context, string, string) (monitor.InvestigationReplay, error)
+}
+
 type frameArchiveReader interface {
 	ArchivedFramePath(context.Context, string, string) (string, error)
 }
@@ -270,6 +275,42 @@ func (s *Server) monitorRun(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, path)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "traces" && r.Method == http.MethodGet {
+		service, ok := s.monitorService.(InvestigationTraceService)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "调查回放暂不可用")
+			return
+		}
+		traces, err := service.ListInvestigationTraces(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "读取调查记录失败")
+			return
+		}
+		writeJSON(w, http.StatusOK, traces)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "traces" && parts[3] == "replay" && r.Method == http.MethodPost {
+		service, ok := s.monitorService.(InvestigationTraceService)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "调查回放暂不可用")
+			return
+		}
+		replay, err := service.ReplayInvestigation(r.Context(), id, parts[2])
+		if err != nil {
+			if errors.Is(err, monitor.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			writeError(w, http.StatusConflict, "调查回放未能完成")
+			return
+		}
+		writeJSON(w, http.StatusOK, replay)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "goal" && r.Method == http.MethodPut {

@@ -104,6 +104,8 @@ const monitorIssues = new Map();
 const stopping = new Set();
 const pausing = new Set();
 const replyingToAgent = new Set();
+const replayingTraces = new Set();
+const replayResults = new Map();
 const openDetailIDs = new Set();
 const readAlerts = new Map();
 const alertFlashUntil = new Map();
@@ -506,6 +508,14 @@ function displayEventLabel(type) {
 
 function renderInvestigation(inv) {
   const review = inv.review;
+  const traceID = review?.trace_id;
+  const replay = traceID ? (() => {
+    const result = replayResults.get(traceID);
+    const en = uiLanguage === "en";
+    const label = replayingTraces.has(traceID) ? (en ? "Replaying…" : "回放中…") : (en ? "Replay investigation" : "回放调查流程");
+    const summary = result ? `<small class="replay-result ${result.matched ? "matched" : "mismatch"}">${result.matched ? (en ? "Path matched" : "路径一致") : (en ? "Path mismatch" : "路径不一致")} · ${Number(result.replayed_turns)} ${en ? "turns" : "轮"} · ${Number(result.replayed_tools)} ${en ? "tools" : "个工具"}${result.error ? ` · ${escapeHTML(result.error)}` : ""}</small>` : "";
+    return `<div class="trace-replay"><button class="replay-trace" data-trace-id="${escapeAttribute(traceID)}" type="button" ${replayingTraces.has(traceID) ? "disabled" : ""}>${label}</button>${summary}</div>`;
+  })() : "";
   const noFinalDecision = Boolean(review?.stop_reason && !["finished", "terminal_tool"].includes(review.stop_reason));
   const status = noFinalDecision ? "调查未完成·继续监听" : decisionLabels[inv.status] || inv.status || "判断中";
   const steps = inv.steps || [];
@@ -516,8 +526,28 @@ function renderInvestigation(inv) {
   const actions = compactAgentActions(steps);
   const activity = actions ? `<p class="agent-activity"><span>Agent</span>${actions}</p>` : "";
   const question = inv.status === "waiting_user" && !inv.user_answer ? `<form class="clarification-form" data-investigation-id="${escapeAttribute(inv.id)}"><p class="clarification-prompt">${escapeHTML(inv.user_question || "Agent 需要你补充判断规则")}</p>${inv.user_options?.length ? `<div class="clarification-options">${inv.user_options.map(option => `<button class="clarification-option" type="button" data-answer="${escapeAttribute(option)}">${escapeHTML(option)}</button>`).join("")}</div>` : ""}<textarea name="answer" rows="3" maxlength="1000" ${runPaused ? "disabled" : ""} required placeholder="补充这次判断需要的条件…">${escapeHTML(clarificationDrafts.get(inv.id) || "")}</textarea><div class="clarification-submit-row"><small>${runPaused ? "继续监控后可回复 Agent" : "你的回答只用于这次判断；监控会继续运行"}</small><button class="detail-primary" type="submit" ${runPaused || replyingToAgent.has(inv.id) ? "disabled" : ""}>${replyingToAgent.has(inv.id) ? "提交中…" : "回复 Agent"}</button></div><p class="clarification-error" aria-live="polite"></p></form>` : inv.user_answer ? `<div class="clarification-answer"><small>你的补充</small><p>${escapeHTML(inv.user_answer)}</p></div>` : "";
-  return `<article class="investigation-item"><div class="detail-item-meta"><span>${escapeHTML(displayEventLabel(inv.event_type))}</span><time>${eventTime(inv.updated_at || inv.created_at)}</time><span class="decision-state ${escapeHTML(inv.status)}">${escapeHTML(status)}</span></div><p class="investigation-conclusion">${escapeHTML(conclusion)}</p>${keyEvidenceMarkup(inv.evidence, detailRunID)}${activity}${question}${inv.user_answer && inv.status === "reviewing_clarification" ? `<p class="clarification-working">Agent 正在结合你的补充重新判断。</p>` : ""}</article>`;
+  return `<article class="investigation-item"><div class="detail-item-meta"><span>${escapeHTML(displayEventLabel(inv.event_type))}</span><time>${eventTime(inv.updated_at || inv.created_at)}</time><span class="decision-state ${escapeHTML(inv.status)}">${escapeHTML(status)}</span></div><p class="investigation-conclusion">${escapeHTML(conclusion)}</p>${keyEvidenceMarkup(inv.evidence, detailRunID)}${activity}${replay}${question}${inv.user_answer && inv.status === "reviewing_clarification" ? `<p class="clarification-working">Agent 正在结合你的补充重新判断。</p>` : ""}</article>`;
 }
+
+async function replayInvestigation(runID, traceID) {
+  if (replayingTraces.has(traceID)) return;
+  replayingTraces.add(traceID);
+  renderMonitorDetail();
+  try {
+    const result = await request(`/api/monitors/${encodeURIComponent(runID)}/traces/${encodeURIComponent(traceID)}/replay`, {method:"POST"});
+    replayResults.set(traceID, result);
+  } catch (error) {
+    replayResults.set(traceID, {matched:false, replayed_turns:0, replayed_tools:0, error:error.message});
+  } finally {
+    replayingTraces.delete(traceID);
+    renderMonitorDetail();
+  }
+}
+
+$("#monitorDetailContent").addEventListener("click", event => {
+  const button = event.target.closest(".replay-trace");
+  if (button) replayInvestigation(detailRunID, button.dataset.traceId);
+});
 function renderMonitorDetail() {
   const dialog = $("#monitorDetailDialog");
   const content = $("#monitorDetailContent");

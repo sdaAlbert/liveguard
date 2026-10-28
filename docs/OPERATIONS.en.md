@@ -164,6 +164,16 @@ $env:LIVEGUARD_MODEL_PRICING = '{"model-id":{"input_per_million":1.0,"output_per
 
 Model records contain correlation IDs, model, duration, outcome category, retries, and token counts. They do not contain prompts or full tool exchanges, so these metrics are not replayable traces. Alert latency is limited by retained Run history. With in-memory storage, model-call records are lost when the process exits.
 
+To keep a local resource time series while testing, run the sampler in a separate PowerShell window:
+
+~~~powershell
+.\scripts\capture-runtime.ps1 -IntervalSeconds 5
+~~~
+
+Stop it with `Ctrl+C`, or add `-DurationMinutes 30` to stop automatically after a 30-minute run. It polls `/api/metrics` every five seconds by default and samples matching `liveguard` Windows processes. Use `-ProcessId` to select a PID or `-MetricsUrl` to change the service address. Output is written under `artifacts/runtime-monitoring/<timestamp>/` as a resource summary CSV, per-monitor queue CSV, and raw metrics JSONL. The metrics API provides point-in-time Go goroutine, heap, and GC counts; PowerShell also records process working set, private memory, OS threads, handles, and cumulative CPU time. This is local sampling, not an alerting service. API outages or scrape errors are recorded in the resource CSV.
+
+Agent investigations with a configured model also record a replayable loop trace: normalized model turns, tool calls, and tool results. SQLite keeps the latest 20 traces per Run. Each tool result is limited to 48 KiB; screenshot content stores only its MIME type, length, and SHA-256 digest, never image bytes. Traces may contain livestream text and tool arguments, so treat them as sensitive local data. Replay runs the Agent loop against recorded turns and tool results; it does not contact the provider, call original tool handlers, or submit alerts. It checks the captured loop path, not a new inference from the original prompt or a reconstruction of the external environment.
+
 See [.env.example](../.env.example) for examples. Never put secrets in public documentation.
 ### HTTP API
 
@@ -184,6 +194,8 @@ See [.env.example](../.env.example) for examples. Never put secrets in public do
 | `GET/POST /api/browser/session` | Inspect/open the dedicated browser window; does not prove successful login |
 | `GET/PUT /api/settings/model` | Read/update local model settings |
 | `GET /api/metrics` | Read-only queue, model-call, and alert-latency metrics |
+| `GET /api/monitors/{id}/traces` | List investigation trace summaries |
+| `POST /api/monitors/{id}/traces/{trace_id}/replay` | Replay one investigation loop without external side effects |
 
 Supported `source_mode` values are `browser_ocr` (real screenshot), `ocr_upload` (manual text or upload), and `demo_replay` (synthetic demo). The Go Service default is `demo_replay`; a successful demo does not prove real capture works.
 

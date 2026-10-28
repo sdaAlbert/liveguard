@@ -219,6 +219,8 @@ Run 快照中的 Event 最多 2,000 条、Investigation/Alert 各最多 500 条�
 
 这些记录适合快速判断积压、模型故障和慢提醒发生在哪一段；它们不能完整还原一次调查，也不能保证重放出相同模型决策。费用使用本机 `LIVEGUARD_MODEL_PRICING` 价格表乘以服务商返回的 Token 数，是估算值，不是账单金额。配置格式和 API 说明见[运行文档](OPERATIONS.md)。
 
+对于新发生的模型调查，Agent Loop 还会逐步保存规范化模型轮次、工具调用和工具结果。详情页的“回放调查流程”按钮会用这些记录重新运行循环，核对轮次、工具名与参数、最终动作和停止原因；回放器不持有 Provider 或真实工具处理器，因此不会发出模型请求、写入提醒或更新监控目标。每个 Run 最多保留 20 条，单项工具输出最多 48 KiB，图片只保留摘要。该能力用于重现控制流，不等于保存原始模型请求，也不保证重新调用模型得到相同判断。
+
 ## 代码导航
 
 | 想追踪的机制 | 阅读入口 |
@@ -231,3 +233,4 @@ Run 快照中的 Event 最多 2,000 条、Investigation/Alert 各最多 500 条�
 | 观测流水与长期查询 | [`ledger.go`](../internal/monitor/ledger.go)、[`sqlite_repository.go`](../internal/monitor/sqlite_repository.go) |
 | Provider Adapter 与重试 | [`model_session.go`](../internal/monitor/model_session.go)、[`messages_model.go`](../internal/monitor/messages_model.go)、[`chat_completions_provider.go`](../internal/monitor/chat_completions_provider.go)、[`retry.go`](../internal/agent/retry.go) |
 | 运行指标和模型调用记录 | [`metrics.go`](../internal/monitor/metrics.go)、[`sqlite_repository.go`](../internal/monitor/sqlite_repository.go)、[`internal/web/server.go`](../internal/web/server.go) |
+| 调查 trace 和无副作用回放 | [`agent/replay.go`](../internal/agent/replay.go)、[`investigation_trace.go`](../internal/monitor/investigation_trace.go)、[`agent_reviewer.go`](../internal/monitor/agent_reviewer.go) |

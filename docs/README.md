@@ -25,6 +25,7 @@ LiveGuard 是一个本地直播监控 Agent 项目。若第一次接触代码，
 | 暂停、停止、改目标、超时或重启时发生什么？ | [项目导览](PROJECT-GUIDE.md)、[运行与故障处理](OPERATIONS.md) |
 | 如何配置 MiniMax、OpenAI、DeepSeek、Tesseract 或 ASR？ | [运行与故障处理](OPERATIONS.md) |
 | 监控室如何统计队列等待、模型失败、费用和提醒延迟？ | [架构](ARCHITECTURE.md)、[运行与故障处理](OPERATIONS.md) |
+| 如何回放一次调查，回放会不会再次调用模型或发送提醒？ | [架构](ARCHITECTURE.md)、[运行与故障处理](OPERATIONS.md) |
 | 测试覆盖什么？之前是否测过模型质量、吞吐和延迟？ | [评测与验证](EVALUATION.md) |
 | 当前有哪些问题值得改进，怎样判断改好了？ | [优化路线图](ROADMAP.md) |
 

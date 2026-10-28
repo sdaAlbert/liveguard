@@ -59,7 +59,16 @@ type Loop struct {
 	Limits        LoopLimits
 	Tools         map[string]ToolHandler
 	TerminalTools map[string]bool
+	Recorder      TraceRecorder
+	ReplayTool    ToolReplay
 }
+
+type TraceRecorder interface {
+	RecordModelTurn(int, ModelTurn, error)
+	RecordToolResult(int, ToolCall, ToolOutput, int64, bool)
+}
+
+type ToolReplay func(int, ToolCall, ToolOutput, bool) (ToolOutput, error)
 
 func (l Loop) Run(parent context.Context, next NextTurn) (result LoopResult, err error) {
 	limits := l.Limits
@@ -99,6 +108,9 @@ func (l Loop) Run(parent context.Context, next NextTurn) (result LoopResult, err
 		}
 		result.Turns++
 		response, err := next(ctx, previous, turn)
+		if l.Recorder != nil {
+			l.Recorder.RecordModelTurn(turn+1, response, err)
+		}
 		if err != nil {
 			result.StopReason = "model_error"
 			return result, err
@@ -131,6 +143,7 @@ func (l Loop) Run(parent context.Context, next NextTurn) (result LoopResult, err
 			}
 			var output ToolOutput
 			started := time.Now()
+			rejected := false
 			var args any
 			validArgs := len(call.Arguments) <= 8192 && json.Unmarshal(call.Arguments, &args) == nil
 			canonical, _ := json.Marshal(args)
@@ -143,23 +156,40 @@ func (l Loop) Run(parent context.Context, next NextTurn) (result LoopResult, err
 			handler, allowed := l.Tools[call.Name]
 			switch {
 			case call.ID == "" || ids[call.ID]:
+				rejected = true
 				output = rejectedTool("invalid or repeated tool call ID")
 			case !validArgs:
+				rejected = true
 				output = rejectedTool("invalid or oversized JSON arguments")
 			case !allowed:
+				rejected = true
 				output = rejectedTool("tool is not in the server allowlist")
 			case l.TerminalTools[call.Name] && len(response.Calls) != 1:
+				rejected = true
 				output = rejectedTool("terminal tool must be called alone")
 			default:
-				toolCtx, cancelTool := context.WithTimeout(ctx, limits.ToolTimeout)
-				output = handler(toolCtx, call, turn)
-				if toolCtx.Err() != nil {
-					output = rejectedTool("tool cancelled or timed out")
+				if l.ReplayTool == nil {
+					toolCtx, cancelTool := context.WithTimeout(ctx, limits.ToolTimeout)
+					output = handler(toolCtx, call, turn)
+					if toolCtx.Err() != nil {
+						output = rejectedTool("tool cancelled or timed out")
+					}
+					cancelTool()
 				}
-				cancelTool()
+			}
+			if l.ReplayTool != nil {
+				var replayErr error
+				output, replayErr = l.ReplayTool(turn+1, call, output, rejected)
+				if replayErr != nil {
+					result.StopReason = "replay_mismatch"
+					return result, replayErr
+				}
 			}
 			ids[call.ID] = true
 			observation := Observation{Call: call, Output: output, DurationMS: time.Since(started).Milliseconds()}
+			if l.Recorder != nil {
+				l.Recorder.RecordToolResult(turn+1, call, output, observation.DurationMS, rejected)
+			}
 			previous = append(previous, observation)
 			result.Observations = append(result.Observations, observation)
 			if output.Terminal && !output.Failed {

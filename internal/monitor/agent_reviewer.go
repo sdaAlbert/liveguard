@@ -18,6 +18,7 @@ import (
 // Credentials and wire formats never participate in business decisions here.
 type AgentReviewer struct {
 	Model            ToolModel
+	TraceStore       InvestigationTraceRepository
 	Breaker          *agent.CircuitBreaker
 	Limits           agent.LoopLimits
 	quotaUnavailable atomic.Bool
@@ -129,6 +130,12 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		}
 	}
 	loop := agent.Loop{Limits: r.Limits, Tools: tools, TerminalTools: map[string]bool{"create_alert": true, "request_user_input": true, "update_monitoring_goal": true}}
+	traceRecorder, traceErr := beginInvestigationTrace(r.TraceStore, input, eventID, attemptID, loop.Limits, loop.Tools, loop.TerminalTools)
+	if traceErr != nil {
+		log.Printf("begin investigation trace failed: run=%s event=%s error=%q", input.RunID, eventID, traceErr)
+		traceRecorder = nil
+	}
+	loop.Recorder = traceRecorder
 	var inTokens, outTokens int64
 	var retries int
 	var priorToolObservations []agent.Observation
@@ -214,6 +221,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	}
 	decision.TransportRetries = retries
 	decision.AttemptID = attemptID
+	decision.TraceID = traceRecorder.TraceID()
 	setReviewMetadata(&decision, model, inTokens, outTokens, started)
 	if errors.Is(loopErr, ErrModelQuotaExhausted) {
 		r.quotaUnavailable.Store(true)
@@ -229,6 +237,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 		}
 	}
 	log.Printf("agent review finished: review_id=%q attempt_id=%q event_id=%q model=%q stop_reason=%s turns=%d tools=%d history_records_reused=%d input_tokens=%d output_tokens=%d latency_ms=%d error=%q", eventID, attemptID, eventID, model, decision.StopReason, decision.Turns, len(result.Observations), decision.HistoryRecordsReused, decision.InputTokens, decision.OutputTokens, decision.LatencyMS, loopErr)
+	traceRecorder.Complete(decision, result.StopReason, loopErr)
 	return decision, loopErr
 }
 

@@ -217,6 +217,8 @@ The control room reads `GET /api/metrics` to show local model failures and failu
 
 These records help locate queue buildup, provider failures, and slow alerts. They cannot fully reconstruct an investigation or guarantee replay of the same model decision. Cost multiplies provider-reported token usage by the local `LIVEGUARD_MODEL_PRICING` table; it is an estimate, not a billing total. See the [operations guide](OPERATIONS.en.md) for the price-table format and API details.
 
+New model investigations also store normalized model turns, tool calls, and tool results as the Agent loop progresses. The “Replay investigation” action in the detail view runs the loop against those records and checks turn order, tool names and arguments, final action, and stop reason. The replay runner has no Provider or live tool handlers, so it cannot send model requests, write alerts, or update a monitor goal. It keeps at most 20 traces per Run, caps each tool output at 48 KiB, and stores only a digest for image content. This reproduces control flow; it does not preserve the original wire request or guarantee the same result from a fresh model call.
+
 ## Code navigation
 
 | Mechanism | Entry points |
@@ -229,3 +231,4 @@ These records help locate queue buildup, provider failures, and slow alerts. The
 | Observation ledger and history search | [ledger.go](../internal/monitor/ledger.go), [sqlite_repository.go](../internal/monitor/sqlite_repository.go) |
 | Provider adapters and retries | [model_session.go](../internal/monitor/model_session.go), [messages_model.go](../internal/monitor/messages_model.go), [chat_completions_provider.go](../internal/monitor/chat_completions_provider.go), [retry.go](../internal/agent/retry.go) |
 | Runtime metrics and model-call records | [metrics.go](../internal/monitor/metrics.go), [sqlite_repository.go](../internal/monitor/sqlite_repository.go), [internal/web/server.go](../internal/web/server.go) |
+| Investigation traces and side-effect-free replay | [agent/replay.go](../internal/agent/replay.go), [investigation_trace.go](../internal/monitor/investigation_trace.go), [agent_reviewer.go](../internal/monitor/agent_reviewer.go) |

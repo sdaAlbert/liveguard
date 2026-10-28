@@ -243,6 +243,13 @@ input::placeholder { color:#959595; }
 .key-evidence { margin:6px 0 0; color:#666660; font-size:10px; line-height:1.65; overflow-wrap:anywhere; }
 .key-evidence span { margin-right:7px; color:#899188; font-size:9px; }
 .agent-activity { margin:7px 0 0; display:flex; flex-wrap:wrap; align-items:center; gap:4px 7px; color:#81817b; font-size:9px; line-height:1.6; }
+.trace-replay { margin-top:8px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.replay-trace { min-height:27px; padding:4px 9px; border:1px solid #d9ddd6; border-radius:5px; color:#536454; background:#f8faf7; font-size:10px; }
+.replay-trace:hover:not(:disabled) { border-color:#aeb8ac; background:#f0f4ef; }
+.replay-trace:disabled { opacity:.65; }
+.replay-result { font-size:9px; }
+.replay-result.matched { color:#547352; }
+.replay-result.mismatch { color:#a3433d; }
 .agent-activity>span:first-child { color:#68756b; font-weight:600; }
 .agent-action:not(:last-child):after { margin-left:7px; color:#c6c6c0; content:"·"; }
 .agent-action.failed { color:#a3433d; }
