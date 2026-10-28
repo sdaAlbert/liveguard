@@ -153,7 +153,16 @@ A proxy is optional. Set `HTTPS_PROXY` for your own environment if needed. The p
 | `LIVEGUARD_SQLITE_PATH` | SQLite database path; defaults to `runtime/liveguard.sqlite` |
 | `LIVEGUARD_FRAME_ARCHIVE_DIR` | Directory to read previously archived screenshots; defaults to Git-ignored `runtime/frames`. Current investigations do not write new screenshots there |
 | `LIVEGUARD_LOG_PATH` | Persistent service log; defaults to `runtime/liveguard.log`, with one 10 MiB rotated file |
-| `LIVEGUARD_OTEL_ENDPOINT` | Optional OTLP exporter; current Agent progress is logged in `runtime/liveguard.log`; full Agent investigation spans are not yet instrumented |
+| `LIVEGUARD_OTEL_ENDPOINT` | Optional OTLP exporter; full Agent investigation spans are not yet instrumented |
+| `LIVEGUARD_MODEL_PRICING` | Optional JSON model-ID price table for estimated cost per million input/output tokens |
+
+The control-room metrics panel reads `/api/metrics` during monitor refresh. Queue size and oldest wait come from live queues. Model calls, failure categories, provider-reported token usage, and transport retry counts are stored in SQLite. Alert latency is the average for locally retained alerts from the last 24 hours. User cancellations are reported separately and excluded from the model failure rate. Cost is estimated only when token usage and a local price entry are available; no price is inferred when either is missing. For example:
+
+~~~powershell
+$env:LIVEGUARD_MODEL_PRICING = '{"model-id":{"input_per_million":1.0,"output_per_million":2.0}}'
+~~~
+
+Model records contain correlation IDs, model, duration, outcome category, retries, and token counts. They do not contain prompts or full tool exchanges, so these metrics are not replayable traces. Alert latency is limited by retained Run history. With in-memory storage, model-call records are lost when the process exits.
 
 See [.env.example](../.env.example) for examples. Never put secrets in public documentation.
 ### HTTP API
@@ -174,6 +183,7 @@ See [.env.example](../.env.example) for examples. Never put secrets in public do
 | `GET /api/events` | SSE state-update hints; read the snapshot for current details |
 | `GET/POST /api/browser/session` | Inspect/open the dedicated browser window; does not prove successful login |
 | `GET/PUT /api/settings/model` | Read/update local model settings |
+| `GET /api/metrics` | Read-only queue, model-call, and alert-latency metrics |
 
 Supported `source_mode` values are `browser_ocr` (real screenshot), `ocr_upload` (manual text or upload), and `demo_replay` (synthetic demo). The Go Service default is `demo_replay`; a successful demo does not prove real capture works.
 

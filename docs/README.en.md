@@ -24,6 +24,7 @@ From the repository root, read the [README](../README.md) for features and quick
 | What is included in the Harness, and how does a model suggestion become an alert? | [Agent Harness](AGENT-HARNESS.en.md) |
 | What happens when I pause, stop, change the goal, time out, or restart? | [Project guide](PROJECT-GUIDE.en.md), [Operations](OPERATIONS.en.md) |
 | How do I configure MiniMax, OpenAI, DeepSeek, Tesseract, or ASR? | [Operations](OPERATIONS.en.md) |
+| How are queue wait, model failures, estimated cost, and alert latency measured? | [Architecture](ARCHITECTURE.en.md), [Operations](OPERATIONS.en.md) |
 | What has been tested or measured for throughput and latency? | [Evaluation and verification](EVALUATION.en.md) |
 | What is worth improving, and how will we know it worked? | [Improvement roadmap](ROADMAP.en.md) |
 

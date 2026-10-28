@@ -142,7 +142,16 @@ $env:LIVEGUARD_OCR_LANGUAGE = "chi_sim+eng"
 | LIVEGUARD_SQLITE_PATH | SQLite 数据库位置，默认 `runtime/liveguard.sqlite` |
 | LIVEGUARD_FRAME_ARCHIVE_DIR | 已有归档截图的读取目录，默认 `runtime/frames`（Git 忽略）；当前调查不会向该目录写入新截图 |
 | LIVEGUARD_LOG_PATH | 持久化服务日志位置，默认 `runtime/liveguard.log`，10 MiB 滚动保留一个旧文件 |
-| LIVEGUARD_OTEL_ENDPOINT | 可选 OTLP 导出器；当前主要依靠 `runtime/liveguard.log` 中的结构化模型/Agent 过程记录，尚未为 Agent 调查建立完整 OTel span |
+| LIVEGUARD_OTEL_ENDPOINT | 可选 OTLP 导出器；当前没有完整 Agent 调查 span |
+| LIVEGUARD_MODEL_PRICING | 可选 JSON，按模型 ID 配置每百万输入/输出 token 单价，用于本地费用估算 |
+
+运行指标页每隔一次控制室刷新读取 `/api/metrics`。队列长度和最老等待时间来自当前运行队列；模型调用、失败类别、服务商返回的 token 用量和重试次数写入 SQLite；提醒延迟展示最近 24 小时本地保留提醒的平均值。模型失败率将用户取消单独列出，不算作模型失败。费用只按已返回的 token 用量和本机价格表估算；模型未返回用量或价格未配置时不会推算费用。价格示例：
+
+~~~powershell
+$env:LIVEGUARD_MODEL_PRICING = '{"模型 ID":{"input_per_million":1.0,"output_per_million":2.0}}'
+~~~
+
+模型记录只包含调用关联 ID、模型、耗时、结果类别、重试和 token 数，不保存提示词或完整工具往返，因此这些指标不代表可重放 trace。提醒延迟受 Run 历史保留上限影响；切换到内存存储时，模型调用记录会随进程退出而丢失。
 
 配置示例见 [.env.example](../.env.example)。不要把密钥写进公开文档。
 
@@ -164,6 +173,7 @@ $env:LIVEGUARD_OCR_LANGUAGE = "chi_sim+eng"
 | GET /api/events | SSE 更新提示；详情仍读快照 |
 | GET/POST /api/browser/session | 查询/打开专用浏览器窗口，不代表已登录成功 |
 | GET/PUT /api/settings/model | 本机模型设置 |
+| GET /api/metrics | 队列、模型调用和提醒延迟的只读运行指标 |
 
 source_mode 支持 browser_ocr（真实截图）、ocr_upload（手工输入/上传）、demo_replay（合成演示）。缺省模式在 Go Service 中是 demo_replay，不能因演示流走通就判断真实采集走通。
 

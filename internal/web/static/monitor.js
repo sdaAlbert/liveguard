@@ -116,6 +116,7 @@ let streamConnected = false;
 let snapshotsConnected = false;
 let refreshSequence = 0;
 let refreshTimer = null;
+let runtimeMetrics = null;
 
 try {
   const saved = JSON.parse(localStorage.getItem(readStorageKey) || "{}");
@@ -846,6 +847,29 @@ async function uploadOCR(id, input, button) {
   }
 }
 
+function renderRuntimeMetrics() {
+  const panel = $("#runtimeMetrics");
+  if (!panel || !runtimeMetrics) return;
+  const m = runtimeMetrics, calls = m.model_calls || {};
+  const en = uiLanguage === "en";
+  const failures = Number(calls.failures || 0), cancelled = Number(calls.by_failure?.cancelled || 0), total = Math.max(0, Number(calls.calls || 0) - cancelled);
+  const failureRate = total ? `${(failures / total * 100).toFixed(1)}%` : "—";
+  const cost = calls.estimated_cost == null ? (en ? "Price not configured" : "未配置价格") : `${en ? "Est." : "估算"} ${Number(calls.estimated_cost).toFixed(4)}`;
+  const oldest = Number(m.queue_oldest_wait_ms || 0);
+  const delay = Number(m.average_received_to_alert_ms || 0);
+  const failureNames = en ? {timeout:"timeout",network_or_provider:"network/provider",rate_limited:"rate limit",quota:"quota",format:"format",cancelled:"cancelled"} : {timeout:"超时",network_or_provider:"网络/服务商",rate_limited:"限流",quota:"额度",format:"格式",cancelled:"取消"};
+  const failureBreakdown = Object.entries(calls.by_failure || {}).filter(([, count]) => Number(count) > 0).map(([kind, count]) => `${failureNames[kind] || kind} ${Number(count)}`).join(" · ") || (en ? "No failures" : "暂无失败");
+  const rows = (m.queues || []).map(q => `<li><span>${escapeHTML(q.name || q.run_id)}</span><span>${Number(q.waiting)} ${en ? "waiting" : "条"} · ${en ? "oldest" : "最老"} ${Math.round(Number(q.oldest_wait_ms || 0)/1000)}${en ? "s" : " 秒"}${q.reviewing ? (en ? " · reviewing" : " · 处理中") : ""}</span></li>`).join("");
+  panel.innerHTML = `<div class="metrics-heading"><b>${en ? "Runtime metrics" : "运行指标"}</b><small>${en ? "Last 24 hours · local" : "最近 24 小时 · 本机统计"}</small></div><div class="metrics-grid"><div><small>${en ? "Queued signals" : "排队信号"}</small><b>${Number(m.queue_waiting || 0)} ${en ? "items" : "条"}</b><span>${en ? "Oldest wait" : "最老等待"} ${Math.round(oldest/1000)}${en ? "s" : " 秒"}</span></div><div><small>${en ? "Model failures" : "模型失败"}</small><b>${failures} / ${total} (${failureRate})</b><span>${failureBreakdown}</span><span>${en ? "Input" : "输入"} ${Number(calls.input_tokens || 0).toLocaleString()} · ${en ? "output" : "输出"} ${Number(calls.output_tokens || 0).toLocaleString()} tokens</span></div><div><small>${en ? "Model cost" : "模型费用"}</small><b>${cost}</b><span>${en ? "Estimate from configured prices" : "按已配置单价估算"}</span></div><div><small>${en ? "Received to alert" : "收到到提醒"}</small><b>${m.alert_samples ? `${(delay/1000).toFixed(1)} ${en ? "s" : "秒"}` : (en ? "No samples" : "暂无样本")}</b><span>${Number(m.alert_samples || 0)} ${en ? "alerts · average" : "条提醒的平均值"}</span></div></div>${rows ? `<ul class="metrics-queues">${rows}</ul>` : ""}${m.alert_history_limited ? `<small class="metrics-note">${en ? "Alert latency samples are limited by local history retention." : "提醒延迟样本受本地历史保留上限影响。"}</small>` : ""}`;
+}
+
+async function refreshRuntimeMetrics() {
+  try {
+    runtimeMetrics = await request("/api/metrics");
+    renderRuntimeMetrics();
+  } catch (_) { /* Metrics are diagnostic; keep the control room usable. */ }
+}
+
 async function refreshRuns() {
   const sequence = ++refreshSequence;
   try {
@@ -865,6 +889,7 @@ async function refreshRuns() {
     monitorRuns.clear();
     details.forEach(run => monitorRuns.set(run.id, run));
     renderAll();
+    refreshRuntimeMetrics();
   } catch (error) {
     if (sequence !== refreshSequence) return;
     snapshotsConnected = false;
@@ -1109,6 +1134,7 @@ $("#languageToggle").addEventListener("click", () => {
   try { localStorage.setItem(languageStorageKey, uiLanguage); } catch (_) {}
   applyLanguage();
   renderAll();
+  renderRuntimeMetrics();
 });
 applyLanguage();
 

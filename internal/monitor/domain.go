@@ -187,19 +187,21 @@ type InvestigationMemory struct {
 }
 
 type Alert struct {
-	EvidenceBasis   string     `json:"evidence_basis,omitempty"`
-	SignalToAlertMS int64      `json:"signal_to_alert_ms"`
-	ID              string     `json:"id"`
-	RoomID          string     `json:"room_id"`
-	RoomName        string     `json:"room_name"`
-	EventType       string     `json:"event_type"`
-	Priority        string     `json:"priority"`
-	Summary         string     `json:"summary"`
-	Confidence      float64    `json:"confidence"`
-	DedupeKey       string     `json:"dedupe_key"`
-	Investigation   string     `json:"investigation_id"`
-	Evidence        []Evidence `json:"evidence"`
-	CreatedAt       time.Time  `json:"created_at"`
+	EvidenceBasis     string     `json:"evidence_basis,omitempty"`
+	SignalToAlertMS   int64      `json:"signal_to_alert_ms"`
+	ReceivedToAlertMS int64      `json:"received_to_alert_ms,omitempty"`
+	ReceivedAt        time.Time  `json:"received_at,omitempty"`
+	ID                string     `json:"id"`
+	RoomID            string     `json:"room_id"`
+	RoomName          string     `json:"room_name"`
+	EventType         string     `json:"event_type"`
+	Priority          string     `json:"priority"`
+	Summary           string     `json:"summary"`
+	Confidence        float64    `json:"confidence"`
+	DedupeKey         string     `json:"dedupe_key"`
+	Investigation     string     `json:"investigation_id"`
+	Evidence          []Evidence `json:"evidence"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // MonitoringPlan is the inspectable execution policy derived from the user's

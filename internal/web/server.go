@@ -57,6 +57,10 @@ type ModelSettingsService interface {
 	ConfigureModel(monitor.ModelSettingsInput) (monitor.ModelSettingsStatus, error)
 }
 
+type RuntimeMetricsService interface {
+	RuntimeMetrics(context.Context) (monitor.RuntimeMetrics, error)
+}
+
 type frameArchiveReader interface {
 	ArchivedFramePath(context.Context, string, string) (string, error)
 }
@@ -95,6 +99,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/events", s.events)
 	mux.HandleFunc("/api/browser/session", s.browserSession)
 	mux.HandleFunc("/api/settings/model", s.modelSettings)
+	mux.HandleFunc("/api/metrics", s.runtimeMetrics)
 	mux.HandleFunc("/api/shutdown", s.shutdown)
 	mux.HandleFunc("/monitor", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, assets, "static/monitor.html")
@@ -107,6 +112,25 @@ func (s *Server) Handler() http.Handler {
 		http.ServeFileFS(w, r, assets, "static/monitor.html")
 	})
 	return securityHeaders(otelhttp.NewHandler(mux, "liveguard.http"))
+}
+
+func (s *Server) runtimeMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	service, ok := s.monitorService.(RuntimeMetricsService)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "运行指标暂不可用")
+		return
+	}
+	metrics, err := service.RuntimeMetrics(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读取运行指标失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, metrics)
 }
 
 func (s *Server) shutdown(w http.ResponseWriter, r *http.Request) {

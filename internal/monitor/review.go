@@ -42,6 +42,7 @@ type UnexpectedEventDecision struct {
 }
 
 type UnexpectedEventInput struct {
+	RunID                  string
 	AttemptID              string
 	UserClarification      string
 	UserInstructions       []string

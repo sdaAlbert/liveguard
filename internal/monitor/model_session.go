@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"liveguard/internal/agent"
 	"liveguard/internal/domain"
@@ -14,6 +15,29 @@ type ToolModel interface {
 	ModelID() string
 	Capabilities() ModelCapabilities
 	NewSession(ModelSessionConfig) ModelSession
+}
+
+type observedToolModel struct {
+	ToolModel
+	observe func(context.Context, ModelReply, error, time.Duration)
+}
+
+func (m observedToolModel) NewSession(config ModelSessionConfig) ModelSession {
+	return observedModelSession{ModelSession: m.ToolModel.NewSession(config), observe: m.observe}
+}
+
+type observedModelSession struct {
+	ModelSession
+	observe func(context.Context, ModelReply, error, time.Duration)
+}
+
+func (s observedModelSession) Next(ctx context.Context, previous []agent.Observation, requiredTool string, feedback string) (ModelReply, error) {
+	started := time.Now()
+	reply, err := s.ModelSession.Next(ctx, previous, requiredTool, feedback)
+	if s.observe != nil {
+		s.observe(ctx, reply, err, time.Since(started))
+	}
+	return reply, err
 }
 
 type ModelCapabilities struct {

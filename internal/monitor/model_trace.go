@@ -9,10 +9,17 @@ import (
 type modelCallTraceContextKey struct{}
 
 type modelCallTrace struct {
+	RunID          string
 	ReviewID       string
 	AttemptID      string
 	Turn           int
 	ParentDeadline time.Time
+}
+
+func withModelRunID(ctx context.Context, runID string) context.Context {
+	trace := modelCallTraceFromContext(ctx)
+	trace.RunID = runID
+	return context.WithValue(ctx, modelCallTraceContextKey{}, trace)
 }
 
 func withModelCallTrace(ctx context.Context, reviewID, attemptID string, turn int) context.Context {

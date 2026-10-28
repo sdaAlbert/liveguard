@@ -98,7 +98,7 @@ func (s *Service) ConfigureModel(input ModelSettingsInput) (ModelSettingsStatus,
 	var reviewer UnexpectedEventReviewer
 	var baseline BaselineAnalyzer
 	if config.Provider != "rules" {
-		model := configuredToolModel(config)
+		model := observedToolModel{ToolModel: configuredToolModel(config), observe: s.observeModelCall(config.Provider, config.Model)}
 		planner = &AgentGoalPlanner{Model: model}
 		reviewer = &AgentReviewer{Model: model, Breaker: agent.NewCircuitBreaker(2, 30*time.Second)}
 		if config.Capabilities.Vision {

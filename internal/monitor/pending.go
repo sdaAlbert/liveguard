@@ -23,14 +23,15 @@ var ErrInputPaused = errors.New("监控采集已暂停，请处理页面状态�
 
 // PendingStatus describes this process's work, not recoverable checkpoints.
 type PendingStatus struct {
-	Processed uint64 `json:"processed"`
-	Failed    uint64 `json:"failed"`
-	Waiting   int    `json:"waiting"`
-	Reviewing bool   `json:"reviewing"`
-	Dropped   uint64 `json:"dropped"`
-	Expired   uint64 `json:"expired"`
-	Coalesced uint64 `json:"coalesced"`
-	LastIssue string `json:"last_issue,omitempty"`
+	Processed    uint64 `json:"processed"`
+	Failed       uint64 `json:"failed"`
+	Waiting      int    `json:"waiting"`
+	OldestWaitMS int64  `json:"oldest_wait_ms"`
+	Reviewing    bool   `json:"reviewing"`
+	Dropped      uint64 `json:"dropped"`
+	Expired      uint64 `json:"expired"`
+	Coalesced    uint64 `json:"coalesced"`
+	LastIssue    string `json:"last_issue,omitempty"`
 }
 
 type pendingSignal struct {
@@ -96,11 +97,27 @@ func (q *signalQueue) stats() PendingStatus {
 	q.mu.Lock()
 	s := q.status
 	s.Waiting = len(q.items)
+	now := q.now()
+	for _, item := range q.items {
+		if !item.enqueuedAt.IsZero() {
+			age := max(int64(0), now.Sub(item.enqueuedAt).Milliseconds())
+			if s.OldestWaitMS == 0 || age > s.OldestWaitMS {
+				s.OldestWaitMS = age
+			}
+		}
+	}
 	durable, runID := q.durable, q.runID
 	q.mu.Unlock()
 	if durable != nil {
 		if waiting, reviewing, err := durable.PendingCounts(context.Background(), runID); err == nil {
 			s.Waiting, s.Reviewing = waiting, reviewing
+		}
+		if ageStore, ok := durable.(interface {
+			OldestPendingAge(context.Context, string, time.Time) (int64, error)
+		}); ok {
+			if age, err := ageStore.OldestPendingAge(context.Background(), runID, now); err == nil {
+				s.OldestWaitMS = age
+			}
 		}
 	}
 	return s

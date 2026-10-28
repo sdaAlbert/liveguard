@@ -1092,6 +1092,7 @@ func (s *Service) processAccepted(ctx context.Context, runID string, snapshot *R
 			}
 			frameCheck := event.Source == SignalFrame
 			input := UnexpectedEventInput{
+				RunID:       runID,
 				AttemptID:   attemptID,
 				EvidenceAt:  time.Now().UTC(),
 				GoalVersion: snapshot.GoalVersion, GoalUpdatedAt: snapshot.GoalUpdatedAt,
@@ -1860,10 +1861,15 @@ func applyUnexpectedReviewTo(run *Run, event SignalEvent, decision UnexpectedEve
 		addStep(&inv, "create_alert", "将目标之外的重要时刻提醒给用户", "已生成带识别原文的主动提醒", now)
 	}
 	commit()
+	receivedAt := event.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = event.ObservedAt
+	}
 	run.Alerts = append(run.Alerts, Alert{
-		EvidenceBasis:   decision.EvidenceBasis,
-		SignalToAlertMS: max(0, now.Sub(event.ObservedAt).Milliseconds()),
-		ID:              domain.NewID("alert"), RoomID: event.RoomID, RoomName: event.RoomName,
+		EvidenceBasis:     decision.EvidenceBasis,
+		SignalToAlertMS:   max(0, now.Sub(event.ObservedAt).Milliseconds()),
+		ReceivedToAlertMS: max(0, now.Sub(receivedAt).Milliseconds()), ReceivedAt: receivedAt,
+		ID: domain.NewID("alert"), RoomID: event.RoomID, RoomName: event.RoomName,
 		EventType: eventType, Priority: "high", Summary: decision.Summary,
 		Confidence: decision.Confidence, DedupeKey: semanticDedupeKey(event.RoomID, eventType, decision.Summary),
 		Investigation: inv.ID, Evidence: append([]Evidence(nil), inv.Evidence...), CreatedAt: now,

@@ -213,6 +213,12 @@ Run 快照中的 Event 最多 2,000 条、Investigation/Alert 各最多 500 条�
 
 实际策略与状态转换见 [`sampling.go`](../internal/monitor/sampling.go)、[`capture_pipeline.go`](../internal/monitor/capture_pipeline.go) 和 [`review_gate.go`](../internal/monitor/review_gate.go)。采集指标应以运行中观测到的间隔和耗时为准，而不是只读计划配置。
 
+## 运行指标与排查边界
+
+监控室通过只读 `GET /api/metrics` 展示本机最近 24 小时的模型调用失败、失败类别、Token 用量、配置价格后的费用估算和提醒平均延迟，并汇总当前队列长度及最老等待时间。SQLite 单独保存模型调用的关联 ID、模型、耗时、结果类别、重试和 Token 数；不会保存提示词和完整工具输入/输出。提醒延迟根据 Run 中保留的提醒记录计算，Run 历史被截断时面板会标注样本受限。
+
+这些记录适合快速判断积压、模型故障和慢提醒发生在哪一段；它们不能完整还原一次调查，也不能保证重放出相同模型决策。费用使用本机 `LIVEGUARD_MODEL_PRICING` 价格表乘以服务商返回的 Token 数，是估算值，不是账单金额。配置格式和 API 说明见[运行文档](OPERATIONS.md)。
+
 ## 代码导航
 
 | 想追踪的机制 | 阅读入口 |
@@ -224,3 +230,4 @@ Run 快照中的 Event 最多 2,000 条、Investigation/Alert 各最多 500 条�
 | 证据来源和提交约束 | [`evidence.go`](../internal/monitor/evidence.go)、[`service.go`](../internal/monitor/service.go)、[`repository.go`](../internal/monitor/repository.go) |
 | 观测流水与长期查询 | [`ledger.go`](../internal/monitor/ledger.go)、[`sqlite_repository.go`](../internal/monitor/sqlite_repository.go) |
 | Provider Adapter 与重试 | [`model_session.go`](../internal/monitor/model_session.go)、[`messages_model.go`](../internal/monitor/messages_model.go)、[`chat_completions_provider.go`](../internal/monitor/chat_completions_provider.go)、[`retry.go`](../internal/agent/retry.go) |
+| 运行指标和模型调用记录 | [`metrics.go`](../internal/monitor/metrics.go)、[`sqlite_repository.go`](../internal/monitor/sqlite_repository.go)、[`internal/web/server.go`](../internal/web/server.go) |

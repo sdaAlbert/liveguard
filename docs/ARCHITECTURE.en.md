@@ -211,6 +211,12 @@ Costs include screenshots/OCR, optional ASR, text-model requests, and image inpu
 
 See [sampling.go](../internal/monitor/sampling.go), [capture_pipeline.go](../internal/monitor/capture_pipeline.go), and [review_gate.go](../internal/monitor/review_gate.go) for policy and transitions. Use observed runtime intervals and durations for capture measurements, not just plan configuration.
 
+## Runtime metrics and investigation limits
+
+The control room reads `GET /api/metrics` to show local model failures and failure categories, token usage, estimated cost when prices are configured, average alert latency over the last 24 hours, and current queue size and oldest wait. SQLite stores model-call correlation IDs, model, duration, outcome category, retries, and token counts separately. It does not store prompts or full tool inputs and outputs. Alert latency is calculated from retained Run alerts; the panel marks the sample as limited when Run history has been truncated.
+
+These records help locate queue buildup, provider failures, and slow alerts. They cannot fully reconstruct an investigation or guarantee replay of the same model decision. Cost multiplies provider-reported token usage by the local `LIVEGUARD_MODEL_PRICING` table; it is an estimate, not a billing total. See the [operations guide](OPERATIONS.en.md) for the price-table format and API details.
+
 ## Code navigation
 
 | Mechanism | Entry points |
@@ -222,3 +228,4 @@ See [sampling.go](../internal/monitor/sampling.go), [capture_pipeline.go](../int
 | Evidence sources and submission checks | [evidence.go](../internal/monitor/evidence.go), [service.go](../internal/monitor/service.go), [repository.go](../internal/monitor/repository.go) |
 | Observation ledger and history search | [ledger.go](../internal/monitor/ledger.go), [sqlite_repository.go](../internal/monitor/sqlite_repository.go) |
 | Provider adapters and retries | [model_session.go](../internal/monitor/model_session.go), [messages_model.go](../internal/monitor/messages_model.go), [chat_completions_provider.go](../internal/monitor/chat_completions_provider.go), [retry.go](../internal/agent/retry.go) |
+| Runtime metrics and model-call records | [metrics.go](../internal/monitor/metrics.go), [sqlite_repository.go](../internal/monitor/sqlite_repository.go), [internal/web/server.go](../internal/web/server.go) |

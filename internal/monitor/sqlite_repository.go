@@ -92,6 +92,22 @@ func (r *SQLiteRepository) initialize(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS pending_signals_by_run ON pending_signals(run_id, status, goal_version, priority DESC, enqueued_at_ns)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS pending_one_processing_per_run ON pending_signals(run_id) WHERE status='processing'`,
+		`CREATE TABLE IF NOT EXISTS model_calls (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			event_id TEXT NOT NULL,
+			attempt_id TEXT NOT NULL,
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			outcome TEXT NOT NULL,
+			failure_kind TEXT NOT NULL,
+			input_tokens INTEGER NOT NULL,
+			output_tokens INTEGER NOT NULL,
+			latency_ms INTEGER NOT NULL,
+			transport_retries INTEGER NOT NULL,
+			created_at_ns INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS model_calls_by_time ON model_calls(created_at_ns)`,
 	}
 	for _, statement := range statements {
 		if _, err := r.db.ExecContext(ctx, statement); err != nil {
@@ -627,6 +643,70 @@ func (r *SQLiteRepository) PendingCounts(ctx context.Context, runID string) (int
 	var reviewing int
 	err := r.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END),0) FROM pending_signals WHERE run_id=?`, runID).Scan(&waiting, &reviewing)
 	return waiting, reviewing > 0, err
+}
+
+func (r *SQLiteRepository) OldestPendingAge(ctx context.Context, runID string, now time.Time) (int64, error) {
+	var enqueuedAt int64
+	err := r.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(enqueued_at_ns),0) FROM pending_signals WHERE run_id=? AND status='pending' AND expires_at_ns>?`, runID, now.UnixNano()).Scan(&enqueuedAt)
+	if err != nil {
+		return 0, err
+	}
+	if enqueuedAt == 0 {
+		return 0, nil
+	}
+	return max(int64(0), now.Sub(time.Unix(0, enqueuedAt)).Milliseconds()), nil
+}
+
+func (r *SQLiteRepository) RecordModelCall(ctx context.Context, call ModelCallRecord) error {
+	if call.ID == "" || call.CreatedAt.IsZero() {
+		return errors.New("model call id and timestamp are required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.ExecContext(ctx, `INSERT OR REPLACE INTO model_calls(id,run_id,event_id,attempt_id,provider,model,outcome,failure_kind,input_tokens,output_tokens,latency_ms,transport_retries,created_at_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, call.ID, call.RunID, call.EventID, call.AttemptID, call.Provider, call.Model, call.Outcome, call.FailureKind, call.InputTokens, call.OutputTokens, call.LatencyMS, call.TransportRetry, call.CreatedAt.UnixNano())
+	return err
+}
+
+func (r *SQLiteRepository) ModelCallSummary(ctx context.Context, since time.Time) (ModelCallSummary, error) {
+	summary := ModelCallSummary{ByFailure: map[string]int64{}, UsageByModel: map[string][3]int64{}}
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN outcome='failure' AND failure_kind<>'cancelled' THEN 1 ELSE 0 END),0),COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) FROM model_calls WHERE created_at_ns>=?`, since.UnixNano()).Scan(&summary.Calls, &summary.Failures, &summary.InputTokens, &summary.OutputTokens)
+	if err != nil {
+		return summary, err
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT failure_kind,COUNT(*) FROM model_calls WHERE created_at_ns>=? AND outcome='failure' GROUP BY failure_kind`, since.UnixNano())
+	if err != nil {
+		return summary, err
+	}
+	for rows.Next() {
+		var kind string
+		var count int64
+		if err := rows.Scan(&kind, &count); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		summary.ByFailure[kind] = count
+	}
+	if err := rows.Close(); err != nil {
+		return summary, err
+	}
+	rows, err = r.db.QueryContext(ctx, `SELECT model,SUM(input_tokens),SUM(output_tokens),SUM(CASE WHEN input_tokens>0 OR output_tokens>0 THEN 1 ELSE 0 END) FROM model_calls WHERE created_at_ns>=? GROUP BY model`, since.UnixNano())
+	if err != nil {
+		return summary, err
+	}
+	for rows.Next() {
+		var model string
+		var input, output, reported int64
+		if err := rows.Scan(&model, &input, &output, &reported); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		summary.UsageByModel[model] = [3]int64{input, output, reported}
+	}
+	if err := rows.Close(); err != nil {
+		return summary, err
+	}
+	summarizeCost(&summary)
+	return summary, nil
 }
 
 func (r *SQLiteRepository) SearchObservations(ctx context.Context, runID string, query ObservationQuery) (ObservationPage, error) {

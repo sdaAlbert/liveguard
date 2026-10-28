@@ -134,6 +134,7 @@ func (r *AgentReviewer) Review(ctx context.Context, input UnexpectedEventInput) 
 	var priorToolObservations []agent.Observation
 	model := r.Model.ModelID()
 	feedback := ""
+	ctx = withModelRunID(ctx, input.RunID)
 	ctx = withModelCallTrace(ctx, eventID, attemptID, -1)
 	result, loopErr := loop.Run(ctx, func(turnCtx context.Context, previous []agent.Observation, turn int) (agent.ModelTurn, error) {
 		if turn >= compactSessionAfterTurn && feedback == "" {
